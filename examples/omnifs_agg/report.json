@@ -1,0 +1,92 @@
+{
+  "model": {
+    "layers": 4,
+    "hidden": 1024,
+    "ffn": 2816,
+    "vocab": 8192,
+    "experts": 0,
+    "dtype": "BF16",
+    "itemsize": 2,
+    "optimizer": true
+  },
+  "backend": "omnifs",
+  "save_parallel": {
+    "tp": 4,
+    "dp": 4,
+    "pp": 2,
+    "world": 32
+  },
+  "load_parallel": {
+    "tp": 4,
+    "dp": 4,
+    "pp": 2,
+    "world": 32
+  },
+  "layout": "hf",
+  "format": "safetensors",
+  "tensors": 117,
+  "aggregate_tp": true,
+  "cache": "host",
+  "files": {
+    "model-00001-of-00002.safetensors": 351324160,
+    "model-00002-of-00002.safetensors": 330342400
+  },
+  "seconds": {
+    "plan_layout": 0.069,
+    "save": 6.096,
+    "load": 9.063
+  },
+  "write": {
+    "pwrite_ops": 1356,
+    "pwrite_bytes": 681693026,
+    "size_p50": 262144,
+    "size_p99": 2097152,
+    "size_hist": {
+      "<4KiB": 297,
+      "4-64KiB": 3,
+      "64KiB-1MiB": 944,
+      "1-16MiB": 112,
+      ">=16MiB": 0
+    },
+    "frag_lt_64KiB_ratio": 0.2212,
+    "unaligned_1MiB_ratio": 0.9978,
+    "chunk_ops_after_split": 1365,
+    "files": 3,
+    "max_writers_per_file": 32,
+    "max_writers_per_64MiB_chunk": 32,
+    "ops_per_rank_min_max": [
+      39,
+      46
+    ],
+    "kv_put_ops": 1365,
+    "kv_size_p50": 262144,
+    "kv_size_p99": 2097152,
+    "kv_per_dn": {
+      "dn0": 156,
+      "dn1": 186,
+      "dn2": 162,
+      "dn3": 163,
+      "dn4": 178,
+      "dn5": 176,
+      "dn6": 173,
+      "dn7": 171
+    }
+  },
+  "read": {
+    "requested_bytes": 1091368704,
+    "L1_bytes": 661430016,
+    "L2_p2p_bytes": 85525376,
+    "L2_p2p_transfer_bytes": 270532608,
+    "L3_store_bytes": 344413312,
+    "L3_store_read_bytes": 681681592,
+    "L3_ops": 652,
+    "unique_file_bytes": 681681592,
+    "store_read_amplification": 1.0,
+    "served_ratio_L1_L2_L3": [
+      0.6061,
+      0.0784,
+      0.3156
+    ]
+  },
+  "load_bytes_verified": true
+}

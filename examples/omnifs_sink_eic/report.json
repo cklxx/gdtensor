@@ -1,0 +1,99 @@
+{
+  "model": {
+    "layers": 4,
+    "hidden": 1024,
+    "ffn": 2816,
+    "vocab": 8192,
+    "experts": 0,
+    "dtype": "BF16",
+    "itemsize": 2,
+    "optimizer": true
+  },
+  "backend": "omnifs",
+  "save_parallel": {
+    "tp": 4,
+    "dp": 4,
+    "pp": 2,
+    "world": 32
+  },
+  "load_parallel": {
+    "tp": 4,
+    "dp": 4,
+    "pp": 2,
+    "world": 32
+  },
+  "layout": "hf",
+  "format": "safetensors",
+  "tensors": 117,
+  "aggregate_tp": false,
+  "cache": "eic",
+  "files": {
+    "model-00001-of-00002.safetensors": 351324160,
+    "model-00002-of-00002.safetensors": 330342400
+  },
+  "seconds": {
+    "plan_layout": 0.07,
+    "save": 7.175,
+    "load": 9.215
+  },
+  "write": {
+    "pwrite_ops": 34116,
+    "pwrite_bytes": 681693026,
+    "size_p50": 1408,
+    "size_p99": 720896,
+    "size_hist": {
+      "<4KiB": 33065,
+      "4-64KiB": 3,
+      "64KiB-1MiB": 944,
+      "1-16MiB": 104,
+      ">=16MiB": 0
+    },
+    "frag_lt_64KiB_ratio": 0.9693,
+    "unaligned_1MiB_ratio": 0.9999,
+    "chunk_ops_after_split": 34125,
+    "files": 3,
+    "max_writers_per_file": 32,
+    "max_writers_per_64MiB_chunk": 32,
+    "ops_per_rank_min_max": [
+      41,
+      2091
+    ],
+    "kv_put_ops": 34125,
+    "kv_size_p50": 1408,
+    "kv_size_p99": 720896,
+    "kv_per_dn": {
+      "dn0": 4238,
+      "dn1": 4275,
+      "dn2": 4235,
+      "dn3": 4215,
+      "dn4": 4228,
+      "dn5": 4323,
+      "dn6": 4318,
+      "dn7": 4293
+    }
+  },
+  "read": {
+    "requested_bytes": 1091368704,
+    "L1_bytes": 696401216,
+    "L2_p2p_bytes": 83758400,
+    "L2_p2p_transfer_bytes": 328204288,
+    "L3_store_bytes": 311209088,
+    "L3_store_read_bytes": 681681592,
+    "L3_ops": 652,
+    "unique_file_bytes": 681681592,
+    "store_read_amplification": 1.0,
+    "served_ratio_L1_L2_L3": [
+      0.6381,
+      0.0767,
+      0.2852
+    ]
+  },
+  "load_bytes_verified": true,
+  "sink": {
+    "files": 3,
+    "chunks": 12,
+    "bytes": 681693026,
+    "seconds": 1.355,
+    "location": "/tmp/om_b/hdfs/proj/step-0"
+  }
+}
