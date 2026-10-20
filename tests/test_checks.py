@@ -20,7 +20,7 @@ from gdtensor.layout import (
     DisjointStorageMeshList, PhysicalLayoutTable, TensorComponentPos, build_payload_index,
     leader_tensor_component_pos_of,
 )
-from gdtensor.mesh import storage_mesh_cells
+from gdtensor.mesh import ArrangedMesh, storage_mesh_cells
 from gdtensor.models import ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table
 
 M = ModelConfig(layers=4, hidden=32, ffn=64, vocab=128)
@@ -137,6 +137,23 @@ def test_layout_rejects_row_label_mismatch():
     assert not res.ok and "rows differ" in res.error
 
 
+def test_storage_mesh_disjoint_rejects_overlap():
+    from gdtensor.mesh import OuterProductMesh, Slice, SlicedMesh
+    base = OuterProductMesh(ArrangedMesh(2, "tensor_count"), ArrangedMesh(4, "world_size"))
+    a = SlicedMesh(base, (Slice(0, 1), Slice(0, 2)))
+    c = SlicedMesh(base, (Slice(0, 2), Slice(1, 3)))
+    res = check_storage_mesh_disjoint(a, c)
+    assert not res.ok and "overlap" in res.error
+
+
+def test_storage_mesh_disjoint_accepts_touching_boundary():
+    from gdtensor.mesh import OuterProductMesh, Slice, SlicedMesh
+    base = OuterProductMesh(ArrangedMesh(1, "tensor_count"), ArrangedMesh(4, "world_size"))
+    a = SlicedMesh(base, (None, Slice(0, 2)))
+    b = SlicedMesh(base, (None, Slice(2, 4)))
+    assert check_storage_mesh_disjoint(a, b).ok
+
+
 def test_empty_slot_layout_passes():
     # 3-column world where one tensor uses columns 0,2 and another column 0.
     from gdtensor.dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard
@@ -203,6 +220,24 @@ def test_storage_range_on_unknown_file_is_detected():
     plan = [(RangeFromComputeView("x", 0, 4), RangeFromStorageView("ghost.safetensors", 0, 4))]
     res = check_storage_d_tensors_access_disjoint(st, lay, ["model.safetensors"], plan)
     assert not res.ok and "unknown file" in res.error
+
+
+def test_compute_range_out_of_bounds_is_detected():
+    ct, st, lay, _, sv = _fixture(M, P, "single")
+    plan = d_tensors_view_rank_plan_save(0, _cv(ct, 0), sv).unwrap()
+    s0, d0 = plan[0]
+    # Move the compute source past the tensor end: full_covering must fail.
+    bad = [(RangeFromComputeView(s0.global_tensor_id, 1 << 40, s0.size), d0)]
+    res = check_compute_d_tensors_access_full_covering(ct, bad)
+    assert not res.ok and "covered" in res.error
+
+
+def test_storage_range_gap_is_detected():
+    ct, st, lay, _, sv = _fixture(M, P, "single")
+    plan = d_tensors_view_rank_plan_save(0, _cv(ct, 0), sv).unwrap()
+    # Drop the first pair: the file no longer starts at offset 0.
+    res = check_storage_d_tensors_access_full_covering(st, lay, ["model.safetensors"], plan[1:])
+    assert not res.ok and "covered" in res.error
 
 
 def test_load_semantics_per_rank_disjoint_union_covering():
