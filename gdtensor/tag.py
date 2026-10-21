@@ -172,3 +172,6 @@ TensorCount = _tagged_int("TensorCount")
 WorldSize = _tagged_int("WorldSize")
 
 Result = Union[Ok, Err]
+
+# C.3: Placement is the Shard/Replicate/Partial oneof
+Placement = Union[Shard, Replicate, Partial]

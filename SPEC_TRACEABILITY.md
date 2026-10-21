@@ -134,3 +134,13 @@ torch 打通（真实 torch 2.12 distributed.tensor，Python 3.11 验证）：
 - 端到端 test_torch_e2e：真实 torch.DTensor → gdtensor 分片 safetensors（行切/列切strided/1维）→ load → torch.equal，含多张量表；官方 safetensors 解码校验。
 
 验证：Python 3.14（无 torch，桥测试 skip）680 passed；Python 3.11 + torch 2.12，691 passed（含 11 项 torch 桥/端到端）。
+
+## LAWA 归并端到端（设计 10）+ API 合规审计
+
+- tests/test_lawa_merge.py：k∈{1,2,3,5} 个 checkpoint 的逐元素平均；朴素版（累加/k）与 Welford 版（delta/n）都走 gdtensor load → torch 计算 → reset → save，两者与 torch.stack().mean 三方一致，结果再经 gdtensor 重载校验。
+- 归并严格只在 torch.DTensor 上做；审计断言 core/io/builder 不存在任何 reduce/mean/lawa/merge API（设计 9、10.3）。
+- meta 不一致（dtype/itemsize）由 plan 的 _check_same_tensors 前置拒绝，正向同 meta 放行。
+- tests/test_api_conformance.py（62 项）：机械对照 C.3 表，逐个断言顶层短名、io 三动词、builder 全部 product/mesh/layout/error/helper、session/access ABC、tag 类型存在且签名正确；并断言顶层和 io 没有表外 API，防止自由发挥。
+- builder 命名空间补齐 C.3 全部 re-export；tag.Placement 联合。
+
+验证：Python 3.11+torch 759 passed；Python 3.14 742 passed（torch 用例 skip）。
