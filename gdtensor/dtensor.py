@@ -29,6 +29,7 @@ from .mesh import (
 )
 from .result import Result, ResultError, catch
 from .constraints import check_constraints as _cc
+from .builder_mixin import attach_builders as _attach
 
 
 def _check(self):
@@ -339,3 +340,9 @@ def is_designated_writer(nd: NamedDTensor, rank: int, tensor_order: int) -> bool
             if coords[d] != tensor_order % cells.shape[d]:
                 return False
     return True
+
+
+# C.1 builder registration
+from .builder_mixin import attach_builders as _ab
+for _c in (GlobalTensorMeta, NaiveDTensor, ReshapedDTensor, NamedDTensor, DTensorTable):
+    _ab(_c)

@@ -36,30 +36,29 @@ def get_gd_tensor(view: ComputeDTensorsView, tensor_id: str):
         raise
 
 
-def _require_torch():
-    try:
-        import torch  # noqa: F401
-        return __import__("torch")
-    except ImportError:
-        raise InvalidArgumentError(
-            "make_gd_tensor requires torch; install torch or build metadata-only tensors",
-            argument_name="d_tensor",
-        ) from None
+def _torch_bridge():
+    from . import torch_bridge as tb
+    return tb
 
 
 @catch
-def make_gd_tensor(d_tensor):
-    """Wrap a torch.DTensor. Without torch this raises InvalidArgumentError."""
-    torch = _require_torch()
-    # torch DTensor integration is intentionally minimal in the lite core:
-    # shape/dtype/placements/mesh are read from the tensor when available.
-    shape = tuple(int(x) for x in d_tensor.shape)
-    dtype = str(d_tensor.dtype).upper().replace("TORCH.", "")
-    itemsize = d_tensor.element_size()
-    raise InvalidArgumentError(
-        f"make_gd_tensor is a declared bridge; torch DTensor unwrapping not enabled for shape {shape}",
-        argument_name="d_tensor",
-    )
+def make_gd_tensor(d_tensor, tensor_id=None, p=None, stage: int = 0, placements=None):
+    """gd_tensor_make: torch.DTensor -> gdtensor GenericDTensor (spec 5.6).
+
+    torch is optional. tensor_id/p/stage/placements name the gdtensor tensor
+    and topology for mesh mapping; without torch returns InvalidArgumentError.
+    """
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        raise InvalidArgumentError(
+            "make_gd_tensor requires torch (torch.distributed.tensor)",
+            argument_name="d_tensor",
+        ) from None
+    from .torch_bridge import make_gd_tensor as _impl
+    if tensor_id is None:
+        tensor_id = getattr(d_tensor, "name", None) or "tensor"
+    return _impl(d_tensor, tensor_id, p, stage, placements)
 
 
 def get_d_tensor(gd_tensor):
@@ -134,3 +133,6 @@ def d_tensors_view_map(origin, map_core: DTensorsViewMapCore):
             origin.begin_save, origin.begin_load,
         )
     raise InvalidArgumentError(f"unknown view type {type(origin).__name__}", argument_name="origin")
+
+
+

@@ -266,3 +266,8 @@ def build_layout(
         for t, w in cells:
             tensor_entries[TensorComponentPos(ids[t], w)] = lst
     return PhysicalLayoutTable(container_format, tensor_entries, file_paths)
+
+
+from .builder_mixin import attach_builders as _ab
+_ab(DisjointStorageMeshList)
+_ab(PhysicalLayoutTable)

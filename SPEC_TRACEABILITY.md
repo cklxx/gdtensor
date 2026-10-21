@@ -117,3 +117,20 @@
 - make_gd_tensor 需要 torch；本机无 torch，返回 InvalidArgumentError，其余桥接 API 在仿真 fabric 上可用。
 
 非目标（设计 9 节）：真实 torch.DTensor 解包、对象存储 multipart、分布式 barrier/重试，仍由 session/实现层承担，核心不实现。
+
+## 对外 API 与 torch DTensor 打通
+
+API 完全对齐（C.1/C.3）：
+
+- gdtensor/builder_mixin.py：每个 product 数据类生成 get_/set_/add_/mutable_/clear_ 构造方法和 new_ 工厂（test_builder_api 6 项）。
+- namespace io/builder/session/access/tag 全部就位，顶层短名 5 个桥函数。
+- 无 has_*/which_*；判空 get_x() is None，判分支 type(x) is。
+
+torch 打通（真实 torch 2.12 distributed.tensor，Python 3.11 验证）：
+
+- gdtensor/torch_bridge.py：make_gd_tensor 读 torch DTensor 的 shape/dtype/itemsize/placements/device_mesh，转成 gdtensor NaiveDTensor 并挂 torch_d_tensor；placement/mesh 双向映射；显式 placements 参数支持“单 torch 进程持有全局值，gdtensor 按虚拟 (pp,dp,tp) 出分片 plan”。
+- fabric_from_torch：把 torch full_tensor 全局字节按 gdtensor ownership 灌进每个 rank。
+- torch_from_fabric：load 后各 rank buffer 按 owned intervals 重组成全局 torch tensor，带重叠/未覆盖校验。
+- 端到端 test_torch_e2e：真实 torch.DTensor → gdtensor 分片 safetensors（行切/列切strided/1维）→ load → torch.equal，含多张量表；官方 safetensors 解码校验。
+
+验证：Python 3.14（无 torch，桥测试 skip）680 passed；Python 3.11 + torch 2.12，691 passed（含 11 项 torch 桥/端到端）。

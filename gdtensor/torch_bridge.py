@@ -1,0 +1,231 @@
+"""gdtensor <-> torch.DTensor bridge (spec 5.6 / B.1.4).
+
+Real integration with torch.distributed.tensor:
+
+* make_gd_tensor(d_tensor, tensor_id, p, stage)
+    torch.DTensor -> gdtensor NaiveDTensor with global meta, mapped placements,
+    a gdtensor SlicedMesh over (pp, dp, tp), and the torch tensor attached.
+* fabric_from_torch(view/table, tensors)
+    Fill a ComputeFabric for every gdtensor rank from the torch global values,
+    so gdtensor save / load / reshard operate on torch-produced bytes.
+* torch_from_fabric(...)
+    Gather owned rank buffers back to a global torch tensor and distribute it
+    to a torch.DTensor on a torch device mesh.
+
+Single-process note: torch is initialized with one process here. The bridge
+reads torch's global tensor (full_tensor) and derives every rank's owned
+intervals with the gdtensor ownership model, so the full plan/IO path is
+exercised without a multi-process torch job.
+"""
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from .dtensor import (
+    DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
+    global_tensor_meta_of, named_of, naive_of, owned_intervals,
+)
+from .mesh import ReshapedMesh, SlicedMesh
+from .tag import InvalidArgumentError, Ok, Replicate, Shard
+from .views import ComputeFabric
+
+_TORCH_DTYPE_TO_NAME = {
+    "torch.float32": "F32", "torch.float": "F32",
+    "torch.float16": "F16", "torch.half": "F16",
+    "torch.bfloat16": "BF16",
+    "torch.float64": "F64", "torch.double": "F64",
+    "torch.int32": "I32", "torch.int": "I32",
+    "torch.int64": "I64", "torch.long": "I64",
+    "torch.int8": "I8", "torch.uint8": "U8", "torch.bool": "BOOL",
+}
+
+
+def _torch():
+    try:
+        import torch
+        return torch
+    except ImportError:
+        raise InvalidArgumentError(
+            "torch bridge requires torch (torch.distributed.tensor)",
+            argument_name="d_tensor",
+        ) from None
+
+
+# ------------------------------------------------------------------ mapping
+
+
+def torch_placement_to_gd(pl):
+    name = type(pl).__name__
+    if name == "Shard":
+        return Shard(int(pl.dim))
+    if name == "Replicate":
+        return Replicate()
+    if name == "_Partial":
+        from .tag import Partial
+        return Partial()
+    raise InvalidArgumentError(f"unsupported torch placement {pl!r}", argument_name="placements")
+
+
+def parallel_config_from_mesh(device_mesh) -> Tuple[int, int, int]:
+    """Map a torch device mesh shape to (pp, dp, tp) by dim names."""
+    shape = tuple(int(x) for x in device_mesh.shape)
+    names = tuple(getattr(device_mesh, "mesh_dim_names", None) or ())
+    if names and len(names) == len(shape):
+        idx = {n: i for i, n in enumerate(names)}
+        pp = shape[idx["pp"]] if "pp" in idx else 1
+        dp = shape[idx["dp"]] if "dp" in idx else 1
+        tp = shape[idx["tp"]] if "tp" in idx else 1
+        if pp * dp * tp != int(np.prod(shape)):
+            raise InvalidArgumentError(f"mesh dims {names} are not exactly pp/dp/tp")
+        return pp, dp, tp
+    # unnamed: single dim -> dp
+    if len(shape) == 1:
+        return 1, shape[0], 1
+    if len(shape) == 2:
+        return 1, shape[0], shape[1]
+    if len(shape) == 3:
+        return shape
+    raise InvalidArgumentError(f"cannot map mesh shape {shape} to (pp,dp,tp)")
+
+
+def gd_compute_mesh(p, stage: int):
+    """SlicedMesh fixing the PP stage, matching models.compute_mesh."""
+    from .models import compute_mesh
+    return compute_mesh(p, stage)
+
+
+def _dtype_name(dt) -> Tuple[str, int]:
+    name = _TORCH_DTYPE_TO_NAME.get(str(dt.dtype), str(dt.dtype).upper().replace("TORCH.", ""))
+    return name, int(dt.element_size())
+
+
+# ------------------------------------------------------------------ make
+
+
+def make_gd_tensor(d_tensor, tensor_id: str, p=None, stage: int = 0, placements=None):
+    """torch.DTensor -> NaiveDTensor (spec gd_tensor_make).
+
+    The device mesh is converted to a gdtensor ComputeMesh; the torch tensor is
+    attached as torch_d_tensor.
+
+    Placements:
+    * ``placements`` given explicitly (gdtensor Shard/Replicate tuple) -> used.
+      This is the normal case when one torch process holds the global values
+      and gdtensor plans a sharded save over a virtual (pp,dp,tp) topology.
+    * otherwise torch placements are mapped and padded to 3 dims.
+    """
+    torch = _torch()
+    dt = d_tensor
+    if not hasattr(dt, "device_mesh") or not hasattr(dt, "placements"):
+        raise InvalidArgumentError("input is not a torch.DTensor", argument_name="d_tensor")
+    if p is None:
+        from .models import ParallelConfig
+        pp, dp, tp = parallel_config_from_mesh(dt.device_mesh)
+        p = ParallelConfig(tp=tp, dp=dp, pp=pp)
+    dtype, itemsize = _dtype_name(dt)
+    meta = GlobalTensorMeta(tuple(int(x) for x in dt.shape), dtype, itemsize)
+    if placements is None:
+        placements = tuple(torch_placement_to_gd(pl) for pl in dt.placements)
+        # pad placements to (pp, dp, tp): torch meshes without pp/dp are replicated
+        if len(placements) < 3:
+            placements = (Replicate(),) * (3 - len(placements)) + placements
+    mesh = gd_compute_mesh(p, stage)
+    return Ok(NaiveDTensor(meta, tuple(placements), mesh, torch_d_tensor=dt))
+
+
+# ------------------------------------------------------------------ fabric fill
+
+
+def global_bytes_of_dtensor(d_tensor) -> np.ndarray:
+    """Deterministic global element bytes of a torch.DTensor (uint8 view)."""
+    torch = _torch()
+    full = d_tensor.full_tensor().detach().cpu().contiguous()
+    return np.frombuffer(full.view(torch.uint8).numpy().tobytes(), dtype=np.uint8)
+
+
+def fabric_from_torch(table: DTensorTable, tensors: Dict[str, object]) -> ComputeFabric:
+    """Populate every rank's owned buffers from torch.DTensor global values."""
+    fab = ComputeFabric(table).allocate()
+    for tid, dt in tensors.items():
+        nd = named_of(table, tid)
+        isz = global_tensor_meta_of(nd).itemsize
+        glob = global_bytes_of_dtensor(dt)
+        for r in list(fab.buffers.keys()):
+            iv = fab.intervals(r, tid)
+            if iv.size == 0:
+                continue
+            elems = np.concatenate([np.arange(a, b) for a, b in iv])
+            buf = glob[(elems[:, None] * isz + np.arange(isz)[None, :]).ravel()]
+            fab.buffers[r][tid] = np.asarray(buf, dtype=np.uint8)
+    return fab
+
+
+# ------------------------------------------------------------------ gather back
+
+
+def gather_global_bytes(table: DTensorTable, fabric: ComputeFabric, tensor_id: str) -> np.ndarray:
+    """Reconstruct the global uint8 byte array from all rank buffers."""
+    nd = named_of(table, tensor_id)
+    isz = global_tensor_meta_of(nd).itemsize
+    nbytes = global_tensor_meta_of(nd).nbytes
+    out = np.zeros(nbytes, dtype=np.uint8)
+    placed = np.zeros(nbytes, dtype=bool)
+    for r in list(fabric.buffers.keys()):
+        iv = fabric.intervals(r, tensor_id)
+        if iv.size == 0 or tensor_id not in fabric.buffers.get(r, {}):
+            continue
+        buf = fabric.buffers[r][tensor_id]
+        off = 0
+        for a, b in iv:
+            n = (b - a) * isz
+            seg = np.arange(a * isz, b * isz)
+            if placed[seg].any():
+                raise InvalidArgumentError(f"rank {r} overlaps others for {tensor_id}")
+            out[seg] = buf[off:off + n]
+            placed[seg] = True
+            off += n
+    if not placed.all():
+        raise InvalidArgumentError(f"{tensor_id}: not every element loaded back")
+    return out
+
+
+def torch_from_fabric(table: DTensorTable, fabric: ComputeFabric, tensor_id: str,
+                      device_mesh=None, placements=None):
+    """Reconstruct a torch.DTensor from a loaded gdtensor fabric."""
+    torch = _torch()
+    nd = named_of(table, tensor_id)
+    meta = global_tensor_meta_of(nd)
+    raw = gather_global_bytes(table, fabric, tensor_id)
+    t = torch.frombuffer(bytes(raw), dtype=getattr(torch, _TORCH_TO_NATIVE.get(meta.dtype, "float32"))) \
+        if meta.dtype in _TORCH_TO_NATIVE else _from_bytes(torch, raw, meta)
+    t = t.reshape(tuple(meta.global_shape)).clone()
+    if device_mesh is None:
+        return t  # metadata path with no torch mesh returns a plain tensor
+    from torch.distributed.tensor import distribute_tensor
+    pls = placements if placements is not None else _torch_placements_from_gd(nd)
+    return distribute_tensor(t, device_mesh, pls)
+
+
+_TORCH_TO_NATIVE = {
+    "F32": "float32", "F16": "float16", "BF16": "bfloat16", "F64": "float64",
+    "I32": "int32", "I64": "int64", "I8": "int8", "U8": "uint8",
+}
+
+
+def _from_bytes(torch, raw: np.ndarray, meta):
+    # default: treat unknown dtypes as uint8 bytes
+    return torch.frombuffer(bytes(raw), dtype=torch.uint8)
+
+
+def _torch_placements_from_gd(nd: NamedDTensor):
+    from torch.distributed.tensor import Replicate as TRep, Shard as TShard
+    torch = _torch()
+    out = []
+    for pl in naive_of(nd).placements:
+        if type(pl) is Shard:
+            out.append(TShard(pl.axis))
+        else:
+            out.append(TRep())
+    return tuple(out)
