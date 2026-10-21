@@ -144,3 +144,26 @@ torch 打通（真实 torch 2.12 distributed.tensor，Python 3.11 验证）：
 - builder 命名空间补齐 C.3 全部 re-export；tag.Placement 联合。
 
 验证：Python 3.11+torch 759 passed；Python 3.14 742 passed（torch 用例 skip）。
+
+## 形式化验证（TLA+ + Lean）
+
+形式化产物在 formal/ 目录。验证对象是抽象模型与算法核心，不直接证明 Python 字节码。
+
+### TLA+（TLC 模型检查）
+
+- formal/tla/CopyPlan.tla：建模 N 元素全局张量、S 个 rank、quotient+remainder 分片（前 N%S 个 rank 多 1 元素）、sharded/replicated 两种 layout、per-rank 独立 save/load plan 生成；状态机覆盖所有 rank 交错。
+- 7 个不变量：SaveDstDisjoint、SaveCovering、SavePairCorrect、LoadPairCorrect、LoadShardedDisjoint、LoadShardedCovering、ReplicatedSingleWriter、BoundsOK。
+- formal/tla/AtomicPublish.tla：writing→fsync→renamed→done 加 crash→recovered；原子 rename 是唯一改变可见版本的动作。3 个不变量：VersionComplete、CrashBeforeRenameKeepsOld、NewOnlyAfterRename。
+- TLC 网格（run_tlc.sh）：S∈{2,3} × N∈{1,2,3,5,6}（含整除/非整除/边界），全部 No error。S=2 为 14 distinct states，S=3 为 30 distinct states；AtomicPublish 通过。
+
+### Lean（机器检验证明）
+
+- formal/lean/ShardAlgebra.lean：仅用核心 Init 库，无 sorry、无 axiom。
+- 已证定理：shardStart_succ（区间相邻）；shardStart_succ_le、shardStart_monotone（起始偏移单调）；sum_size_eq_start（前 r 个分片大小之和=start r）；sum_shardSize（S 个分片大小之和=N，由 div_add_mod'）；shardStart_S_eq_N（rank S 起点=N）；shardEnd_le_N（各区间末端不超过 N）。
+- 非交并覆盖：shardAddress_exists（每个 n<N 都被某个 (rank, local) 命中，即满射）；shardAddress_unique（两个 (rank, local) 映射到同一全局元素则相等，即单射）。
+
+### 诚实边界
+
+- TLA+/Lean 证明的是抽象模型与分片代数、原子发布算法，不直接证明 Python 实现，存在语义鸿沟。
+- 形式化与穷举（world≤8）、独立 oracle、属性对拍、变异测试互补，不构成对全部代码的数学证明。
+- 声明：在已建模的输入空间内未发现反例。
