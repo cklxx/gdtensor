@@ -226,3 +226,8 @@ def mesh_coords(cells: np.ndarray, value: int) -> Optional[Tuple[int, ...]]:
     if hit.shape[0] > 1:
         raise ResultError(f"participant {value} appears {hit.shape[0]} times in mesh")
     return tuple(int(x) for x in hit[0])
+
+
+from .builder_mixin import attach_builders as _ab
+for _c in (Slice, ArrangedMesh, LiteralMesh, ReshapedMesh, PermutedMesh, SlicedMesh, OuterProductMesh):
+    _ab(_c)
