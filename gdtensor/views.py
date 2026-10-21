@@ -120,6 +120,10 @@ class ComputeDataAccessor:
 
 @dataclass
 class ComputeDTensorsView:
+    def check_constraints(self):
+        from .constraints import check_constraints as _check
+        return _check(self)
+
     tensor_ids: List[str]
     d_tensor_table: DTensorTable
     data_accessor: ComputeDataAccessor
@@ -181,6 +185,10 @@ class StorageDataAccessor:
 
 @dataclass
 class StorageDTensorsView:
+    def check_constraints(self):
+        from .constraints import check_constraints as _check
+        return _check(self)
+
     tensor_ids: List[str]
     d_tensor_table: DTensorTable
     data_accessor: StorageDataAccessor

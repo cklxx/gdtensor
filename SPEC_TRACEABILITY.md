@@ -94,3 +94,26 @@
 - 线程与 fork 进程两种 rank 运行时产出逐字节相同。
 - 发布路径全部走 fsync + os.replace（原子重命名），读者只见完整文件或无文件。
 - 要在真多机集群复验：在 Linux 上跑 `python3 -m pytest -q`，再跑 `python3 tests/mutation_check.py`，两者全过即环境一致。
+
+## 设计修订对齐（最新版文档，约 1513 行版 vs 初版 785 行版）
+
+新增实现：
+
+| 设计条目 | 实现 | 测试 |
+|---|---|---|
+| B.3.3 五个类型化 Error + tag Box（C.2） | gdtensor/tag.py（Ok/Err/Shard/Replicate/Partial/WorldSize/ConstantOne/TensorCount，五类 Error） | test_spec_alignment |
+| B.3.2 LiteralMesh（显式 rank 列表，compute + content slots） | mesh.py LiteralMesh，ComputeMesh/ContentSlotsMesh 联合，字面内容槽用 -1 表示空列 | test_spec_alignment |
+| B.2.4 / 5.7 check_constraints 递归校验 | gdtensor/constraints.py，挂在各数据类 | test_spec_alignment（正反向） |
+| 5.5 d_tensors_view_map + 四回调 | gdtensor/builder.py | test_spec_alignment |
+| 5.6 compute↔torch 桥五个短名 API | gdtensor/builder.py + 包顶层（无 torch 环境返回 InvalidArgumentError） | test_spec_alignment |
+| B.2.2.5/6 session/access ABC + init_data_accessor | gdtensor/session.py，具体会话/accessor 注册为虚拟子类 | test_spec_alignment |
+| B.2.3.5 NaiveDTensor.torch_d_tensor | dtensor.py 可选字段 | 元数据-only 桥测试 |
+| C.3 namespace io/builder/session/access/tag | gdtensor/io.py、gdtensor/__init__.py 顶层短名 | 导入测试 |
+
+兼容性处理：
+
+- 旧的 `Shard(0)` 位置参数、`Shard.axis`、`Ok/Err`、`ResultError` 全部保留，653 个旧测试零改动通过。
+- ResultError 现为五类 Error 的基类 GDTensorError 的别名；catch 装饰器把已知错误原样保留在 Err 里。
+- make_gd_tensor 需要 torch；本机无 torch，返回 InvalidArgumentError，其余桥接 API 在仿真 fabric 上可用。
+
+非目标（设计 9 节）：真实 torch.DTensor 解包、对象存储 multipart、分布式 barrier/重试，仍由 session/实现层承担，核心不实现。

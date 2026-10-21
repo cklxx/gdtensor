@@ -28,6 +28,11 @@ from .mesh import (
     resolve_storage_mesh,
 )
 from .result import Result, ResultError, catch
+from .constraints import check_constraints as _cc
+
+
+def _check(self):
+    return _cc(self)
 
 MeshT = TypeVar("MeshT")
 
@@ -39,6 +44,9 @@ class GlobalTensorMeta:
     global_shape: Tuple[int, ...]
     dtype: str
     itemsize: int
+
+    def check_constraints(self):
+        return _check(self)
 
     @property
     def numel(self) -> int:
@@ -52,20 +60,7 @@ class GlobalTensorMeta:
 # ---------------------------------------------------------------- B.2.3.7
 
 
-@dataclass(frozen=True)
-class Shard:
-    axis: int
-
-
-@dataclass(frozen=True)
-class Replicate:
-    pass
-
-
-@dataclass(frozen=True)
-class Partial:
-    pass
-
+from .tag import Partial, Replicate, Shard
 
 Placement = Union[Shard, Replicate, Partial]
 
@@ -77,6 +72,9 @@ class NaiveDTensor(Generic[MeshT]):
     global_tensor_meta: GlobalTensorMeta
     placements: Tuple[Placement, ...]
     mesh: MeshT
+    # B.2.3.5: underlying torch.DTensor for compute-side processing; None
+    # means metadata-only. Storage-side tensors keep it None.
+    torch_d_tensor: object = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +114,9 @@ class DTensorTable(Generic[MeshT]):
             if nd.global_tensor_id in self._order:
                 raise ResultError(f"duplicate tensor id {nd.global_tensor_id}")
             self._order[nd.global_tensor_id] = i
+
+    def check_constraints(self):
+        return _check(self)
 
     @property
     def tensor_ids(self) -> List[str]:
@@ -281,14 +282,24 @@ def box_of(naive: NaiveDTensor, mesh_shape: Tuple[int, ...], coords: Tuple[int, 
 
 
 def resolve_mesh(nd: NamedDTensor, side: str) -> np.ndarray:
-    """Participant ndarray: compute ranks, or storage columns (row t=0 only)."""
+    """Participant ndarray: compute ranks, or storage columns (row t=0 only).
+
+    Empty literal cells (-1) stay -1; mesh_coords treats them as unowned.
+    """
     naive = naive_of(nd)
     if side == "compute":
         return resolve_compute_mesh(naive.mesh)
     cells, w_size = resolve_storage_mesh(naive.mesh)
-    if np.any(cells // w_size != 0):
+    valid = cells >= 0
+    if np.any(valid & (cells // w_size != 0)):
         raise ResultError(f"{nd.global_tensor_id}: SingleTensorStorageMesh covers tensor row != 0")
-    return cells % w_size
+    out = cells % w_size
+    out[~valid] = -1
+    return out
+
+
+def participants_of(nd: NamedDTensor, side: str) -> List[int]:
+    return sorted(int(x) for x in resolve_mesh(nd, side).ravel() if x >= 0)
 
 
 def owned_box(nd: NamedDTensor, side: str, participant: int) -> Optional[Tuple[List[int], List[int]]]:
