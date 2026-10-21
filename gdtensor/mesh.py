@@ -44,6 +44,27 @@ class Slice:
 
 
 @dataclass(frozen=True)
+class LiteralMesh:
+    """Explicit rank list (B.3.2), used when no regular arranged form exists.
+
+    ``ranks`` lists participants in order; ``max_`` is the exclusive upper
+    bound tagged by dimension (world_size / tensor_count / ...). Compute meshes
+    may use LiteralMesh as a base; storage ``content_slots`` accepts it.
+    """
+
+    ranks: Tuple[int, ...]
+    max_: int
+
+    def __post_init__(self) -> None:
+        if not self.ranks:
+            raise ResultError("LiteralMesh ranks must be non-empty")
+        if any(not isinstance(r, int) or r < 0 or r >= self.max_ for r in self.ranks):
+            raise ResultError(f"LiteralMesh rank outside [0, {self.max_})")
+        if len(set(self.ranks)) != len(self.ranks):
+            raise ResultError("LiteralMesh ranks contain duplicates")
+
+
+@dataclass(frozen=True)
 class ReshapedMesh:
     underlying_mesh: "AnyMesh"
     shape: Tuple[int, ...]
@@ -73,18 +94,20 @@ class OuterProductMesh:
     content_slots: ArrangedMesh  # "world_size"
 
     def __post_init__(self) -> None:
-        if self.content_slots.tag != "world_size":
-            raise ResultError("content_slots must be ArrangedMesh['world_size']")
-        if self.tensor_slots.tag not in ("constant_one", "tensor_count"):
+        if isinstance(self.content_slots, ArrangedMesh) and self.content_slots.tag != "world_size":
+            raise ResultError("content_slots must be ArrangedMesh['world_size'] or LiteralMesh")
+        if isinstance(self.tensor_slots, ArrangedMesh) and self.tensor_slots.tag not in ("constant_one", "tensor_count"):
             raise ResultError("tensor_slots must be 'constant_one' or 'tensor_count'")
 
 
-AnyMesh = Union[ArrangedMesh, ReshapedMesh, PermutedMesh, SlicedMesh, OuterProductMesh]
+AnyMesh = Union[ArrangedMesh, LiteralMesh, ReshapedMesh, PermutedMesh, SlicedMesh, OuterProductMesh]
 
-# ComputeMesh = $arranged ArrangedMesh["world_size"] | $reshaped | $permuted | $sliced
-ComputeMesh = Union[ArrangedMesh, ReshapedMesh, PermutedMesh, SlicedMesh]
+# ComputeMesh = $literal | $arranged | $reshaped | $permuted | $sliced
+ComputeMesh = Union[LiteralMesh, ArrangedMesh, ReshapedMesh, PermutedMesh, SlicedMesh]
 # StorageMesh[T] = $outer_product_mesh | $reshaped_mesh | $sliced_mesh
 StorageMesh = Union[OuterProductMesh, ReshapedMesh, SlicedMesh]
+# ContentSlotsMesh = LiteralMesh[world_size] | ArrangedMesh[world_size]
+ContentSlotsMesh = Union[LiteralMesh, ArrangedMesh]
 
 
 def _apply_transform(mesh: AnyMesh, inner: np.ndarray) -> np.ndarray:
@@ -111,6 +134,8 @@ def _apply_transform(mesh: AnyMesh, inner: np.ndarray) -> np.ndarray:
 
 def resolve_compute_mesh(mesh: ComputeMesh) -> np.ndarray:
     """Return the ndarray of global ranks of a ComputeMesh."""
+    if isinstance(mesh, LiteralMesh):
+        return np.array(mesh.ranks, dtype=np.int64)
     if isinstance(mesh, ArrangedMesh):
         if mesh.tag != "world_size":
             raise ResultError("ComputeMesh base must be ArrangedMesh['world_size']")
@@ -133,6 +158,8 @@ def storage_mesh_base(mesh: StorageMesh) -> OuterProductMesh:
 def resolve_storage_mesh(mesh: StorageMesh) -> Tuple[np.ndarray, int]:
     """Return (ndarray of slot ids ``t*W+w``, W)."""
     if isinstance(mesh, OuterProductMesh):
+        if isinstance(mesh.tensor_slots, LiteralMesh) or isinstance(mesh.content_slots, LiteralMesh):
+            return _resolve_outer_product_literal(mesh)
         t_size = mesh.tensor_slots.size
         w_size = mesh.content_slots.size
         cells = np.arange(t_size * w_size, dtype=np.int64).reshape(t_size, w_size)
@@ -143,18 +170,48 @@ def resolve_storage_mesh(mesh: StorageMesh) -> Tuple[np.ndarray, int]:
     return _apply_transform(mesh, inner), w_size
 
 
+def _resolve_outer_product_literal(mesh: OuterProductMesh) -> Tuple[np.ndarray, int]:
+    """Outer product where one axis is a LiteralMesh.
+
+    A literal axis keeps an identity cell table sized by its max; only the
+    selected coordinates are non-empty (others are -1, i.e. no participant).
+    Callers filter -1 cells. Returning -1 keeps the table rectangular so
+    reshape/slice transforms still work.
+    """
+    ts, cs = mesh.tensor_slots, mesh.content_slots
+    if isinstance(ts, LiteralMesh):
+        t_size, t_ranks = ts.max_, list(ts.ranks)
+    else:
+        t_size, t_ranks = ts.size, list(range(ts.size))
+    if isinstance(cs, LiteralMesh):
+        w_size, w_ranks = cs.max_, list(cs.ranks)
+    else:
+        w_size, w_ranks = cs.size, list(range(cs.size))
+    cells = np.full((t_size, w_size), -1, dtype=np.int64)
+    for ti, tr in enumerate(t_ranks):
+        for wi, wr in enumerate(w_ranks):
+            cells[tr, wr] = ti * w_size + wr
+    return cells, w_size
+
+
 def is_single_tensor_storage_mesh(mesh: StorageMesh) -> bool:
-    return storage_mesh_base(mesh).tensor_slots.tag == "constant_one"
+    base = storage_mesh_base(mesh)
+    ts = base.tensor_slots
+    return (isinstance(ts, ArrangedMesh) and ts.tag == "constant_one") or (
+        isinstance(ts, LiteralMesh) and ts.max_ == 1)
 
 
 def is_multi_tensors_storage_mesh(mesh: StorageMesh) -> bool:
-    return storage_mesh_base(mesh).tensor_slots.tag == "tensor_count"
+    base = storage_mesh_base(mesh)
+    ts = base.tensor_slots
+    return (isinstance(ts, ArrangedMesh) and ts.tag == "tensor_count") or isinstance(ts, LiteralMesh)
 
 
 def storage_mesh_cells(mesh: StorageMesh) -> set:
-    """Set of (t, w) cells covered by a storage mesh."""
+    """Set of (t, w) cells covered by a storage mesh. -1 = empty literal cell."""
     cells, w_size = resolve_storage_mesh(mesh)
-    return {divmod(int(c), w_size) for c in cells.ravel()}
+    flat = cells.ravel()
+    return {divmod(int(c), w_size) for c in flat if c >= 0}
 
 
 def multi_mesh_row(mesh: StorageMesh, tensor_order: int) -> set:

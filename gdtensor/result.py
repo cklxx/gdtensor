@@ -1,49 +1,34 @@
-"""Result[T] = $ok T | $err str  (DTensorsView appendix B.3.3)."""
+"""Result wrapper and @catch decorator (spec B.3.3).
+
+The Ok / Err tags and the typed Error hierarchy live in gdtensor.tag. This
+module keeps the lite call style (``@catch``, ``ResultError``) as thin
+compatibility wrappers over them.
+"""
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
-from typing import Any, Callable, Generic, TypeVar, Union
+from typing import Any, Callable, Union
 
-T = TypeVar("T")
+from .tag import Err, GDTensorError, Ok  # re-exported
 
+T = type("T", (), {})()  # placeholder not used; real signatures use Any below
 
-class ResultError(RuntimeError):
-    """Raised by Err.unwrap()."""
-
-
-@dataclass(frozen=True)
-class Ok(Generic[T]):
-    value: T
-    ok = True
-
-    def unwrap(self) -> T:
-        return self.value
+ResultError = GDTensorError
+Result = Union[Ok, Err]
 
 
-@dataclass(frozen=True)
-class Err:
-    error: str
-    ok = False
-
-    def unwrap(self) -> Any:
-        raise ResultError(self.error)
-
-
-Result = Union[Ok[T], Err]
-
-
-def catch(fn: Callable[..., Any]) -> Callable[..., Result]:
-    """Wrap a function so that it returns Ok(value) or Err(message)."""
+def catch(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a function so it returns Ok(value) or Err(typed error)."""
 
     @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Result:
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             out = fn(*args, **kwargs)
-        except ResultError as exc:
-            return Err(str(exc))
-        except Exception as exc:  # noqa: BLE001 - lite core maps every failure to Err
-            return Err(f"{type(exc).__name__}: {exc}")
+        except GDTensorError as exc:
+            return Err(exc)
+        except Exception as exc:  # noqa: BLE001 - unknown failure maps to IO-ish Err
+            from .tag import GDTensorIOError
+            return Err(GDTensorIOError(f"{type(exc).__name__}: {exc}"))
         if isinstance(out, (Ok, Err)):
             return out
         return Ok(out)

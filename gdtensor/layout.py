@@ -33,6 +33,7 @@ from .mesh import (
     storage_mesh_cells,
 )
 from .result import Result, ResultError, catch
+from .constraints import check_constraints as _check
 
 ContainerFormat = Literal["safetensors", "distcp"]
 
@@ -44,6 +45,9 @@ class TensorComponentPos(NamedTuple):
 
 @dataclass(frozen=True)
 class DisjointStorageMeshList:
+    def check_constraints(self):
+        return _check(self)
+
     """One logical list per physical file.
 
     ``tensor_ids`` is a lite addition: the row labels of the "tensor_count"
@@ -81,6 +85,9 @@ def leader_tensor_component_pos_of(disjoint_storage_meshes: DisjointStorageMeshL
 
 @dataclass
 class PhysicalLayoutTable:
+    def check_constraints(self):
+        return _check(self)
+
     """Pure configuration data. No function fields; JSON-serializable."""
 
     container_format: ContainerFormat
