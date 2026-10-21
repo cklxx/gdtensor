@@ -136,3 +136,26 @@ def d_tensors_view_map(origin, map_core: DTensorsViewMapCore):
 
 
 
+
+
+# ------------------------------------------------------------------ C.3 re-exports
+# The builder namespace is the single import surface for every product type,
+# mesh, layout, typed error, and helper listed in design table C.3. The
+# implementations live in their own modules; this block only re-exports them.
+from .dtensor import (  # noqa: E402
+    DTensorTable, GenericDTensor, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
+    ReshapedDTensor, global_tensor_meta_of, tensor_order_value_of,
+)
+from .layout import (  # noqa: E402
+    ContainerFormat, DisjointStorageMeshList, PhysicalLayoutTable,
+    TensorComponentPos, file_path_of, leader_tensor_component_pos_of,
+)
+from .mesh import (  # noqa: E402
+    ArrangedMesh, ComputeMesh, ContentSlotsMesh, LiteralMesh, OuterProductMesh,
+    PermutedMesh, ReshapedMesh, Slice, SlicedMesh, StorageMesh,
+)
+from .tag import (  # noqa: E402
+    CheckFailedError, ConstraintViolationError, GDTensorIOError,
+    InvalidArgumentError, NotFoundError, Placement,
+)
+from .views import ComputeDTensorsView, DTensorsView, StorageDTensorsView  # noqa: E402
