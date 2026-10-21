@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gdtensor.dtensor import iv_intersect, iv_normalize, iv_subtract
+from gdtensor.dtensor import iv_intersect, iv_normalize, iv_prefix, iv_subtract
 from gdtensor.plan import _pair
 from gdtensor.ranges import RangeFromComputeView, RangeFromStorageView
 from gdtensor.result import ResultError
@@ -212,3 +212,25 @@ def test_pair_empty_plan_when_no_overlap():
     src = [(_iv([(20, 30)]), ("storage", "f", 20, 1))]
     with pytest.raises(ResultError, match="no source covers"):
         _pair(dst, src)
+
+
+# ------------------------------------------------------------------ mutants: touching-only cases
+
+
+def test_iv_intersect_only_touching_is_empty():
+    a = _iv([(0, 5)])
+    b = _iv([(5, 10)])
+    assert iv_intersect(a, b).size == 0
+    # intersect of two touching-only multi-interval lists must stay empty
+    a2 = _iv([(0, 5), (10, 15)])
+    b2 = _iv([(5, 10), (15, 20)])
+    assert iv_intersect(a2, b2).size == 0
+
+
+def test_iv_prefix_last_element_of_interval():
+    # points at the final element: looser end check would accept the point
+    # just past the interval
+    a = _iv([(10, 20)])
+    assert iv_prefix(a, np.array([19])).tolist() == [9]
+    with pytest.raises(Exception):
+        iv_prefix(a, np.array([20]))

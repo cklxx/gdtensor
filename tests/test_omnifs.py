@@ -215,3 +215,48 @@ def test_ssd_miss_does_not_imply_sunk(tmp_path):
     os.remove(cfg.sink_path)  # sink state not published
     res, _, _ = load(cfg, st, lay, ct, P)
     assert not res[0].ok
+
+
+def test_one_byte_overlap_is_rejected(tmp_path):
+    """Two KVs that overlap by exactly 1 byte must be rejected (boundary)."""
+    cfg, ct, st, lay = setup(tmp_path)
+    assert_all_ok(save(cfg, ct, st, lay)[0])
+    e = next(iter(KvStore(cfg).layout().values()))[0]
+    kv = KvStore(cfg)
+    # starts one byte before this KV ends, covers >= 1 byte: overlap
+    kv.put(e.rank, e.blob_id, e.chunk, e.chunk_offset + e.length - 1, b"\x00" * 2)
+    kv.flush(e.rank)
+    with pytest.raises(Exception, match="overlap"):
+        kv.layout(refresh=True)
+
+
+def test_gap_in_layout_journal_is_detected_on_read(tmp_path):
+    """A missing middle KV makes layout reads fail, not just commit checks."""
+    cfg, ct, st, lay = setup(tmp_path)
+    assert_all_ok(save(cfg, ct, st, lay)[0])
+    e = next(iter(KvStore(cfg).layout().values()))[0]
+    # delete this rank's journal entry by truncating its journal to keep only
+    # other entries (multi-KV chunks exist: small chunk + many ranks)
+    import gdtensor.omnifs as O
+    jp = kv_journal = KvStore(cfg)._journal_path(e.rank)
+    lines = open(jp).read().splitlines(keepends=True)
+    drop_key = json.loads(lines[0])["key"]
+    kept = [ln for ln in lines if json.loads(ln)["key"] != drop_key]
+    if len(kept) == len(lines):  # first entry unique chunk: try last instead
+        kept = lines[:-1]
+    if len(kept) == len(lines):
+        pytest.skip("no removable non-unique KV in this snapshot")
+    open(jp, "w").write("".join(kept))
+    kv2 = KvStore(cfg)
+    # the chunk that lost a KV now has a gap (or coverage fails); either way
+    # reading through the store must raise rather than return wrong bytes
+    m = Manifest.load(cfg.manifest_path)
+    io = OmniFsIO(cfg)
+    io.bind(m)
+    with pytest.raises(Exception):
+        for rel, f in m.files.items():
+            pos = 0
+            while pos < f["size"]:
+                n = min(cfg.chunk_bytes, f["size"] - pos)
+                io.pread(-1, rel, pos, n)
+                pos += n
