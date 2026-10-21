@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import zlib
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -133,7 +134,10 @@ class P2PReadCache:
                 peers = sorted(n for n in self._holders.get(key, ()) if n != node)
                 if peers:
                     holders = self._holders[key]
-                    data = self._l1[peers[hash((node, idx)) % len(peers)]][key]
+                    # Stable peer pick: Python hash() is salted per process,
+                    # which would change L2 routing across machines.
+                    pick = zlib.crc32(f"{node}:{idx}".encode()) % len(peers)
+                    data = self._l1[peers[pick]][key]
                     if self.max_replicas is None or len(holders) < self.max_replicas(path):
                         self._put(node, key, data)  # diffuse one more replica
                     tracer.count("L2_block_bytes", len(data))

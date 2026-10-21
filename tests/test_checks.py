@@ -306,3 +306,19 @@ def _cv(table, rank):
 
 def _sv(storage_view, rank):
     return storage_view
+
+def test_two_lists_mapping_to_one_path_is_rejected():
+    """check_physical_layout rejects two list leaders sharing one path."""
+    ct = compute_table(M, P)
+    st = storage_table(ct, P, "mirror")
+    lay = layout_builder("per_rank", st, P, "safetensors")
+    leaders = sorted(lay.file_paths)
+    assert len(leaders) >= 2
+    victim_paths = dict(lay.file_paths)
+    victim_paths[leaders[1]] = victim_paths[leaders[0]]
+    bad = PhysicalLayoutTable(lay.container_format, dict(lay.tensor_entries), victim_paths)
+    from gdtensor.plan import check_physical_layout
+    assert not check_physical_layout(st, bad).ok
+    from gdtensor.layout import build_payload_index
+    with pytest.raises(Exception):
+        build_payload_index(st, bad)
