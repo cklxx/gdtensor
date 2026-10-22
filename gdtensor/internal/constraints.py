@@ -202,12 +202,15 @@ def _list(o):
 
     if not o.disjoint_storage_mesh_list:
         return _err(o, "list_non_empty", "disjoint_storage_mesh_list is empty")
-    labels_error = _list_row_labels(o)
+    try:
+        labels_error = _list_row_labels(o)
+        cells = [storage_mesh_cells(m) for m in o.disjoint_storage_mesh_list]
+    except Exception as exc:
+        return _err(o, "meshes_disjoint", str(exc))
     if labels_error is not None:
         return labels_error
     seen = set()
-    for m in o.disjoint_storage_mesh_list:
-        c = storage_mesh_cells(m)
+    for c in cells:
         if seen & c:
             return _err(o, "meshes_disjoint", "meshes overlap inside one list")
         seen |= c

@@ -170,6 +170,33 @@ def test_function_signatures(path, parameters):
     assert list(inspect.signature(fn).parameters) == parameters
 
 
+def test_internal_plan_and_check_declarations_match_design_without_importing_them():
+    design = (ROOT / "docs" / "DTensorsView-design.md").read_text()
+    section = design[design.index("#### B.1.2 Plan APIs") : design.index("#### B.1.4")]
+    declarations = re.findall(
+        r"^(\w+)(?:\[[^\n]*\])? =\n    (Result\[\w+\])\n(.*?)(?=^\w|^```)",
+        section,
+        re.MULTILINE | re.DOTALL,
+    )
+    expected = {
+        name: (re.findall(r"^  <- \$(\w+) ", args, re.MULTILINE), result)
+        for name, result, args in declarations
+    }
+    tree = ast.parse((ROOT / "gdtensor" / "internal" / "plan.py").read_text())
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name.startswith(("d_tensors_view_rank_plan_", "check_"))
+    }
+    assert len(expected) == 8 and functions.keys() == expected.keys()
+    for name, node in functions.items():
+        parameters, result = expected[name]
+        assert [arg.arg for arg in node.args.args] == parameters
+        assert node.returns is not None
+        assert ast.unparse(node.returns) == result.replace("void", "None")
+
+
 def test_type_aliases_and_namespace_separation():
     for name in (
         "DTensorsView",
