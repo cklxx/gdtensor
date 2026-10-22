@@ -1,0 +1,32 @@
+name: gdtensor pre-merge gate
+
+trigger:
+  change:
+    branches: [main]
+  manual:
+
+jobs:
+  gate:
+    name: lint + full non-torch tests
+    image: hub.byted.org/codebase/ci_python_311
+    steps:
+      - name: Install dependencies
+        commands:
+          - python3 -m pip install --upgrade pip
+          - python3 -m pip install -i https://bytedpypi.byted.org/simple numpy safetensors pytest ruff
+      - name: Show tool versions
+        commands:
+          - python3 --version
+          - ruff --version
+      - name: Lint unused imports (ruff F401)
+        commands:
+          - ruff check --select F401 gdtensor gdtensor_sim tests
+      - name: Byte-compile
+        commands:
+          - python3 -m compileall -q gdtensor gdtensor_sim tests
+      - name: Public package import smoke
+        commands:
+          - python3 -c "import gdtensor, gdtensor.io, gdtensor.builder, gdtensor.session, gdtensor.access, gdtensor.tag, gdtensor.internal.api, gdtensor_sim.models"
+      - name: Pytest (torch tests skip without torch)
+        commands:
+          - python3 -m pytest -q -p no:cacheprovider
