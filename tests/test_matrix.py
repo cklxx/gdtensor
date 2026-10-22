@@ -14,7 +14,7 @@ from gdtensor.internal.formats import make_storage_view
 from gdtensor.internal.layout import TensorComponentPos, build_layout, build_payload_index, file_path_of
 from gdtensor.internal.mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
 from gdtensor.tag import ConstantOne, TensorCount, WorldSize
-from gdtensor.internal.models import (
+from gdtensor_sim.models import (
     ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table,
 )
 from gdtensor.internal.plan import (
@@ -23,7 +23,7 @@ from gdtensor.internal.plan import (
     check_storage_mesh_disjoint, d_tensors_view_rank_plan_load, d_tensors_view_rank_plan_reshard,
     d_tensors_view_rank_plan_save,
 )
-from gdtensor.internal.runner import compute_view, load_threads, reshard_threads, run_processes, save_threads
+from gdtensor_sim.runner import compute_view, load_threads, reshard_threads, run_processes, save_threads
 from gdtensor.internal.views import ComputeFabric
 
 M = ModelConfig(layers=4, hidden=32, ffn=64, vocab=128)
@@ -156,7 +156,7 @@ def test_reshard_storage_to_storage_hf_to_dcp(tmp_path):
     ct, st, lay, _ = roundtrip(src, M, P, "hf", "hf", "safetensors")
     st2 = storage_table(ct, P, "mirror")
     lay2 = layout_builder("per_rank", st2, P, "distcp")
-    from gdtensor.internal.coord import ThreadCoordinator
+    from gdtensor_sim.coord import ThreadCoordinator
     sv_src = make_storage_view(_ids(st), st, lay, src)
     sv_dst = make_storage_view(_ids(st2), st2, lay2, dst, coord=ThreadCoordinator(P.world))
     assert_all_ok(reshard_threads(P.world, lambda r: sv_src, lambda r: sv_dst))
@@ -286,8 +286,8 @@ def test_abort_on_one_rank_discards_shared_file(root):
     ct = compute_table(M, P)
     st = storage_table(ct, P, "hf")
     lay = layout_builder("single", st, P, "safetensors")
-    from gdtensor.internal.coord import ThreadCoordinator
-    from gdtensor.internal.runner import _run_threads
+    from gdtensor_sim.coord import ThreadCoordinator
+    from gdtensor_sim.runner import _run_threads
     sv = make_storage_view(_ids(st), st, lay, root, coord=ThreadCoordinator(P.world))
 
     def rank_fn(r):

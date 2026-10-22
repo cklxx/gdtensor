@@ -30,7 +30,7 @@ from .dtensor import (
     global_tensor_meta_of, named_of, nbytes_of,
 )
 from .result import Fail, InvalidArgumentError
-from ..tag import Ok, Replicate, Shard
+from ..tag import Ok, Replicate, Shard, WorldSize as _WorldSize
 from .views import ComputeFabric
 
 _TORCH_DTYPE_TO_NAME = {
@@ -91,10 +91,26 @@ def parallel_config_from_mesh(device_mesh) -> Tuple[int, int, int]:
     raise Fail(InvalidArgumentError(argument_name="device_mesh", msg=f"cannot map mesh shape {shape} to (pp,dp,tp)"))
 
 
+def _compute_mesh(pp: int, dp: int, tp: int, stage: int):
+    """Core compute mesh for one PP stage over a (pp, dp, tp) world.
+
+    Pure core construction (design mesh types); does not depend on the
+    business model layer. Mirrors gdtensor_sim.models.compute_mesh.
+    """
+    from .mesh import ArrangedMesh, ReshapedMesh, Slice, SlicedMesh
+    world = pp * dp * tp
+    return SlicedMesh(
+        ReshapedMesh(ArrangedMesh(_WorldSize(world)), [pp, dp, tp]),
+        [Slice(stage, stage + 1), None, None])
+
+
 def gd_compute_mesh(p, stage: int):
-    """SlicedMesh fixing the PP stage, matching models.compute_mesh."""
-    from .models import compute_mesh
-    return compute_mesh(p, stage)
+    """SlicedMesh fixing the PP stage, for a ParallelConfig-shaped p.
+
+    Kept for the test-framework helper gd_for_layout, whose p exposes
+    tp/dp/pp. Public gd_tensor_make builds the mesh directly.
+    """
+    return _compute_mesh(p.pp, p.dp, p.tp, stage)
 
 
 def _dtype_name(dt) -> Tuple[str, int]:
@@ -166,9 +182,9 @@ def _make(d_tensor, tensor_id: str, p=None, stage: int = 0, placements=None):
     if not hasattr(dt, "device_mesh") or not hasattr(dt, "placements"):
         raise Fail(InvalidArgumentError(argument_name="d_tensor", msg="input is not a torch.DTensor"))
     if p is None:
-        from .models import ParallelConfig
         pp, dp, tp = parallel_config_from_mesh(dt.device_mesh)
-        p = ParallelConfig(tp=tp, dp=dp, pp=pp)
+    else:
+        pp, dp, tp = p.pp, p.dp, p.tp
     dtype, itemsize = _dtype_name(dt)
     meta = GlobalTensorMeta(tuple(int(x) for x in dt.shape), dtype, itemsize)
     if placements is None:
@@ -176,7 +192,8 @@ def _make(d_tensor, tensor_id: str, p=None, stage: int = 0, placements=None):
         # pad placements to (pp, dp, tp): torch meshes without pp/dp are replicated
         if len(placements) < 3:
             placements = (Replicate(),) * (3 - len(placements)) + placements
-    return Ok(NaiveDTensor(meta, tuple(placements), gd_compute_mesh(p, stage), torch_d_tensor=dt))
+    return Ok(NaiveDTensor(meta, tuple(placements), _compute_mesh(pp, dp, tp, stage),
+                            torch_d_tensor=dt))
 
 
 # ------------------------------------------------------------------ fabric fill

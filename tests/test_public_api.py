@@ -23,13 +23,13 @@ import gdtensor.tag as gt  # noqa: E402
 
 # fixtures only (not the system under test)
 from gdtensor.internal.dtensor import tensor_ids_of  # noqa: E402
-from gdtensor.internal.models import (  # noqa: E402
+from gdtensor_sim.models import (  # noqa: E402
     ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table,
 )
 from gdtensor.internal.formats import make_storage_view  # noqa: E402
-from gdtensor.internal.runner import compute_view  # noqa: E402
+from gdtensor_sim.runner import compute_view  # noqa: E402
 from gdtensor.internal.views import ComputeFabric  # noqa: E402
-from gdtensor.internal.coord import ThreadCoordinator  # noqa: E402
+from gdtensor_sim.coord import ThreadCoordinator  # noqa: E402
 from gdtensor.internal.result import Fail  # noqa: E402
 
 M = ModelConfig(layers=1, hidden=8, ffn=16, vocab=32)

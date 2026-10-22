@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from conftest import assert_all_ok, verify_safetensors_dir
 from gdtensor.internal.dtensor import tensor_ids_of as _ids  # noqa: E402
 from gdtensor.internal.dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor
-from gdtensor.internal.models import (
+from gdtensor_sim.models import (
     ModelConfig, ParallelConfig, compute_mesh, compute_table, fill_pattern, layout_builder,
     storage_table,
 )
@@ -24,9 +24,9 @@ from gdtensor.internal.api import d_tensors_view_rank_plan_save
 from gdtensor.internal.ranges import RangeFromStorageView
 from gdtensor.internal.dtensor import Replicate, Shard
 from gdtensor.internal.iobackend import FileIO
-from gdtensor.internal.coord import ThreadCoordinator
+from gdtensor_sim.coord import ThreadCoordinator
 from gdtensor.internal.formats import make_storage_view
-from gdtensor.internal.runner import compute_view, reshard_threads
+from gdtensor_sim.runner import compute_view, reshard_threads
 from gdtensor.internal.views import ComputeDataAccessor, ComputeFabric
 
 MiB = 1 << 20

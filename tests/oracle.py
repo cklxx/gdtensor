@@ -19,7 +19,7 @@ import numpy as np
 
 from gdtensor.internal.dtensor import global_tensor_meta_of, iv_normalize, iv_total, named_of, owned_intervals
 from gdtensor.internal.layout import PayloadIndex
-from gdtensor.internal.models import interval_elems
+from gdtensor_sim.models import interval_elems
 from gdtensor.internal.ranges import RangeFromComputeView, RangeFromStorageView
 
 
