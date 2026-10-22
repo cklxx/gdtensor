@@ -25,21 +25,29 @@ Load sessions read the headers of the files that hold this rank's storage
 column plus every file it leads at begin_load; other headers are read on the
 first get_file_offset that needs them.
 """
+
 from __future__ import annotations
 
 import json
 import os
 import struct
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .dtensor import DTensorTable, global_tensor_meta_of, nbytes_of, numel_of, owned_box
+from gdtensor.builder import (
+    DTensorTable,
+    PhysicalLayoutTable,
+    TensorComponentPos,
+    global_tensor_meta_of,
+)
+from ._geometry import nbytes_of, numel_of, owned_box
+from ._layout import PayloadIndex, SlotPayload, build_payload_index, pos_key
+from ._result import catch, invalid, io_error, not_found
 from .iobackend import FileIO
-from .layout import PayloadIndex, PhysicalLayoutTable, SlotPayload, TensorComponentPos, build_payload_index, pos_key
-from .result import catch, invalid, io_error, not_found
-from ..session import StorageLoadSession, StorageSaveSession
+from gdtensor.session import StorageLoadSession, StorageSaveSession
 
 METADATA_NAME = ".metadata"
 HF_INDEX_NAME = "model.safetensors.index.json"
@@ -48,7 +56,9 @@ HF_INDEX_NAME = "model.safetensors.index.json"
 # ------------------------------------------------------------------ headers
 
 
-def _whole_tensor_files(table: DTensorTable, index: PayloadIndex) -> Dict[Tuple[str, int], bool]:
+def _whole_tensor_files(
+    table: DTensorTable, index: PayloadIndex
+) -> Dict[Tuple[str, int], bool]:
     """(path, tensor_order) -> True if the file's slots form the full tensor."""
     out = {}
     for path, fp in index.files.items():
@@ -58,9 +68,20 @@ def _whole_tensor_files(table: DTensorTable, index: PayloadIndex) -> Dict[Tuple[
         for t, slots in by_t.items():
             numel = numel_of(global_tensor_meta_of(table.named_d_tensors[t]))
             iv = np.concatenate([s.intervals for s in slots])
-            ok = iv[0, 0] == 0 and iv[-1, 1] == numel and bool(np.all(iv[1:, 0] == iv[:-1, 1]))
+            ok = (
+                iv[0, 0] == 0
+                and iv[-1, 1] == numel
+                and bool(np.all(iv[1:, 0] == iv[:-1, 1]))
+            )
             out[(path, t)] = ok
     return out
+
+
+def _storage_box(nd, rank):
+    box = owned_box(nd, "storage", rank)
+    if box is None:
+        raise invalid("storage_mesh", "payload slot is not on the storage mesh")
+    return box
 
 
 def safetensors_header(table: DTensorTable, index: PayloadIndex, path: str) -> bytes:
@@ -71,9 +92,9 @@ def safetensors_header(table: DTensorTable, index: PayloadIndex, path: str) -> b
     for s in fp.slots:
         nd = table.named_d_tensors[s.tensor_order]
         meta = global_tensor_meta_of(nd)
+        if whole[(path, s.tensor_order)] and s.tensor_order in emitted:
+            continue
         if whole[(path, s.tensor_order)]:
-            if s.tensor_order in emitted:
-                continue
             emitted.add(s.tensor_order)
             begin = s.contiguous_payload_offset
             header[nd.global_tensor_id] = {
@@ -81,31 +102,50 @@ def safetensors_header(table: DTensorTable, index: PayloadIndex, path: str) -> b
                 "shape": list(meta.global_shape),
                 "data_offsets": [begin, begin + nbytes_of(meta)],
             }
-        else:
-            lo, hi = owned_box(nd, "storage", s.pos.rank)
-            header[f"{nd.global_tensor_id}/slot{s.pos.rank}"] = {
-                "dtype": meta.dtype,
-                "shape": [h - l for l, h in zip(lo, hi)],
-                "data_offsets": [s.contiguous_payload_offset, s.contiguous_payload_offset + s.nbytes],
-            }
+            continue
+        lo, hi = _storage_box(nd, s.pos.rank)
+        header[f"{nd.global_tensor_id}/slot{s.pos.rank}"] = {
+            "dtype": meta.dtype,
+            "shape": [h - l for l, h in zip(lo, hi)],
+            "data_offsets": [
+                s.contiguous_payload_offset,
+                s.contiguous_payload_offset + s.nbytes,
+            ],
+        }
     raw = json.dumps(header, separators=(",", ":")).encode()
     raw += b" " * (-len(raw) % 8)
     return struct.pack("<Q", len(raw)) + raw
 
 
-def distcp_metadata(table: DTensorTable, layout: PhysicalLayoutTable, index: PayloadIndex) -> bytes:
+def distcp_metadata(
+    table: DTensorTable, layout: PhysicalLayoutTable, index: PayloadIndex
+) -> bytes:
     tensors = []
     for nd in table.named_d_tensors:
         m = global_tensor_meta_of(nd)
-        tensors.append({"id": nd.global_tensor_id, "shape": list(m.global_shape), "dtype": m.dtype, "itemsize": m.itemsize})
+        tensors.append(
+            {
+                "id": nd.global_tensor_id,
+                "shape": list(m.global_shape),
+                "dtype": m.dtype,
+                "itemsize": m.itemsize,
+            }
+        )
     chunks = []
     for path in sorted(index.files):
         for s in index.files[path].slots:
-            lo, hi = owned_box(table.named_d_tensors[s.tensor_order], "storage", s.pos.rank)
-            chunks.append({
-                "tensor_id": s.pos.tensor_id, "slot": s.pos.rank, "file": path,
-                "offset": s.contiguous_payload_offset, "size": s.nbytes, "box_lo": lo, "box_hi": hi,
-            })
+            lo, hi = _storage_box(table.named_d_tensors[s.tensor_order], s.pos.rank)
+            chunks.append(
+                {
+                    "tensor_id": s.pos.tensor_id,
+                    "slot": s.pos.rank,
+                    "file": path,
+                    "offset": s.contiguous_payload_offset,
+                    "size": s.nbytes,
+                    "box_lo": lo,
+                    "box_hi": hi,
+                }
+            )
     doc = {"format": "gdtensor-distcp", "tensors": tensors, "chunks": chunks}
     return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
 
@@ -133,6 +173,32 @@ class _Base:
         return sorted(out)
 
 
+def _size_file(path, size):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.ftruncate(fd, size)
+    finally:
+        os.close(fd)
+
+
+def _sync_file(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _finish_publication(session, published, error):
+    if not published:
+        return error
+    try:
+        session._after_barrier()
+    except BaseException as exc:
+        return exc
+    return error
+
+
 class SaveSessionBase(_Base, StorageSaveSession):
     tmp_suffix = ""
 
@@ -150,23 +216,30 @@ class SaveSessionBase(_Base, StorageSaveSession):
 
     def _open_files(self) -> None:
         for path in self.my_files():
-            full = self.abspath(path)
-            os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
-            header = self._header(path)
-            self.data_start[path] = len(header)
-            fd = os.open(full, os.O_RDWR | os.O_CREAT, 0o644)
-            try:
-                os.ftruncate(fd, len(header) + self.index.files[path].payload_size)
-            finally:
-                os.close(fd)
-            if header and self.index.files[path].leader.rank == self.rank:
-                self.io.pwrite(self.rank, full, 0, header)  # header first, data later
+            self._open_file(path)
+
+    def _open_file(self, path):
+        full = self.abspath(path)
+        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+        header = self._header(path)
+        self.data_start[path] = len(header)
+        _size_file(full, len(header) + self.index.files[path].payload_size)
+        if header and self.index.files[path].leader.rank == self.rank:
+            self.io.pwrite(self.rank, full, 0, header)
+
+    def _leader_files(self):
+        return [
+            path
+            for path in self.my_files()
+            if self.index.files[path].leader.rank == self.rank
+        ]
 
     @catch
     def init_data_accessor(self):
         if self.state != "open":
             raise invalid("session", f"init_data_accessor on {self.state} session")
-        from .views import StorageDataAccessor
+        from .access import StorageDataAccessor
+
         return StorageDataAccessor(self.index, self.io, session=self)
 
     @catch
@@ -175,7 +248,9 @@ class SaveSessionBase(_Base, StorageSaveSession):
             raise invalid("session", f"get_file_offset on {self.state} session")
         hit = self.index.slots.get(pos)
         if hit is None:
-            raise not_found("tensor_entries", pos_key(pos), f"{pos_key(pos)} has no physical file")
+            raise not_found(
+                "tensor_entries", pos_key(pos), f"{pos_key(pos)} has no physical file"
+            )
         path, slot = hit
         if path not in self.data_start:
             self.data_start[path] = len(self._header(path))
@@ -189,10 +264,6 @@ class SaveSessionBase(_Base, StorageSaveSession):
 
     def _vote(self, ok: bool) -> bool:
         return ok if self.coord is None else self.coord.vote(ok)
-
-    def _wait(self) -> None:
-        if self.coord is not None:
-            self.coord.wait()
 
     @catch
     def commit(self) -> None:
@@ -209,15 +280,15 @@ class SaveSessionBase(_Base, StorageSaveSession):
             self._publish()
         except BaseException as exc:  # noqa: BLE001
             err = exc
-        self._wait()
-        if err is None:
-            try:
-                self._after_barrier()
-            except BaseException as exc:  # noqa: BLE001
-                err = exc
-        if err is not None:
+        published = self._vote(err is None)
+        err = _finish_publication(self, published, err)
+        completed = self._vote(published and err is None)
+        if not completed:
             self.state = "unknown"  # keep payloads; abort must not delete them
-            raise io_error("commit", f"commit outcome unknown: {err}")
+            raise io_error(
+                "commit",
+                f"commit outcome unknown: {err or 'another rank failed to publish'}",
+            )
         self.state = "committed"
 
     @catch
@@ -233,12 +304,8 @@ class SaveSessionBase(_Base, StorageSaveSession):
         self._discard()
 
     def _discard(self) -> None:
-        for path in self.my_files():
-            if self.index.files[path].leader.rank == self.rank:
-                try:
-                    os.remove(self.abspath(path))
-                except FileNotFoundError:
-                    pass
+        for path in self._leader_files():
+            Path(self.abspath(path)).unlink(missing_ok=True)
 
 
 class SafeTensorsSaveSession(SaveSessionBase):
@@ -255,16 +322,10 @@ class SafeTensorsSaveSession(SaveSessionBase):
         return self._headers[path]
 
     def _publish(self) -> None:
-        for path in self.my_files():
-            if self.index.files[path].leader.rank != self.rank:
-                continue
+        for path in self._leader_files():
             tmp, final = self.abspath(path), os.path.join(self.root, path)
-            fd = os.open(tmp, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.replace(tmp, final)  # readers see no file or the full new file
+            _sync_file(tmp)
+            os.replace(tmp, final)
 
     def _after_barrier(self) -> None:
         """HF directory: the lowest leader writes model.safetensors.index.json
@@ -278,7 +339,9 @@ class SafeTensorsSaveSession(SaveSessionBase):
         weight_map = {}
         for (path, t), _ in sorted(whole.items(), key=lambda kv: kv[0][1]):
             weight_map[self.table.named_d_tensors[t].global_tensor_id] = path
-        total = sum(nbytes_of(global_tensor_meta_of(nd)) for nd in self.table.named_d_tensors)
+        total = sum(
+            nbytes_of(global_tensor_meta_of(nd)) for nd in self.table.named_d_tensors
+        )
         doc = {"metadata": {"total_size": total}, "weight_map": weight_map}
         tmp = os.path.join(self.root, HF_INDEX_NAME + ".tmp")
         with open(tmp, "w") as f:
@@ -297,23 +360,19 @@ class DcpSaveSession(SaveSessionBase):
         return min(fp.leader.rank for fp in self.index.files.values())
 
     def _publish(self) -> None:
-        for path in self.my_files():
-            if self.index.files[path].leader.rank == self.rank:
-                fd = os.open(self.abspath(path), os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
+        for path in self._leader_files():
+            _sync_file(self.abspath(path))
 
     def _after_barrier(self) -> None:
-        if self.rank == self._coordinator():
-            tmp = os.path.join(self.root, METADATA_NAME + ".tmp")
-            data = distcp_metadata(self.table, self.layout, self.index)
-            with open(tmp, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, os.path.join(self.root, METADATA_NAME))  # completion marker
+        if self.rank != self._coordinator():
+            return
+        tmp = os.path.join(self.root, METADATA_NAME + ".tmp")
+        data = distcp_metadata(self.table, self.layout, self.index)
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(self.root, METADATA_NAME))
 
 
 class LoadSessionBase(_Base, StorageLoadSession):
@@ -329,7 +388,8 @@ class LoadSessionBase(_Base, StorageLoadSession):
     def init_data_accessor(self):
         if self.state != "open":
             raise invalid("session", f"init_data_accessor on {self.state} session")
-        from .views import StorageDataAccessor
+        from .access import StorageDataAccessor
+
         return StorageDataAccessor(self.index, self.io, session=self)
 
     @catch
@@ -337,13 +397,22 @@ class LoadSessionBase(_Base, StorageLoadSession):
         if self.state != "open":
             raise invalid("session", f"get_file_offset on {self.state} session")
         if pos not in self.offsets:
-            hit = self.index.slots.get(pos)
-            if hit is None:
-                raise not_found("tensor_entries", pos_key(pos), f"{pos_key(pos)} has no physical file")
-            self._read_file_offsets(hit[0])
+            self._read_component(pos)
         if pos not in self.offsets:
-            raise not_found("tensor_entries", pos_key(pos), f"{pos_key(pos)} not found in header / metadata")
+            raise not_found(
+                "tensor_entries",
+                pos_key(pos),
+                f"{pos_key(pos)} not found in header / metadata",
+            )
         return self.offsets[pos]
+
+    def _read_component(self, pos):
+        hit = self.index.slots.get(pos)
+        if hit is None:
+            raise not_found(
+                "tensor_entries", pos_key(pos), f"{pos_key(pos)} has no physical file"
+            )
+        self._read_file_offsets(hit[0])
 
     @catch
     def finish(self) -> None:
@@ -370,19 +439,37 @@ class SafeTensorsLoadSession(LoadSessionBase):
             raise io_error("read", str(exc), full) from None
         data_start = 8 + n
         seen: Dict[int, int] = {}
-        for s in self.index.files[path].slots:
-            tid = s.pos.tensor_id
-            if tid in header:
-                first = seen.setdefault(s.tensor_order, s.contiguous_payload_offset)
-                begin = header[tid]["data_offsets"][0] + (s.contiguous_payload_offset - first)
-            elif f"{tid}/slot{s.pos.rank}" in header:
-                ent = header[f"{tid}/slot{s.pos.rank}"]
-                if ent["data_offsets"][1] - ent["data_offsets"][0] != s.nbytes:
-                    raise io_error("read", f"{path}: size mismatch for {tid}/slot{s.pos.rank}", full)
-                begin = ent["data_offsets"][0]
-            else:
-                raise not_found("tensor_id", tid, f"{path}: header lacks {tid}")
-            self.offsets[s.pos] = data_start + begin
+        for slot in self.index.files[path].slots:
+            self.offsets[slot.pos] = data_start + _safetensors_slot_offset(
+                self.table, slot, header, seen, path, full
+            )
+
+
+def _safetensors_slot_offset(table, slot, header, seen, path, full):
+    tid = slot.pos.tensor_id
+    nd = table.named_d_tensors[slot.tensor_order]
+    meta = global_tensor_meta_of(nd)
+    if tid in header:
+        entry = header[tid]
+        expected_shape, expected_size = list(meta.global_shape), nbytes_of(meta)
+        first = seen.setdefault(slot.tensor_order, slot.contiguous_payload_offset)
+        begin = entry["data_offsets"][0] + slot.contiguous_payload_offset - first
+    elif f"{tid}/slot{slot.pos.rank}" in header:
+        entry = header[f"{tid}/slot{slot.pos.rank}"]
+        lo, hi = _storage_box(nd, slot.pos.rank)
+        expected_shape, expected_size = [h - l for l, h in zip(lo, hi)], slot.nbytes
+        begin = entry["data_offsets"][0]
+    else:
+        raise not_found("tensor_id", tid, f"{path}: header lacks {tid}")
+    offsets = entry["data_offsets"]
+    if (
+        entry.get("dtype") != meta.dtype
+        or entry.get("shape") != expected_shape
+        or offsets[0] < 0
+        or offsets[1] - offsets[0] != expected_size
+    ):
+        raise io_error("read", f"{path}: metadata mismatch for {tid}", full)
+    return begin
 
 
 class DcpLoadSession(LoadSessionBase):
@@ -390,13 +477,52 @@ class DcpLoadSession(LoadSessionBase):
         super().__init__(*a, **kw)
         full = os.path.join(self.root, METADATA_NAME)
         if not os.path.exists(full):
-            raise io_error("open", "distcp checkpoint is incomplete: .metadata is missing", full)
+            raise io_error(
+                "open", "distcp checkpoint is incomplete: .metadata is missing", full
+            )
         doc = json.loads(self.io.pread(self.rank, full, 0, os.path.getsize(full)))
-        for c in doc["chunks"]:
-            self.offsets[TensorComponentPos(c["tensor_id"], c["slot"])] = c["offset"]
-        for pos, (path, s) in self.index.slots.items():
-            if self.offsets.get(pos) != s.contiguous_payload_offset:
-                raise io_error("read", f".metadata disagrees with layout at {pos_key(pos)}", full)
+        expected_tensors = [_tensor_schema(nd) for nd in self.table.named_d_tensors]
+        if (
+            doc.get("format") != "gdtensor-distcp"
+            or doc.get("tensors") != expected_tensors
+        ):
+            raise io_error(
+                "read", ".metadata tensor schema disagrees with layout", full
+            )
+        self.offsets = _dcp_offsets(self.index, doc, full)
+
+
+def _tensor_schema(nd):
+    meta = global_tensor_meta_of(nd)
+    return {
+        "id": nd.global_tensor_id,
+        "shape": list(meta.global_shape),
+        "dtype": meta.dtype,
+        "itemsize": meta.itemsize,
+    }
+
+
+def _dcp_offsets(index, doc, full):
+    offsets = {}
+    for chunk in doc["chunks"]:
+        pos = TensorComponentPos(chunk["tensor_id"], chunk["slot"])
+        hit = index.slots.get(pos)
+        if hit is None or pos in offsets:
+            raise io_error(
+                "read", f".metadata has unknown or duplicate chunk {pos_key(pos)}", full
+            )
+        path, slot = hit
+        if chunk["file"] != path or chunk["size"] != slot.nbytes:
+            raise io_error(
+                "read", f".metadata chunk disagrees with layout at {pos_key(pos)}", full
+            )
+        offsets[pos] = chunk["offset"]
+    for pos, (_, slot) in index.slots.items():
+        if offsets.get(pos) != slot.contiguous_payload_offset:
+            raise io_error(
+                "read", f".metadata disagrees with layout at {pos_key(pos)}", full
+            )
+    return offsets
 
 
 # ------------------------------------------------------------------ factory
@@ -411,7 +537,8 @@ def make_storage_view(
     coord=None,
 ):
     """Business constructor: a StorageDTensorsView over files in ``root``."""
-    from .views import StorageDataAccessor, StorageDTensorsView
+    from .access import StorageDataAccessor
+    from gdtensor.builder import StorageDTensorsView
 
     io = io or FileIO()
     index = build_payload_index(table, layout)
@@ -423,11 +550,27 @@ def make_storage_view(
 
     @catch
     def begin_save(view, rank: int):
-        return save_cls(rank, root, view.d_tensor_table, view.physical_layout, index, io, coord=coord)
+        return save_cls(
+            rank,
+            root,
+            view.d_tensor_table,
+            view.physical_layout,
+            index,
+            io,
+            coord=coord,
+        )
 
     @catch
     def begin_load(view, rank: int):
-        return load_cls(rank, root, view.d_tensor_table, view.physical_layout, index, io)
+        try:
+            return load_cls(
+                rank, root, view.d_tensor_table, view.physical_layout, index, io
+            )
+        except BaseException:
+            io.fds.close_rank(rank, root)
+            raise
 
     accessor = StorageDataAccessor(index=index, io=io)
-    return StorageDTensorsView(list(tensor_ids), table, accessor, layout, begin_save, begin_load)
+    return StorageDTensorsView(
+        list(tensor_ids), table, accessor, layout, begin_save, begin_load
+    )

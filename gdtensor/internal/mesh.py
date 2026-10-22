@@ -11,9 +11,11 @@ Resolution (internal): a mesh resolves to an integer ndarray.
   row, ``w`` is the content-slot column (global rank), ``W`` is the
   content-slot world size. Cells not selected by a LiteralMesh are -1.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import GenericAlias
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -25,19 +27,31 @@ from ..tag import ConstantOne, TensorCount, WorldSize
 
 def _cc(self):
     from .constraints import check_constraints
+
     return check_constraints(self)
 
 
 # ---------------------------------------------------------------- B.3.2
 
 ArrangedMeshBuilderMixin = make_builder_mixin("ArrangedMesh", [("size", "scalar")])
-LiteralMeshBuilderMixin = make_builder_mixin("LiteralMesh", [("ranks", "list"), ("max", "scalar")])
-ReshapedMeshBuilderMixin = make_builder_mixin("ReshapedMesh", [("underlying_mesh", "object"), ("shape", "list")])
-PermutedMeshBuilderMixin = make_builder_mixin("PermutedMesh", [("underlying_mesh", "object"), ("permutation", "list")])
-SlicedMeshBuilderMixin = make_builder_mixin("SlicedMesh", [("underlying_mesh", "object"), ("slices", "list")])
-SliceBuilderMixin = make_builder_mixin("Slice", [("start", "nullable"), ("stop", "nullable"), ("step", "nullable")])
+LiteralMeshBuilderMixin = make_builder_mixin(
+    "LiteralMesh", [("ranks", "list"), ("max", "scalar")]
+)
+ReshapedMeshBuilderMixin = make_builder_mixin(
+    "ReshapedMesh", [("underlying_mesh", "oneof"), ("shape", "list")]
+)
+PermutedMeshBuilderMixin = make_builder_mixin(
+    "PermutedMesh", [("underlying_mesh", "oneof"), ("permutation", "list")]
+)
+SlicedMeshBuilderMixin = make_builder_mixin(
+    "SlicedMesh", [("underlying_mesh", "oneof"), ("slices", "list")]
+)
+SliceBuilderMixin = make_builder_mixin(
+    "Slice", [("start", "nullable"), ("stop", "nullable"), ("step", "nullable")]
+)
 OuterProductMeshBuilderMixin = make_builder_mixin(
-    "OuterProductMesh", [("tensor_slots", "object"), ("content_slots", "object")])
+    "OuterProductMesh", [("tensor_slots", "object"), ("content_slots", "oneof")]
+)
 
 
 _hash = field_hash
@@ -49,7 +63,7 @@ class ArrangedMesh(ArrangedMeshBuilderMixin):
     __hash__ = _hash
 
     def __class_getitem__(cls, item):
-        return cls
+        return GenericAlias(cls, item)
 
     def check_constraints(self):
         return _cc(self)
@@ -65,7 +79,7 @@ class LiteralMesh(LiteralMeshBuilderMixin):
         self.ranks = list(self.ranks)
 
     def __class_getitem__(cls, item):
-        return cls
+        return GenericAlias(cls, item)
 
     def check_constraints(self):
         return _cc(self)
@@ -81,7 +95,7 @@ class ReshapedMesh(ReshapedMeshBuilderMixin):
         self.shape = list(self.shape)
 
     def __class_getitem__(cls, item):
-        return cls
+        return GenericAlias(cls, item)
 
     def check_constraints(self):
         return _cc(self)
@@ -97,7 +111,7 @@ class PermutedMesh(PermutedMeshBuilderMixin):
         self.permutation = list(self.permutation)
 
     def __class_getitem__(cls, item):
-        return cls
+        return GenericAlias(cls, item)
 
     def check_constraints(self):
         return _cc(self)
@@ -124,7 +138,7 @@ class SlicedMesh(SlicedMeshBuilderMixin):
         self.slices = list(self.slices)
 
     def __class_getitem__(cls, item):
-        return cls
+        return GenericAlias(cls, item)
 
     def check_constraints(self):
         return _cc(self)
@@ -140,7 +154,7 @@ class OuterProductMesh(OuterProductMeshBuilderMixin):
     __hash__ = _hash
 
     def __class_getitem__(cls, item):
-        return cls
+        return GenericAlias(cls, item)
 
     def check_constraints(self):
         return _cc(self)
@@ -163,7 +177,7 @@ def tag_int(tagged, *tags) -> int:
 
 def _apply_transform(mesh, inner: np.ndarray) -> np.ndarray:
     if type(mesh) is ReshapedMesh:
-        shape = tuple(int(s) for s in mesh.shape)
+        shape = tuple(mesh.shape)
         if int(np.prod(shape, dtype=np.int64)) != inner.size:
             raise invalid("mesh", f"reshape {inner.shape} -> {shape} changes mesh size")
         return inner.reshape(shape)
@@ -174,8 +188,13 @@ def _apply_transform(mesh, inner: np.ndarray) -> np.ndarray:
         return inner.transpose(perm)
     if type(mesh) is SlicedMesh:
         if len(mesh.slices) != inner.ndim:
-            raise invalid("mesh", f"slices {len(mesh.slices)} != mesh ndim {inner.ndim}")
-        idx = tuple(slice(None) if s is None else slice(s.start, s.stop, s.step) for s in mesh.slices)
+            raise invalid(
+                "mesh", f"slices {len(mesh.slices)} != mesh ndim {inner.ndim}"
+            )
+        idx = tuple(
+            slice(None) if s is None else slice(s.start, s.stop, s.step)
+            for s in mesh.slices
+        )
         out = inner[idx]
         if out.size == 0:
             raise invalid("mesh", "sliced mesh is empty")
@@ -214,20 +233,20 @@ def _content_slots(cs) -> Tuple[int, List[int]]:
 
 def resolve_storage_mesh(mesh) -> Tuple[np.ndarray, int]:
     """(ndarray of slot ids ``t*W+w`` or -1, W)."""
-    if type(mesh) is OuterProductMesh:
-        if type(mesh.tensor_slots) is not ArrangedMesh:
-            raise invalid("mesh", "tensor_slots must be an ArrangedMesh")
-        t_size = tag_int(mesh.tensor_slots.size, ConstantOne, TensorCount)
-        w_size, w_ranks = _content_slots(mesh.content_slots)
-        cells = np.full((t_size, w_size), -1, dtype=np.int64)
-        for t in range(t_size):
-            for w in w_ranks:
-                cells[t, w] = t * w_size + w
-        return cells, w_size
-    if type(mesh) not in (ReshapedMesh, SlicedMesh):
-        raise invalid("mesh", f"{type(mesh).__name__} is not a StorageMesh branch")
-    inner, w_size = resolve_storage_mesh(mesh.underlying_mesh)
-    return _apply_transform(mesh, inner), w_size
+    if type(mesh) is not OuterProductMesh:
+        if type(mesh) not in (ReshapedMesh, SlicedMesh):
+            raise invalid("mesh", f"{type(mesh).__name__} is not a StorageMesh branch")
+        inner, w_size = resolve_storage_mesh(mesh.underlying_mesh)
+        return _apply_transform(mesh, inner), w_size
+    if type(mesh.tensor_slots) is not ArrangedMesh:
+        raise invalid("mesh", "tensor_slots must be an ArrangedMesh")
+    t_size = tag_int(mesh.tensor_slots.size, ConstantOne, TensorCount)
+    w_size, w_ranks = _content_slots(mesh.content_slots)
+    cells = np.full((t_size, w_size), -1, dtype=np.int64)
+    for t in range(t_size):
+        for w in w_ranks:
+            cells[t, w] = t * w_size + w
+    return cells, w_size
 
 
 def is_single_tensor_storage_mesh(mesh) -> bool:
@@ -262,5 +281,7 @@ def mesh_coords(cells: np.ndarray, value: int) -> Optional[Tuple[int, ...]]:
     if hit.shape[0] == 0:
         return None
     if hit.shape[0] > 1:
-        raise invalid("mesh", f"participant {value} appears {hit.shape[0]} times in mesh")
+        raise invalid(
+            "mesh", f"participant {value} appears {hit.shape[0]} times in mesh"
+        )
     return tuple(int(x) for x in hit[0])

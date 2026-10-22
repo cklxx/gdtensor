@@ -10,27 +10,27 @@ Public surface (design appendix C.3):
 * gdtensor.access: DTensorDataAccessor
 * gdtensor.tag: Ok / Err / Shard / Replicate / Partial / WorldSize ...
 """
+
 from __future__ import annotations
 
-from .builder import (
-    Error, get_d_tensor, get_gd_tensor, get_tensor_ids, make_gd_tensor, reset_d_tensor,
+from .internal.result import Error
+from .internal.torch_bridge import (
+    get_d_tensor,
+    get_gd_tensor,
+    get_tensor_ids,
+    make_gd_tensor,
+    reset_d_tensor,
 )
-from .tag import Err, Ok
-def _result_alias():
-    import typing
+from .tag import Err as _Err, Ok as _Ok
 
-    class _ResultAlias:
-        # Result[T] = tag.Ok[T] | tag.Err[Error] (design C.2).
-        def __getitem__(self, item):
-            return typing.Union[Ok[item], Err[Error]]
-
-    return _ResultAlias()
-
-
-Result = _result_alias()
-del _result_alias
+type Result[T] = _Ok[T] | _Err[Error]
 
 __all__ = [
-    "get_tensor_ids", "get_gd_tensor", "make_gd_tensor", "get_d_tensor",
-    "reset_d_tensor", "Result", "Error", "Ok", "Err",
+    "get_tensor_ids",
+    "get_gd_tensor",
+    "make_gd_tensor",
+    "get_d_tensor",
+    "reset_d_tensor",
+    "Result",
+    "Error",
 ]

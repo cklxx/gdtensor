@@ -2,6 +2,7 @@
 
 The oneof branch is the Python class. Units are bytes.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,9 +10,21 @@ from dataclasses import dataclass
 from .builder_mixin import field_hash, make_builder_mixin
 
 RangeFromComputeViewBuilderMixin = make_builder_mixin(
-    "RangeFromComputeView", [("global_tensor_id", "scalar"), ("global_tensor_offset", "scalar"), ("size", "scalar")])
+    "RangeFromComputeView",
+    [
+        ("global_tensor_id", "scalar"),
+        ("global_tensor_offset", "scalar"),
+        ("size", "scalar"),
+    ],
+)
 RangeFromStorageViewBuilderMixin = make_builder_mixin(
-    "RangeFromStorageView", [("file_path", "scalar"), ("contiguous_payload_offset", "scalar"), ("size", "scalar")])
+    "RangeFromStorageView",
+    [
+        ("file_path", "scalar"),
+        ("contiguous_payload_offset", "scalar"),
+        ("size", "scalar"),
+    ],
+)
 
 
 @dataclass(eq=True)
@@ -23,6 +36,7 @@ class RangeFromComputeView(RangeFromComputeViewBuilderMixin):
 
     def check_constraints(self):
         from .constraints import check_constraints
+
         return check_constraints(self)
 
 
@@ -37,6 +51,7 @@ class RangeFromStorageView(RangeFromStorageViewBuilderMixin):
 
     def check_constraints(self):
         from .constraints import check_constraints
+
         return check_constraints(self)
 
 

@@ -1,0 +1,257 @@
+"""Public products and helpers, without internal fixtures or Result patches."""
+
+import abc
+import dataclasses
+import types
+import typing
+
+import pytest
+
+import gdtensor
+import gdtensor.access as ga
+import gdtensor.builder as gb
+import gdtensor.session as gs
+import gdtensor.tag as gt
+
+
+def test_result_and_error_are_type_aliases():
+    assert isinstance(gdtensor.Error, types.UnionType)
+    assert set(typing.get_args(gdtensor.Error)) == {
+        gb.ConstraintViolationError,
+        gb.CheckFailedError,
+        gb.NotFoundError,
+        gb.InvalidArgumentError,
+        gb.GDTensorIOError,
+    }
+    assert isinstance(gdtensor.Result, typing.TypeAliasType)
+    assert typing.get_origin(gdtensor.Result[int]) is gdtensor.Result
+    assert typing.get_args(gdtensor.Result[int]) == (int,)
+    assert typing.get_args(gdtensor.Result.__value__) == (
+        gt.Ok[gdtensor.Result.__type_params__[0]],
+        gt.Err[gdtensor.Error],
+    )
+    assert isinstance(gb.NotFoundError(msg="missing"), gdtensor.Error)
+    assert not hasattr(gt.Ok, "unwrap") and not hasattr(gt.Ok, "ok")
+    assert not hasattr(gt.Err, "error")
+
+
+def test_tags_are_distinct_boxes_and_support_annotations():
+    Foo, Bar = gt.make_box_subclass("Foo"), gt.make_box_subclass("Bar")
+    assert issubclass(Foo, gt.Box)
+    assert Foo(1) == Foo(1) and Foo(1) != Bar(1)
+    assert hash(Foo(1)) == hash(Foo(1))
+    assert repr(gt.WorldSize(2)) == "WorldSize(2)"
+    assert typing.get_origin(gt.Ok[int]) is gt.Ok
+    for tag in (
+        gt.Ok,
+        gt.Err,
+        gt.Replicate,
+        gt.Partial,
+        gt.Shard,
+        gt.ConstantOne,
+        gt.TensorCount,
+        gt.WorldSize,
+    ):
+        assert issubclass(tag, gt.Box)
+    assert gt.Replicate().value is None
+
+
+def test_tensor_lookup_helpers_and_missing_id():
+    table = gb.DTensorTable([gb.NamedDTensor("b"), gb.NamedDTensor("a")])
+    assert gb.tensor_order_value_of(table, "a") == gt.Ok(1)
+    missing = gb.tensor_order_value_of(table, "missing")
+    assert type(missing) is gt.Err and type(missing.value) is gb.NotFoundError
+
+
+def test_file_path_and_leader_helpers():
+    group = gb.DisjointStorageMeshList(
+        [
+            gb.OuterProductMesh(
+                gb.ArrangedMesh(gt.TensorCount(2)), gb.ArrangedMesh(gt.WorldSize(2))
+            )
+        ],
+        ["b", "a"],
+    )
+    leader = gb.leader_tensor_component_pos_of(group)
+    assert leader == gb.TensorComponentPos("b", 0)
+    pos = gb.TensorComponentPos("a", 1)
+    layout = gb.PhysicalLayoutTable(
+        "safetensors", {pos: group}, {leader: "model.safetensors"}
+    )
+    assert gb.file_path_of(layout, pos) == gt.Ok("model.safetensors")
+    missing = gb.file_path_of(layout, gb.TensorComponentPos("missing", 0))
+    assert type(missing) is gt.Err and type(missing.value) is gb.NotFoundError
+
+
+def test_meshes_and_type_aliases():
+    mesh = gb.PermutedMesh(
+        gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(4)), [2, 2]), [1, 0]
+    )
+    assert type(mesh.check_constraints()) is gt.Ok
+    literal = gb.LiteralMesh([3, 1], gt.WorldSize(4))
+    assert literal.get_ranks() == [3, 1]
+    assert type(literal.check_constraints()) is gt.Ok
+    assert gb.ContainerFormat is str
+    for alias in (
+        gb.DTensorsView,
+        gb.ComputeMesh,
+        gb.StorageMesh,
+        gb.ContentSlotsMesh,
+        gb.Placement,
+        gb.GenericDTensor,
+    ):
+        assert isinstance(alias, types.UnionType)
+
+
+@pytest.mark.parametrize("name", sorted(n for n in gb.__all__ if n.startswith("new_")))
+def test_product_factories_create_independent_defaults(name):
+    factory = getattr(gb, name)
+    first, second = factory(), factory()
+    assert type(first) is type(second) and first is not second
+    assert dataclasses.is_dataclass(first)
+    mixin = getattr(gb, type(first).__name__ + "BuilderMixin")
+    assert isinstance(first, mixin)
+    for field in dataclasses.fields(first):
+        assert hasattr(first, "get_" + field.name) and hasattr(
+            first, "set_" + field.name
+        )
+        value = getattr(first, field.name)
+        if isinstance(value, (list, dict)):
+            assert value is not getattr(second, field.name)
+    assert callable(first.check_constraints)
+
+
+def test_product_hash_ignores_dict_insertion_order():
+    a, b = gb.TensorComponentPos("a", 0), gb.TensorComponentPos("b", 1)
+    left = gb.PhysicalLayoutTable("safetensors", {}, {a: "a", b: "b"})
+    right = gb.PhysicalLayoutTable("safetensors", {}, {b: "b", a: "a"})
+    assert left == right and hash(left) == hash(right)
+
+
+def test_session_and_accessor_interfaces_are_abstract():
+    for interface in (
+        ga.DTensorDataAccessor,
+        gs.StorageSaveSession,
+        gs.StorageLoadSession,
+    ):
+        assert issubclass(interface, abc.ABC)
+        with pytest.raises(TypeError):
+            interface()
+        assert not hasattr(interface, "check_constraints")
+
+
+def test_view_map_rejects_unknown_origin():
+    result = gb.d_tensors_view_map(object(), gb.DTensorsViewMapCore())
+    assert type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
+
+
+def test_bridge_plain_values_and_result_lookup():
+    gd = gb.NaiveDTensor(
+        gb.GlobalTensorMeta([2], "F32", 4),
+        [gt.Replicate()],
+        gb.ArrangedMesh(gt.WorldSize(1)),
+    )
+    view = gb.ComputeDTensorsView(
+        ["w"], gb.DTensorTable([gb.NamedDTensor("w", gd)]), None
+    )
+    ids = gdtensor.get_tensor_ids(view)
+    assert type(ids) is list and ids == ["w"]
+    ids.clear()
+    assert view.tensor_ids == ["w"]
+    assert gdtensor.get_d_tensor(gd) is None
+    result = gdtensor.get_gd_tensor(view, "w")
+    assert type(result) is gt.Ok and result.value is gd
+
+
+def test_view_map_requires_result_callbacks():
+    gd = gb.NaiveDTensor(
+        gb.GlobalTensorMeta([2], "F32", 4),
+        [gt.Replicate()],
+        gb.ArrangedMesh(gt.WorldSize(1)),
+    )
+    view = gb.ComputeDTensorsView(
+        ["w"], gb.DTensorTable([gb.NamedDTensor("w", gd)]), None
+    )
+    result = gb.d_tensors_view_map(
+        view, gb.DTensorsViewMapCore(convert_each_compute_view=lambda tensor: tensor)
+    )
+    assert type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
+
+
+def test_oneof_fields_can_be_cleared():
+    tensor = gb.new_named_d_tensor()
+    tensor.set_d_tensor(gb.new_naive_d_tensor())
+    tensor.clear_d_tensor()
+    assert tensor.get_d_tensor() is None
+    naive = gb.new_naive_d_tensor()
+    naive.set_mesh(gb.ArrangedMesh(gt.WorldSize(1)))
+    naive.clear_mesh()
+    assert naive.get_mesh() is None
+    mesh = gb.new_reshaped_mesh()
+    mesh.set_underlying_mesh(gb.ArrangedMesh(gt.WorldSize(1)))
+    mesh.clear_underlying_mesh()
+    assert mesh.get_underlying_mesh() is None
+
+
+@pytest.mark.parametrize("name", sorted(n for n in gb.__all__ if n.startswith("new_")))
+def test_builder_methods_operate_on_the_named_field(name):
+    value = getattr(gb, name)()
+    for field in dataclasses.fields(value):
+        original = getattr(value, field.name)
+        assert getattr(value, "get_" + field.name)() is original
+        if isinstance(original, list):
+            singular = (
+                field.name[:-1]
+                if field.name.endswith("s") and field.name != "alias"
+                else field.name
+            )
+            getattr(value, "add_" + singular)("element")
+            assert getattr(value, "mutable_" + field.name)() == ["element"]
+            getattr(value, "clear_" + field.name)()
+            assert getattr(value, field.name) == []
+        elif isinstance(original, dict):
+            getattr(value, "mutable_" + field.name)()["key"] = "value"
+            assert getattr(value, field.name) == {"key": "value"}
+            getattr(value, "clear_" + field.name)()
+            assert getattr(value, field.name) == {}
+        replacement = object()
+        getattr(value, "set_" + field.name)(replacement)
+        assert getattr(value, "get_" + field.name)() is replacement
+
+
+def test_compute_bridge_rejects_storage_views_and_tensors():
+    from test_io_contract import Memory, _storage
+
+    view = _storage(Memory(range(8)), [])
+    with pytest.raises(ValueError, match="ComputeDTensorsView"):
+        gdtensor.get_tensor_ids(view)
+    result = gdtensor.get_gd_tensor(view, "w")
+    assert type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
+    tensor = view.d_tensor_table.named_d_tensors[0].d_tensor
+    for value in (tensor, gb.ReshapedDTensor(tensor, [2, 4])):
+        with pytest.raises(ValueError, match="ComputeMesh"):
+            gdtensor.get_d_tensor(value)
+        with pytest.raises(ValueError, match="ComputeMesh"):
+            gdtensor.reset_d_tensor(value, object())
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "NaiveDTensor",
+        "ReshapedDTensor",
+        "NamedDTensor",
+        "DTensorTable",
+        "ArrangedMesh",
+        "LiteralMesh",
+        "ReshapedMesh",
+        "PermutedMesh",
+        "SlicedMesh",
+        "OuterProductMesh",
+    ],
+)
+def test_parameterized_products_preserve_annotation_arguments(name):
+    cls = getattr(gb, name)
+    annotation = cls[int]
+    assert typing.get_origin(annotation) is cls
+    assert typing.get_args(annotation) == (int,)

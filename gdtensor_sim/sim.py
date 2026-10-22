@@ -7,11 +7,13 @@ verifies the loaded bytes.
 Example:
   python -m gdtensor_sim.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer
 """
+
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import logging
 import os
 import shutil
 import time
@@ -20,24 +22,37 @@ from typing import Dict, List
 
 import numpy as np
 
-from gdtensor.internal.iobackend import FileIO, IoTracer, MiB
-from gdtensor.internal.layout import build_payload_index
-from gdtensor.internal.dtensor import named_of
-from .models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
-from gdtensor.internal.plan import check_physical_layout
+from .iobackend import FileIO, IoTracer, MiB
+from ._layout import build_payload_index
+from ._geometry import named_of
+from .models import (
+    ModelConfig,
+    ParallelConfig,
+    compute_table,
+    fill_pattern,
+    layout_builder,
+    storage_table,
+)
 from .runner import load_threads, run_processes, save_threads
-from gdtensor.internal.views import ComputeFabric
+from gdtensor_sim.fabric import ComputeFabric
 
-SIZE_BINS = [("<4KiB", 4 << 10), ("4-64KiB", 64 << 10), ("64KiB-1MiB", MiB), ("1-16MiB", 16 * MiB), (">=16MiB", 1 << 62)]
+SIZE_BINS = [
+    ("<4KiB", 4 << 10),
+    ("4-64KiB", 64 << 10),
+    ("64KiB-1MiB", MiB),
+    ("1-16MiB", 16 * MiB),
+    (">=16MiB", 1 << 62),
+]
+
+
+_LOG = logging.getLogger(__name__)
 
 
 def size_hist(sizes: List[int]) -> Dict[str, int]:
     out = {name: 0 for name, _ in SIZE_BINS}
-    for s in sizes:
-        for name, hi in SIZE_BINS:
-            if s < hi:
-                out[name] += 1
-                break
+    for size in sizes:
+        bucket = next(name for name, upper in SIZE_BINS if size < upper)
+        out[bucket] += 1
     return out
 
 
@@ -56,11 +71,16 @@ def write_report(records) -> dict:
         "size_p50": int(np.percentile(sizes, 50)) if sizes else 0,
         "size_p99": int(np.percentile(sizes, 99)) if sizes else 0,
         "size_hist": size_hist(sizes),
-        "frag_lt_64KiB_ratio": round(sum(s < (64 << 10) for s in sizes) / max(len(sizes), 1), 4),
+        "frag_lt_64KiB_ratio": round(
+            sum(s < (64 << 10) for s in sizes) / max(len(sizes), 1), 4
+        ),
         "unaligned_1MiB_ratio": round(unaligned / max(len(w), 1), 4),
         "files": len(per_file),
         "max_writers_per_file": max((len(v) for v in per_file.values()), default=0),
-        "ops_per_rank_min_max": [min(per_rank_ops.values(), default=0), max(per_rank_ops.values(), default=0)],
+        "ops_per_rank_min_max": [
+            min(per_rank_ops.values(), default=0),
+            max(per_rank_ops.values(), default=0),
+        ],
     }
 
 
@@ -80,35 +100,72 @@ def dump_trace(records, path: str, t0: float) -> None:
         wr = csv.writer(f)
         wr.writerow(["t_us", "rank", "op", "file", "offset", "size"])
         for r in sorted(records, key=lambda r: r.t):
-            wr.writerow([int((r.t - t0) * 1e6), r.rank, r.op, os.path.basename(r.path).replace(".tmp", ""),
-                         r.offset, r.size])
+            wr.writerow(
+                [
+                    int((r.t - t0) * 1e6),
+                    r.rank,
+                    r.op,
+                    os.path.basename(r.path).replace(".tmp", ""),
+                    r.offset,
+                    r.size,
+                ]
+            )
 
 
 def main(argv=None) -> dict:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--root", required=True)
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--hidden", type=int, default=512)
     ap.add_argument("--ffn", type=int, default=1408)
     ap.add_argument("--vocab", type=int, default=4096)
     ap.add_argument("--experts", type=int, default=0)
-    ap.add_argument("--optimizer", action="store_true", help="add ZeRO-sharded Adam m/v (F32)")
+    ap.add_argument(
+        "--optimizer", action="store_true", help="add ZeRO-sharded Adam m/v (F32)"
+    )
     ap.add_argument("--tp", type=int, default=2)
     ap.add_argument("--dp", type=int, default=2)
     ap.add_argument("--pp", type=int, default=1)
     ap.add_argument("--load-tp", type=int)
     ap.add_argument("--load-dp", type=int)
     ap.add_argument("--load-pp", type=int)
-    ap.add_argument("--layout", default="hf", choices=["hf", "single", "per_rank", "rank_multi", "per_stage"])
-    ap.add_argument("--format", default="safetensors", choices=["safetensors", "distcp"])
+    ap.add_argument(
+        "--layout",
+        default="hf",
+        choices=["hf", "single", "per_rank", "rank_multi", "per_stage"],
+    )
+    ap.add_argument(
+        "--format", default="safetensors", choices=["safetensors", "distcp"]
+    )
     ap.add_argument("--hf-shards", type=int, default=2)
-    ap.add_argument("--aggregate-tp", action="store_true",
-                    help="business layout: one TP rank stores each dim1-sharded tensor whole")
-    ap.add_argument("--processes", action="store_true", help="fork one process per rank for save")
+    ap.add_argument(
+        "--aggregate-tp",
+        action="store_true",
+        help="business layout: one TP rank stores each dim1-sharded tensor whole",
+    )
+    ap.add_argument(
+        "--processes", action="store_true", help="fork one process per rank for save"
+    )
     ap.add_argument("--report", default=None)
     a = ap.parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    _LOG.info(
+        "setup format=%s layout=%s save_world=%d load_world=%d",
+        a.format,
+        a.layout,
+        a.tp * a.dp * a.pp,
+        (a.load_tp or a.tp) * (a.load_dp or a.dp) * (a.load_pp or a.pp),
+    )
 
-    m = ModelConfig(a.layers, a.hidden, a.ffn, a.vocab, a.experts, optimizer=a.optimizer)
+    m = ModelConfig(
+        a.layers, a.hidden, a.ffn, a.vocab, a.experts, optimizer=a.optimizer
+    )
     p = ParallelConfig(a.tp, a.dp, a.pp)
     lp = ParallelConfig(a.load_tp or a.tp, a.load_dp or a.dp, a.load_pp or a.pp)
     out_dir = a.report or a.root + "_report"
@@ -121,16 +178,24 @@ def main(argv=None) -> dict:
     mode = "hf" if a.layout in ("hf", "single", "per_stage") else "mirror"
     st = storage_table(ct, p, mode, aggregate_tp=a.aggregate_tp)
     lay = layout_builder(a.layout, st, p, a.format, a.hf_shards)
-    layout_result = check_physical_layout(st, lay)
+    layout_result = lay.check_constraints()
     if type(layout_result).__name__ != "Ok":
         raise SystemExit(f"bad layout: {layout_result.value}")
     index = build_payload_index(st, lay)
     t_plan = time.perf_counter() - t
 
+    _LOG.info(
+        "layout ready tensors=%d files=%d elapsed=%.3fs",
+        len(st.named_d_tensors),
+        len(index.files),
+        t_plan,
+    )
     # ---- save
     t0 = time.perf_counter()
     if a.processes:
-        res, wrecs, _ = run_processes("save", ct, st, lay, a.root, p.world, fill=fill_pattern)
+        res, wrecs, _ = run_processes(
+            "save", ct, st, lay, a.root, p.world, fill=fill_pattern
+        )
     else:
         fab = ComputeFabric(ct).allocate(fill=fill_pattern)
         res, wio = save_threads(ct, st, lay, a.root, fab, p.world)
@@ -140,6 +205,7 @@ def main(argv=None) -> dict:
     if bad:
         raise SystemExit(f"save failed: {bad}")
 
+    _LOG.info("save complete elapsed=%.3fs writes=%d", t_save, len(wrecs))
     # ---- load
     data_bytes = sum(os.path.getsize(os.path.join(a.root, f)) for f in index.files)
     ct2 = compute_table(m, lp)
@@ -151,28 +217,60 @@ def main(argv=None) -> dict:
     bad = {r: x.value for r, x in res2.items() if type(x).__name__ != "Ok"}
     if bad:
         raise SystemExit(f"load failed: {bad}")
-    ok = all(np.array_equal(buf, fill_pattern(named_of(ct2, tid), fab2.intervals(r, tid)))
-             for r, bufs in fab2.buffers.items() for tid, buf in bufs.items())
+    ok = all(
+        np.array_equal(buf, fill_pattern(named_of(ct2, tid), fab2.intervals(r, tid)))
+        for r, bufs in fab2.buffers.items()
+        for tid, buf in bufs.items()
+    )
 
+    _LOG.info(
+        "load complete elapsed=%.3fs reads=%d bytes_verified=%s",
+        t_load,
+        len(rio.tracer.records),
+        ok,
+    )
     report = {
         "model": m.__dict__,
         "save_parallel": {"tp": p.tp, "dp": p.dp, "pp": p.pp, "world": p.world},
         "load_parallel": {"tp": lp.tp, "dp": lp.dp, "pp": lp.pp, "world": lp.world},
-        "layout": a.layout, "format": a.format, "tensors": len(st.named_d_tensors),
+        "layout": a.layout,
+        "format": a.format,
+        "tensors": len(st.named_d_tensors),
         "aggregate_tp": a.aggregate_tp,
         "files": {path: fp.payload_size for path, fp in sorted(index.files.items())},
-        "seconds": {"plan_layout": round(t_plan, 3), "save": round(t_save, 3), "load": round(t_load, 3)},
+        "seconds": {
+            "plan_layout": round(t_plan, 3),
+            "save": round(t_save, 3),
+            "load": round(t_load, 3),
+        },
         "write": write_report(wrecs),
         "read": read_report(rio.tracer.records, data_bytes),
-        "load_bytes_verified": bool(ok),
+        "load_bytes_verified": ok,
     }
     with open(os.path.join(out_dir, "report.json"), "w") as f:
         json.dump(report, f, indent=2, default=str)
     dump_trace(wrecs, os.path.join(out_dir, "write_trace.csv"), t0)
     dump_trace(rio.tracer.records, os.path.join(out_dir, "read_trace.csv"), t1)
-    print(json.dumps({k: report[k] for k in ("save_parallel", "load_parallel", "layout", "format",
-                                              "aggregate_tp", "seconds", "write", "read",
-                                              "load_bytes_verified")}, indent=1, default=str))
+    print(
+        json.dumps(
+            {
+                k: report[k]
+                for k in (
+                    "save_parallel",
+                    "load_parallel",
+                    "layout",
+                    "format",
+                    "aggregate_tp",
+                    "seconds",
+                    "write",
+                    "read",
+                    "load_bytes_verified",
+                )
+            },
+            indent=1,
+            default=str,
+        )
+    )
     return report
 
 

@@ -7,6 +7,7 @@ not listed only recurse.
 
 Sessions and accessors are abstract interfaces and have no check_constraints.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -17,29 +18,33 @@ from ..tag import Box, Err, Ok
 
 
 def _err(obj, constraint: str, msg: str):
-    return Err(ConstraintViolationError(type_name=type(obj).__name__, constraint_name=constraint, msg=msg))
+    return Err(
+        ConstraintViolationError(
+            type_name=type(obj).__name__, constraint_name=constraint, msg=msg
+        )
+    )
 
 
 def _recurse(value: Any):
     if value is None or isinstance(value, (int, float, str, bytes, bool)):
         return Ok(None)
     if isinstance(value, (list, tuple)):
-        for x in value:
-            r = _recurse(x)
-            if type(r) is Err:
-                return r
-        return Ok(None)
+        return _recurse_values(value)
     if isinstance(value, dict):
-        for x in value.values():
-            r = _recurse(x)
-            if type(r) is Err:
-                return r
-        return Ok(None)
+        return _recurse_values(value.values())
     if isinstance(value, Box):
         return _recurse(value.value)
     if dataclasses.is_dataclass(value) and type(value).__name__ in _DATA_TYPES:
-        return check_constraints(value)
+        return value.check_constraints()
     return Ok(None)  # opaque payload (callable, accessor, torch tensor)
+
+
+def _recurse_values(values):
+    for value in values:
+        result = _recurse(value)
+        if type(result) is Err:
+            return result
+    return Ok(None)
 
 
 def check_constraints(obj: Any):
@@ -61,8 +66,11 @@ def check_constraints(obj: Any):
 
 def _compute_view(o):
     from .dtensor import tensor_ids_of
+
     if tensor_ids_of(o.d_tensor_table) != list(o.tensor_ids):
-        return _err(o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table")
+        return _err(
+            o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table"
+        )
     if o.data_accessor is None:
         return _err(o, "data_accessor_non_nil", "data_accessor is nil")
     return None
@@ -70,15 +78,33 @@ def _compute_view(o):
 
 def _storage_view(o):
     from .dtensor import tensor_ids_of
+
     if tensor_ids_of(o.d_tensor_table) != list(o.tensor_ids):
-        return _err(o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table")
-    if o.physical_layout is not None:
-        ids = set(o.tensor_ids)
-        for pos in o.physical_layout.tensor_entries:
-            if pos.tensor_id not in ids:
-                return _err(o, "layout_tensor_in_table", f"layout tensor {pos.tensor_id} not in d_tensor_table")
+        return _err(
+            o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table"
+        )
+    entries = o.physical_layout.tensor_entries if o.physical_layout is not None else {}
+    ids = set(o.tensor_ids)
+    for pos in entries:
+        if pos.tensor_id not in ids:
+            return _err(
+                o,
+                "layout_tensor_in_table",
+                f"layout tensor {pos.tensor_id} not in d_tensor_table",
+            )
+    for meshes in entries.values():
+        if meshes.tensor_ids != list(o.tensor_ids):
+            return _err(
+                o,
+                "tensor_ids_match_table",
+                "physical list row labels differ from table order",
+            )
     if o.data_accessor is None or o.begin_save is None or o.begin_load is None:
-        return _err(o, "callbacks_non_nil", "data_accessor / begin_save / begin_load must be set")
+        return _err(
+            o,
+            "callbacks_non_nil",
+            "data_accessor / begin_save / begin_load must be set",
+        )
     return None
 
 
@@ -86,7 +112,11 @@ def _table(o):
     seen = set()
     for nd in o.named_d_tensors:
         if nd.global_tensor_id in seen:
-            return _err(o, "global_tensor_id_unique", f"duplicate tensor id {nd.global_tensor_id}")
+            return _err(
+                o,
+                "global_tensor_id_unique",
+                f"duplicate tensor id {nd.global_tensor_id}",
+            )
         seen.add(nd.global_tensor_id)
     return None
 
@@ -100,23 +130,25 @@ def _named(o):
 def _naive(o):
     from .mesh import mesh_shape
     from ..tag import Shard
+
     try:
         shape = mesh_shape(o.mesh)
     except Exception as exc:  # noqa: BLE001
         return _err(o, "mesh_valid", str(exc))
     if len(o.placements) != len(shape):
-        return _err(o, "placements_match_mesh", f"{len(o.placements)} placements for mesh ndim {len(shape)}")
+        return _err(
+            o,
+            "placements_match_mesh",
+            f"{len(o.placements)} placements for mesh ndim {len(shape)}",
+        )
     nd = len(o.global_tensor_meta.global_shape)
     for p in o.placements:
         if type(p) is Shard and not 0 <= p.value < nd:
-            return _err(o, "placements_match_meta", f"Shard axis {p.value} out of range for ndim {nd}")
-    return None
-
-
-def _reshaped(o):
-    import math
-    if math.prod(o.shape) != math.prod(o.underlying_d_tensor.global_tensor_meta.global_shape):
-        return _err(o, "shape_keeps_numel", f"reshape to {o.shape} changes numel")
+            return _err(
+                o,
+                "placements_match_meta",
+                f"Shard axis {p.value} out of range for ndim {nd}",
+            )
     return None
 
 
@@ -132,32 +164,47 @@ def _meta(o):
 
 def _layout(o):
     from .layout import leader_tensor_component_pos_of, list_cells, pos_key
+
     if o.container_format not in ("safetensors", "distcp"):
-        return _err(o, "container_format_unique", f"unknown container_format {o.container_format!r}")
-    leaders, seen_cells = set(), set()
+        return _err(
+            o,
+            "container_format_unique",
+            f"unknown container_format {o.container_format!r}",
+        )
+    leaders, seen_cells = {}, set()
     for lst in o.tensor_entries.values():
         try:
             leader = leader_tensor_component_pos_of(lst)
             cells = set(list_cells(lst))
         except Exception as exc:  # noqa: BLE001
             return _err(o, "meshes_disjoint", str(exc))
+        if leader in leaders and leaders[leader] != lst:
+            return _err(o, "meshes_disjoint", "different physical lists share a leader")
         if leader in leaders:
             continue
-        leaders.add(leader)
+        leaders[leader] = lst
         if leader not in o.file_paths:
-            return _err(o, "leader_in_file_paths", f"leader {pos_key(leader)} has no path")
+            return _err(
+                o, "leader_in_file_paths", f"leader {pos_key(leader)} has no path"
+            )
         if seen_cells & cells:
             return _err(o, "meshes_disjoint", "a slot is covered by two files")
         seen_cells |= cells
-    if set(o.file_paths) != leaders:
-        return _err(o, "file_paths_keys_are_leaders", "file_paths keys must be list leaders")
+    if o.file_paths.keys() != leaders.keys():
+        return _err(
+            o, "file_paths_keys_are_leaders", "file_paths keys must be list leaders"
+        )
     return None
 
 
 def _list(o):
     from .mesh import storage_mesh_cells
+
     if not o.disjoint_storage_mesh_list:
         return _err(o, "list_non_empty", "disjoint_storage_mesh_list is empty")
+    labels_error = _list_row_labels(o)
+    if labels_error is not None:
+        return labels_error
     seen = set()
     for m in o.disjoint_storage_mesh_list:
         c = storage_mesh_cells(m)
@@ -167,9 +214,31 @@ def _list(o):
     return None
 
 
+def _list_row_labels(value):
+    from .mesh import storage_mesh_base
+    from ..tag import TensorCount
+
+    for mesh in value.disjoint_storage_mesh_list:
+        tensor_count = storage_mesh_base(mesh).tensor_slots.size
+        if (
+            type(tensor_count) is not TensorCount
+            or len(value.tensor_ids) != tensor_count.value
+        ):
+            return _err(
+                value,
+                "tensor_ids_match_tensor_count",
+                "row label count differs from mesh tensor_count",
+            )
+    return None
+
+
 def _arranged(o):
     # StorageMesh content_slots / ComputeMesh ArrangedMesh: size > 0
-    if not isinstance(o.size, Box) or not isinstance(o.size.value, int) or o.size.value <= 0:
+    if (
+        not isinstance(o.size, Box)
+        or not isinstance(o.size.value, int)
+        or o.size.value <= 0
+    ):
         return _err(o, "size_positive", f"size={o.size!r}")
     return None
 
@@ -198,7 +267,6 @@ _EXTRA = {
     "DTensorTable": _table,
     "NamedDTensor": _named,
     "NaiveDTensor": _naive,
-    "ReshapedDTensor": _reshaped,
     "GlobalTensorMeta": _meta,
     "PhysicalLayoutTable": _layout,
     "DisjointStorageMeshList": _list,
@@ -209,6 +277,14 @@ for _cls in ERROR_TYPES:
     _EXTRA[_cls.__name__] = _error
 
 _DATA_TYPES = set(_EXTRA) | {
-    "ReshapedMesh", "PermutedMesh", "SlicedMesh", "Slice", "OuterProductMesh",
-    "TensorComponentPos", "DTensorsViewMapCore", "RangeFromComputeView", "RangeFromStorageView",
+    "ReshapedDTensor",
+    "ReshapedMesh",
+    "PermutedMesh",
+    "SlicedMesh",
+    "Slice",
+    "OuterProductMesh",
+    "TensorComponentPos",
+    "DTensorsViewMapCore",
+    "RangeFromComputeView",
+    "RangeFromStorageView",
 }
