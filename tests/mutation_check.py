@@ -32,8 +32,8 @@ DETECTORS = [
 #   full-coverage check; the early exit is an optimization (todo.size is
 #   rechecked on the next src iteration). Plan equality is covered directly
 #   by tests/oracle.py check_pair_identity over 286 configurations.
-# - peer selection pick expression: data outcome is identical; routing is
-#   asserted by test_p2p_peer_pick_is_hash_seed_independent.
+# - intersect side flips only change zero-width rows dropped by keep = e > s;
+#   subtract advance variants are swept by 60-seed property trials.
 EQUIVALENT = {
     # plan: covered by the later full-coverage raise / next-iteration guard;
     # pair element identity is pinned directly by tests/oracle.py.
