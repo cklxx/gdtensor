@@ -42,6 +42,8 @@
 | `formal/tla/CopyPlan.tcl` + `AtomicPublish.tla` | TLC 全网格：CopyPlan 非交并覆盖（save/load/reshard）、发布状态机 writing→done |
 | `formal/lean/ShardAlgebra.lean` | 分片相邻、单调、满射、唯一、非交并覆盖（clean build，无 sorry/axiom） |
 
+数据正确性（CRC 与 arrange 张量）：test_data_correctness 只用公开 io API（rank_save/rank_load/rank_reshard）驱动存取，CRC 期望自行解析 safetensors 头并按公开分片归属计算，覆盖 4 种布局、字节翻转检出、跨并行 save/load、compute↔compute 与 storage→storage reshard。
+
 诚实边界：形式化证明只针对抽象模型与分片代数，不针对 Python 字节码。Python 侧以穷举（world≤8）、独立 plan oracle、属性对拍、变异测试（13/13 有效变异被杀）补足。
 
 ## 多机一致性
