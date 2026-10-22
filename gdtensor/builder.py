@@ -8,23 +8,23 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from ._dtensor import (
+from .internal.dtensor import (
     DTensorTable, GenericDTensor, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
     Placement, ReshapedDTensor, global_tensor_meta_of, named_of, tensor_order_value_of,
 )
-from ._layout import (
+from .internal.layout import (
     ContainerFormat, DisjointStorageMeshList, PhysicalLayoutTable,
     TensorComponentPos, file_path_of, leader_tensor_component_pos_of,
 )
-from ._mesh import (
+from .internal.mesh import (
     ArrangedMesh, ComputeMesh, ContentSlotsMesh, LiteralMesh, OuterProductMesh,
     PermutedMesh, ReshapedMesh, Slice, SlicedMesh, StorageMesh,
 )
-from ._result import (
+from .internal.result import (
     CheckFailedError, ConstraintViolationError, ERROR_TYPES,
     GDTensorIOError, InvalidArgumentError, NotFoundError,
 )
-from ._views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
+from .internal.views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
 
 
 # ------------------------------------------------------------------ 5.6 bridge (top-level names)
@@ -38,7 +38,7 @@ def get_tensor_ids(view):
 
 def get_gd_tensor(view, tensor_id: str):
     # compute_d_tensors_view_get_gd_tensor
-    from ._result import catch
+    from .internal.result import catch
     @catch
     def fn():
         nd = named_of(view.d_tensor_table, tensor_id)
@@ -48,8 +48,8 @@ def get_gd_tensor(view, tensor_id: str):
 
 def make_gd_tensor(d_tensor):
     # gd_tensor_make: torch.DTensor -> GenericDTensor[ComputeMesh]
-    from . import _torch_bridge
-    return _torch_bridge.gd_tensor_make(d_tensor)
+    from .internal import torch_bridge
+    return torch_bridge.gd_tensor_make(d_tensor)
 
 
 def get_d_tensor(gd_tensor):
@@ -61,7 +61,7 @@ def get_d_tensor(gd_tensor):
 
 def reset_d_tensor(gd_tensor, d_tensor) -> None:
     # gd_tensor_reset_d_tensor: replace the underlying torch.DTensor
-    from ._result import invalid
+    from .internal.result import invalid
     from .tag import Err
     target = gd_tensor if type(gd_tensor) is NaiveDTensor else gd_tensor.underlying_d_tensor
     if type(target) is not NaiveDTensor:

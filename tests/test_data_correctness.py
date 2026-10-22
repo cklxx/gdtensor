@@ -19,21 +19,21 @@ import numpy as np
 import pytest
 
 from conftest import assert_all_ok, verify_fabric
-from gdtensor._dtensor import tensor_ids_of as _ids  # noqa: E402
-from gdtensor._coord import ThreadCoordinator
-from gdtensor._dtensor import (
+from gdtensor.internal.dtensor import tensor_ids_of as _ids  # noqa: E402
+from gdtensor.internal.coord import ThreadCoordinator
+from gdtensor.internal.dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard,
     global_tensor_meta_of, owned_intervals,
 )
-from gdtensor._formats import make_storage_view
-from gdtensor._iobackend import MiB
-from gdtensor._layout import build_payload_index
-from gdtensor._models import (
+from gdtensor.internal.formats import make_storage_view
+from gdtensor.internal.iobackend import MiB
+from gdtensor.internal.layout import build_payload_index
+from gdtensor.internal.models import (
     ModelConfig, ParallelConfig, compute_mesh, compute_table, fill_pattern, layout_builder,
     pattern_bytes, storage_table, tensor_seed,
 )
-from gdtensor._runner import _run_threads, compute_view, load_threads, reshard_threads, save_threads
-from gdtensor._views import ComputeFabric
+from gdtensor.internal.runner import _run_threads, compute_view, load_threads, reshard_threads, save_threads
+from gdtensor.internal.views import ComputeFabric
 
 M = ModelConfig(layers=2, hidden=64, ffn=128, vocab=256)
 P = ParallelConfig(tp=2, dp=2, pp=2)

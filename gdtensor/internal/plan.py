@@ -18,7 +18,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from ._dtensor import (
+from .dtensor import (
     EMPTY,
     DTensorTable,
     NamedDTensor,
@@ -36,13 +36,13 @@ from ._dtensor import (
     owned_intervals,
     participants_of,
 )
-from ._layout import (
+from .layout import (
     PhysicalLayoutTable, TensorComponentPos, build_payload_index, leader_tensor_component_pos_of, list_cells, pos_key,
 )
-from ._mesh import storage_mesh_cells
-from ._ranges import CopyPlan, DTensorRange, RangeFromComputeView, RangeFromStorageView
-from ._result import catch, check_failed, invalid
-from ._views import ComputeDTensorsView, StorageDTensorsView
+from .mesh import storage_mesh_cells
+from .ranges import CopyPlan, DTensorRange, RangeFromComputeView, RangeFromStorageView
+from .result import catch, check_failed, invalid
+from .views import ComputeDTensorsView, StorageDTensorsView
 
 
 def is_compute(r) -> bool:

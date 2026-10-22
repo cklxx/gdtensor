@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ._builder_mixin import field_hash, make_builder_mixin
+from .builder_mixin import field_hash, make_builder_mixin
 
 RangeFromComputeViewBuilderMixin = make_builder_mixin(
     "RangeFromComputeView", [("global_tensor_id", "scalar"), ("global_tensor_offset", "scalar"), ("size", "scalar")])
@@ -22,7 +22,7 @@ class RangeFromComputeView(RangeFromComputeViewBuilderMixin):
     __hash__ = field_hash
 
     def check_constraints(self):
-        from ._constraints import check_constraints
+        from .constraints import check_constraints
         return check_constraints(self)
 
 
@@ -36,7 +36,7 @@ class RangeFromStorageView(RangeFromStorageViewBuilderMixin):
     __hash__ = field_hash
 
     def check_constraints(self):
-        from ._constraints import check_constraints
+        from .constraints import check_constraints
         return check_constraints(self)
 
 

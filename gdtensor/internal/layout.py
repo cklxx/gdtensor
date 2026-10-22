@@ -14,8 +14,8 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from ._builder_mixin import field_hash, make_builder_mixin
-from ._dtensor import (
+from .builder_mixin import field_hash, make_builder_mixin
+from .dtensor import (
     DTensorTable,
     NamedDTensor,
     global_tensor_meta_of,
@@ -24,13 +24,13 @@ from ._dtensor import (
     participants_of,
     tensor_ids_of,
 )
-from ._mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh, is_multi_tensors_storage_mesh, storage_mesh_cells
-from ._result import catch, invalid, not_found
-from .tag import TensorCount, WorldSize
+from .mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh, is_multi_tensors_storage_mesh, storage_mesh_cells
+from .result import catch, invalid, not_found
+from ..tag import TensorCount, WorldSize
 
 
 def _cc(self):
-    from ._constraints import check_constraints
+    from .constraints import check_constraints
     return check_constraints(self)
 
 
@@ -204,8 +204,8 @@ def build_payload_index(table: DTensorTable, layout: PhysicalLayoutTable) -> Pay
 def _cells_to_meshes(cells: List[Tuple[int, int]], n_tensors: int, world: int) -> List[Any]:
     """Cover a cell set with disjoint rectangles: per row, contiguous column
     runs; identical runs on consecutive rows merge into one rectangle."""
-    from ._mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
-    from .tag import TensorCount, WorldSize
+    from .mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
+    from ..tag import TensorCount, WorldSize
 
     base = OuterProductMesh(ArrangedMesh(TensorCount(n_tensors)), ArrangedMesh(WorldSize(world)))
     by_row: Dict[int, List[int]] = {}

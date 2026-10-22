@@ -15,8 +15,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
-from ._builder_mixin import make_builder_mixin
-from ._dtensor import (
+from .builder_mixin import make_builder_mixin
+from .dtensor import (
     DTensorTable,
     global_tensor_meta_of,
     iv_prefix,
@@ -25,12 +25,12 @@ from ._dtensor import (
     owned_intervals,
     participants_of,
 )
-from ._iobackend import FileIO
-from ._layout import PayloadIndex, PhysicalLayoutTable
-from ._ranges import RangeFromComputeView, RangeFromStorageView
-from ._result import Fail, catch, invalid, io_error
-from .access import DTensorDataAccessor
-from .tag import Err, Ok
+from .iobackend import FileIO
+from .layout import PayloadIndex, PhysicalLayoutTable
+from .ranges import RangeFromComputeView, RangeFromStorageView
+from .result import Fail, catch, invalid, io_error
+from ..access import DTensorDataAccessor
+from ..tag import Err, Ok
 
 
 def buffer_address(buf) -> int:
@@ -153,7 +153,7 @@ class ComputeDTensorsView(ComputeDTensorsViewBuilderMixin):
         self.tensor_ids = list(self.tensor_ids)
 
     def check_constraints(self):
-        from ._constraints import check_constraints
+        from .constraints import check_constraints
         return check_constraints(self)
 
 
@@ -240,7 +240,7 @@ class StorageDTensorsView(StorageDTensorsViewBuilderMixin):
         self.tensor_ids = list(self.tensor_ids)
 
     def check_constraints(self):
-        from ._constraints import check_constraints
+        from .constraints import check_constraints
         return check_constraints(self)
 
 

@@ -20,14 +20,14 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ._builder_mixin import field_hash, make_builder_mixin
-from ._mesh import mesh_coords, resolve_compute_mesh, resolve_storage_mesh
-from ._result import Fail, catch, invalid, not_found
-from .tag import Partial, Replicate, Shard
+from .builder_mixin import field_hash, make_builder_mixin
+from .mesh import mesh_coords, resolve_compute_mesh, resolve_storage_mesh
+from .result import Fail, catch, invalid, not_found
+from ..tag import Partial, Replicate, Shard
 
 
 def _cc(self):
-    from ._constraints import check_constraints
+    from .constraints import check_constraints
     return check_constraints(self)
 
 

@@ -20,15 +20,15 @@ import os
 import numpy as np
 import pytest
 
-from gdtensor._dtensor import tensor_ids_of as _ids  # noqa: E402
-from gdtensor._formats import make_storage_view
-from gdtensor._layout import build_payload_index
-from gdtensor._models import (
+from gdtensor.internal.dtensor import tensor_ids_of as _ids  # noqa: E402
+from gdtensor.internal.formats import make_storage_view
+from gdtensor.internal.layout import build_payload_index
+from gdtensor.internal.models import (
     ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table,
 )
-from gdtensor._plan import d_tensors_view_rank_plan_load, d_tensors_view_rank_plan_save
-from gdtensor._runner import compute_view
-from gdtensor._views import ComputeDataAccessor, ComputeFabric
+from gdtensor.internal.plan import d_tensors_view_rank_plan_load, d_tensors_view_rank_plan_save
+from gdtensor.internal.runner import compute_view
+from gdtensor.internal.views import ComputeDataAccessor, ComputeFabric
 from oracle import check_load, check_save
 
 # pp <= layers: model_tensors maps every layer to a stage; pp > layers gives
@@ -83,13 +83,13 @@ def test_non_divisible_shapes_plan(p):
 
 def _e2e(root, m, ps_cfg, pl_cfg, mode, kind):
     from conftest import assert_all_ok, verify_fabric, verify_safetensors_dir
-    from gdtensor._runner import load_threads, save_threads
+    from gdtensor.internal.runner import load_threads, save_threads
 
     ct = compute_table(m, ps_cfg)
     st = storage_table(ct, ps_cfg, mode)
     lay = layout_builder(kind, st, ps_cfg, "safetensors")
     fab = ComputeFabric(ct).allocate(fill=__import__(
-        "gdtensor._models", fromlist=["fill_pattern"]).fill_pattern)
+        "gdtensor.internal.models", fromlist=["fill_pattern"]).fill_pattern)
     assert_all_ok(save_threads(ct, st, lay, root, fab, ps_cfg.world)[0])
     verify_safetensors_dir(root, st)
     ctl = compute_table(m, pl_cfg)

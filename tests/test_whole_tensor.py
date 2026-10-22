@@ -11,11 +11,11 @@ import struct
 
 import numpy as np
 
-from gdtensor._dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard
-from gdtensor._formats import _whole_tensor_files, safetensors_header
-from gdtensor._layout import build_layout, build_payload_index
-from gdtensor._mesh import Slice
-from gdtensor._models import storage_mesh
+from gdtensor.internal.dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard
+from gdtensor.internal.formats import _whole_tensor_files, safetensors_header
+from gdtensor.internal.layout import build_layout, build_payload_index
+from gdtensor.internal.mesh import Slice
+from gdtensor.internal.models import storage_mesh
 
 
 def _strided_table(world=2):

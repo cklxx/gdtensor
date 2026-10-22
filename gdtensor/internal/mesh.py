@@ -18,13 +18,13 @@ from typing import Any, List, Optional, Tuple
 
 import numpy as np
 
-from ._builder_mixin import field_hash, make_builder_mixin
-from ._result import invalid
-from .tag import ConstantOne, TensorCount, WorldSize
+from .builder_mixin import field_hash, make_builder_mixin
+from .result import invalid
+from ..tag import ConstantOne, TensorCount, WorldSize
 
 
 def _cc(self):
-    from ._constraints import check_constraints
+    from .constraints import check_constraints
     return check_constraints(self)
 
 

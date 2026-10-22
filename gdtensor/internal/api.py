@@ -5,15 +5,15 @@ through the view accessors, and closes sessions. It never re-selects ranges.
 """
 from __future__ import annotations
 
-from ._plan import (
+from .plan import (
     d_tensors_view_rank_plan_load,
     d_tensors_view_rank_plan_reshard,
     d_tensors_view_rank_plan_save,
 )
-from ._ranges import CopyPlan
-from ._result import catch, invalid, must_ok
-from ._views import StorageDTensorsView, copy_from_ptr, copy_to_ptr
-from .tag import Ok
+from .ranges import CopyPlan
+from .result import catch, invalid, must_ok
+from .views import StorageDTensorsView, copy_from_ptr, copy_to_ptr
+from ..tag import Ok
 
 
 def _copy(plan: CopyPlan, src_view, dst_view) -> None:

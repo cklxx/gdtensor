@@ -14,14 +14,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from ._api import d_tensors_view_rank_load, d_tensors_view_rank_reshard, d_tensors_view_rank_save
-from ._coord import ProcessCoordinator, ThreadCoordinator
-from ._dtensor import DTensorTable, tensor_ids_of
-from ._formats import make_storage_view
-from ._iobackend import FileIO
-from ._layout import PhysicalLayoutTable
-from ._result import Err, Ok
-from ._views import ComputeDataAccessor, ComputeDTensorsView, ComputeFabric
+from .api import d_tensors_view_rank_load, d_tensors_view_rank_reshard, d_tensors_view_rank_save
+from .coord import ProcessCoordinator, ThreadCoordinator
+from .dtensor import DTensorTable, tensor_ids_of
+from .formats import make_storage_view
+from .iobackend import FileIO
+from .layout import PhysicalLayoutTable
+from .result import Err, Ok
+from .views import ComputeDataAccessor, ComputeDTensorsView, ComputeFabric
 
 
 def compute_view(table: DTensorTable, fabric: ComputeFabric, rank: int) -> ComputeDTensorsView:

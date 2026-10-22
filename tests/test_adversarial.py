@@ -16,17 +16,17 @@ import numpy as np
 import pytest
 
 from conftest import assert_all_ok, verify_fabric
-from gdtensor._dtensor import tensor_ids_of as _ids  # noqa: E402
-from gdtensor._api import d_tensors_view_rank_save
-from gdtensor._coord import ThreadCoordinator
-from gdtensor._dtensor import (
+from gdtensor.internal.dtensor import tensor_ids_of as _ids  # noqa: E402
+from gdtensor.internal.api import d_tensors_view_rank_save
+from gdtensor.internal.coord import ThreadCoordinator
+from gdtensor.internal.dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard,
 )
-from gdtensor._formats import make_storage_view
-from gdtensor._iobackend import FileIO, IoTracer, MiB
-from gdtensor._models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
-from gdtensor._runner import _run_threads, compute_view, load_threads, reshard_threads, save_threads
-from gdtensor._views import ComputeFabric
+from gdtensor.internal.formats import make_storage_view
+from gdtensor.internal.iobackend import FileIO, IoTracer, MiB
+from gdtensor.internal.models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
+from gdtensor.internal.runner import _run_threads, compute_view, load_threads, reshard_threads, save_threads
+from gdtensor.internal.views import ComputeFabric
 
 M = ModelConfig(layers=2, hidden=32, ffn=64, vocab=128)
 
@@ -131,8 +131,8 @@ def test_abort_then_rewrite_succeeds(tmp_path):
 
     def fn(r):
         if r == 3:
-            from gdtensor._api import _bind, _copy
-            from gdtensor._plan import d_tensors_view_rank_plan_save
+            from gdtensor.internal.api import _bind, _copy
+            from gdtensor.internal.plan import d_tensors_view_rank_plan_save
             s = sv.begin_save(sv, r).unwrap()
             plan = d_tensors_view_rank_plan_save(r, compute_view(ct, fab, r), sv).unwrap()
             _bind(sv, s)

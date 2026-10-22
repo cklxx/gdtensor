@@ -20,16 +20,16 @@ import torch.distributed as dist  # noqa: E402
 
 from conftest import assert_all_ok  # noqa: E402
 from gdtensor.builder import get_d_tensor, get_gd_tensor  # noqa: E402
-from gdtensor._dtensor import DTensorTable, NamedDTensor  # noqa: E402
-from gdtensor._models import ParallelConfig, layout_builder, storage_table  # noqa: E402
-from gdtensor._runner import save_threads  # noqa: E402
-from gdtensor._torch_bridge import (  # noqa: E402
+from gdtensor.internal.dtensor import DTensorTable, NamedDTensor  # noqa: E402
+from gdtensor.internal.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
+from gdtensor.internal.runner import save_threads  # noqa: E402
+from gdtensor.internal.torch_bridge import (  # noqa: E402
     fabric_from_torch, gather_global_bytes, global_bytes_of_dtensor,
     parallel_config_from_mesh, torch_from_fabric, torch_placement_to_gd,
 )
 from gdtensor.builder import InvalidArgumentError  # noqa: E402
 from gdtensor.tag import Ok, Replicate, Shard  # noqa: E402
-from gdtensor._torch_bridge import gd_for_layout  # noqa: E402
+from gdtensor.internal.torch_bridge import gd_for_layout  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("GDTENSOR_TORCH_TESTS"), reason="set GDTENSOR_TORCH_TESTS=1 (torch distributed)")
@@ -88,7 +88,7 @@ def test_gd_for_layout_from_torch_dtensor():
 
 def test_roundtrip_through_safetensors(tmp_path):
     """torch DTensor -> gdtensor fabric -> save -> load -> torch tensor."""
-    from gdtensor._runner import load_threads
+    from gdtensor.internal.runner import load_threads
 
     p = ParallelConfig(tp=1, dp=4, pp=1)
     mesh = _mesh((1,), ("dp",))
@@ -130,9 +130,9 @@ def test_gather_requires_full_coverage():
     dt = distribute_tensor(g, mesh, [TRep()])
     gd = gd_for_layout(dt, "w", p=p).unwrap()
     ct = DTensorTable([NamedDTensor("w", gd)])
-    from gdtensor._views import ComputeFabric
+    from gdtensor.internal.views import ComputeFabric
     empty = ComputeFabric(ct).allocate()
-    from gdtensor._result import Fail
+    from gdtensor.internal.result import Fail
     with pytest.raises(Fail, match="overlaps others|not every element loaded back"):
         gather_global_bytes(ct, empty, "w")
 
@@ -144,8 +144,8 @@ def test_get_gd_tensor_roundtrip_id():
     dt = distribute_tensor(g, mesh, [TRep()])
     gd = gd_for_layout(dt, "x", p=p).unwrap()
     table = DTensorTable([NamedDTensor("x", gd)])
-    from gdtensor._runner import compute_view
-    from gdtensor._views import ComputeFabric
+    from gdtensor.internal.runner import compute_view
+    from gdtensor.internal.views import ComputeFabric
     fab = ComputeFabric(table).allocate()
     view = compute_view(table, fab, 0)
     got = get_gd_tensor(view, "x").unwrap()
