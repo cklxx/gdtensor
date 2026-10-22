@@ -43,15 +43,38 @@ python3 -m gdtensor_sim.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer \
 | `test_matrix.py` | 设计第 7 节用例矩阵：每 rank 文件、多 rank 合写、一空槽、跨文件、reshard、生命周期 |
 | `test_exhaustive.py` | world≤8 共 286 种配置穷举 |
 | `test_adversarial.py` | 空张量、标量、全 replicate、单 rank、reshard 自拷贝、abort 后重写 |
-| `test_data_correctness.py` | safetensors CRC、arrange 张量在不同并行度下往返 |
+| `test_data_correctness.py` | 两种格式、五种布局的独立 CRC / arange 校验，8→6→8 rank 往返、四种 reshard 方向、元数据错误与发布失败 |
+| `test_public_io_contract.py` | 仅实现公共 ABC 的 session/accessor、错误清理、buffer 长度、view map session 回调 |
 | `test_consistency.py` | plan 纯函数、线程/进程字节一致、反序启动、PYTHONHASHSEED 跨进程一致 |
 | `test_spec_alignment.py` | C.2/C.3/B.2.4 产品类、tag、约束递归、view map、桥、session/access ABC |
 | `test_api_conformance.py` | C.3 符号与签名机械审计 |
 | `test_builder_api.py` | C.1 BuilderMixin get/set/add/mutable/clear |
 | `test_torch_bridge.py` `test_torch_e2e.py` `test_lawa_merge.py` | 真实 torch.DTensor（2.12+）桥与 LAWA，门控 `GDTENSOR_TORCH_TESTS=1` |
+| `test_lawa_public.py` | 两个真实 torch rank，通过公共桥和 IO 执行朴素 / Welford LAWA；k=1/2/5，F32/F64、非整除列分片、DP/TP 与逆序 mesh |
 | `tests/mutation_check.py` | 核心区间/plan/layout 变异，13 个有效变异全部被杀 |
 
+## 自动化检测
+
+提交前高速门禁（约 3 秒，无需 torch）：
+
+```bash
+scripts/precommit.sh        # ruff F401 + 字节编译 + import 冒烟 + 核心/API pytest（约 3 秒）
+scripts/full_check.sh       # 全量 760（含 GDTENSOR_TORCH_TESTS=1 门控 torch 用例）
+```
+
+本地 git 钩子已用 `git config core.hooksPath .githooks` 启用，提交时自动跑 precommit.sh；其他克隆需执行同一条 config。
+
+远端：`.codebase/pipelines/ci.yaml` 在目标为 main 的 MR 上自动跑 ruff F401、字节编译、import 冒烟与全量非 torch pytest（torch 用例在无 torch 镜像中自动 skip）。
+
 形式化验证：`formal/tla/CopyPlan.tla`（TLC）建模 save/load/reshard 的非交并覆盖与原子发布；`formal/lean/ShardAlgebra.lean` 机器证明分片代数。
+
+运行含真实 torch 分布式用例的全套测试：
+
+```bash
+GDTENSOR_TORCH_TESTS=1 python3 -m pytest -q
+```
+
+公共桥直接保留 torch mesh 的 rank 排列、维度和 placements。IO 执行器使用 session 的 `init_data_accessor()`，自定义 accessor 无需实现内部 `index` / `bind`。保存成功前，各 rank 同步 payload 发布与元数据发布的结果。CRC 是测试侧校验；raw IO 不提供 payload 校验和。
 
 ## 边界
 
