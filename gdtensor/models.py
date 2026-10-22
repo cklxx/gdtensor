@@ -172,7 +172,7 @@ def storage_table(compute: DTensorTable, p: ParallelConfig, mode: str = "hf",
     * ``hf``    : HF file layout. Columns = the dedup writer group of the
                   tensor; Shard(0) along the flat or row axis, so the slots
                   concatenate to the full tensor in row-major order. A TP
-                  dim1 shard then writes strided pieces (OmniFS pattern).
+                  dim1 shard then writes strided pieces.
     * ``mirror``: DCP-like layout. Storage boxes = writer compute boxes; the
                   flat ``zero`` tensors keep their flat shard.
 
@@ -228,7 +228,7 @@ def layout_builder(kind: str, table: DTensorTable, p: ParallelConfig, fmt: Conta
     """Business layout builders. ``kind``:
 
     hf        : tensors grouped into ``hf_shards`` files by size; every file is
-                shared by many ranks (OmniFS).
+                shared by many ranks.
     single    : one file for everything.
     per_rank  : one file per content column (rank).
     rank_multi: up to three files per rank (tensor row mod 3).

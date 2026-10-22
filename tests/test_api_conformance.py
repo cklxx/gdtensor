@@ -6,7 +6,7 @@ errors + sessions/access ABCs + plan/check internal helpers) and asserts it
 exists with the spec-defined call shape. Anything extra exported at top level
 or under gdtensor.io that is not on the spec list fails the audit.
 
-Scope note: models.py / runner.py / iobackend.py / omnifs*.py / sim.py are the
+Scope note: models.py / runner.py / iobackend.py / sim.py are the
 business/simulation layer (design 4.3: builders live outside the core) and are
 intentionally not part of the spec'd public API.
 """

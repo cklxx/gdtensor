@@ -1,8 +1,8 @@
 """Multi-rank runner: one thread (or forked process) per rank.
 
-Threads share one ComputeFabric (device memory of all ranks) and one
-P2PReadCache, so compute->compute reshard and P2P reads work. Processes give
-real OS-level concurrency for pwrite; they support save and load only.
+Threads share one ComputeFabric (device memory of all ranks), so
+compute->compute reshard works. Processes give real OS-level concurrency for
+pwrite; they support save and load only.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .api import d_tensors_view_rank_load, d_tensors_view_rank_reshard, d_tensor
 from .coord import ProcessCoordinator, ThreadCoordinator
 from .dtensor import DTensorTable
 from .formats import make_storage_view
-from .iobackend import FileIO, IoRecord, IoTracer, P2PReadCache
+from .iobackend import FileIO
 from .layout import PhysicalLayoutTable
 from .result import Err, Ok
 from .views import ComputeDataAccessor, ComputeDTensorsView, ComputeFabric
@@ -54,10 +54,8 @@ def load_threads(table, storage_table, layout, root, fabric, world, io: Optional
     return res, io
 
 
-def reshard_threads(world: int, make_src: Callable[[int], object], make_dst: Callable[[int], object],
-                    coalesce_storage: bool = False):
-    return _run_threads(
-        world, lambda r: d_tensors_view_rank_reshard(r, make_src(r), make_dst(r), coalesce_storage))
+def reshard_threads(world: int, make_src: Callable[[int], object], make_dst: Callable[[int], object]):
+    return _run_threads(world, lambda r: d_tensors_view_rank_reshard(r, make_src(r), make_dst(r)))
 
 
 # ------------------------------------------------------------------ processes

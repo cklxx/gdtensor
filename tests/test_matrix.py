@@ -229,7 +229,7 @@ def test_plan_union_disjoint_and_covering(kind):
         assert check_compute_d_tensors_access_disjoint(ct, pl).ok  # per-rank load dst disjoint
         union_save += ps
         union_load += pl
-    # OmniFS invariant: all ranks' storage writes are disjoint and cover every file.
+    # Shared-file invariant: all ranks' storage writes are disjoint and cover every file.
     assert check_storage_d_tensors_access_disjoint(st, lay, paths, union_save).ok
     assert check_storage_d_tensors_access_full_covering(st, lay, paths, union_save).ok
     assert check_compute_d_tensors_access_full_covering(ct, union_save).ok

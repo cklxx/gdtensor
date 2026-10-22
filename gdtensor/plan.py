@@ -173,8 +173,9 @@ def d_tensors_view_rank_plan_reshard(rank: int, src_view: DTensorsView, dst_view
 
 # ------------------------------------------------------------------ B.1.3
 # Internal checks. Disjoint checks run on one rank's plan or on the union of
-# all ranks' plans; storage disjointness over the union is the OmniFS
-# lock-free pwrite invariant. Covering checks run on the union.
+# all ranks' plans; storage disjointness over the union is the invariant
+# that lets ranks pwrite one shared file without locks. Covering checks run
+# on the union.
 
 
 def _ranges(plan: CopyPlan, pred) -> List[DTensorRange]:

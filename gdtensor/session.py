@@ -61,12 +61,11 @@ class DTensorDataAccessor(abc.ABC, Generic[RangeT]):
 # isinstance checks match the spec types without changing their hierarchy.
 def _register_virtuals() -> None:
     from .formats import DcpLoadSession, DcpSaveSession, SafeTensorsLoadSession, SafeTensorsSaveSession
-    from .omnifs_view import OmniFsLoadSession, OmniFsSaveSession
     from .views import StorageDataAccessor
 
-    for cls in (SafeTensorsSaveSession, DcpSaveSession, OmniFsSaveSession):
+    for cls in (SafeTensorsSaveSession, DcpSaveSession):
         StorageSaveSession.register(cls)
-    for cls in (SafeTensorsLoadSession, DcpLoadSession, OmniFsLoadSession):
+    for cls in (SafeTensorsLoadSession, DcpLoadSession):
         StorageLoadSession.register(cls)
     DTensorDataAccessor.register(StorageDataAccessor)
 

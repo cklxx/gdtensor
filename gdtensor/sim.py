@@ -1,15 +1,11 @@
-"""gdtensor simulator CLI: save (concurrent pwrite) + load (L1/L2/L3 P2P).
+"""gdtensor simulator CLI: save with concurrent pwrite, then load.
 
-Backends:
-* file   : local files. safetensors (tmp+rename, index.json) or distcp
-           (.metadata).
-* omnifs : OmniFS-Store (design 2.1). manifest (prepared/committed) +
-           64 MiB chunks + variable KVs on simulated DNs. --sink sinks the
-           snapshot to an HF directory on simulated HDFS before load.
+The store is a local directory. Formats: safetensors (tmp + rename,
+index.json) or distcp (.metadata). The CLI reports write/read patterns and
+verifies the loaded bytes.
 
 Example:
-  python -m gdtensor.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer \
-      --backend omnifs --sink --cache eic --ranks-per-node 8
+  python -m gdtensor.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer
 """
 from __future__ import annotations
 
@@ -24,13 +20,11 @@ from typing import Dict, List
 
 import numpy as np
 
-from .iobackend import CHUNK_BYTES, FileIO, IoTracer, MiB, P2PReadCache, eic_replica_policy
+from .iobackend import FileIO, IoTracer, MiB
 from .layout import build_payload_index
 from .models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
-from .omnifs import Manifest, OmniFsConfig, OmniFsIO, sink_snapshot
-from .omnifs_view import make_omnifs_storage_view
 from .plan import check_physical_layout
-from .runner import load_threads, reshard_threads, run_processes, save_threads, compute_view
+from .runner import load_threads, run_processes, save_threads
 from .views import ComputeFabric
 
 SIZE_BINS = [("<4KiB", 4 << 10), ("4-64KiB", 64 << 10), ("64KiB-1MiB", MiB), ("1-16MiB", 16 * MiB), (">=16MiB", 1 << 62)]
@@ -46,19 +40,13 @@ def size_hist(sizes: List[int]) -> Dict[str, int]:
     return out
 
 
-def write_report(records, root: str) -> dict:
+def write_report(records) -> dict:
     w = [r for r in records if r.op == "pwrite"]
     sizes = [r.size for r in w]
     per_file = defaultdict(set)
-    chunk_writers = defaultdict(set)
-    chunk_ops = 0
     unaligned = 0
     for r in w:
         per_file[r.path].add(r.rank)
-        c0, c1 = r.offset // CHUNK_BYTES, (r.offset + r.size - 1) // CHUNK_BYTES
-        chunk_ops += c1 - c0 + 1  # a write that crosses a chunk boundary splits
-        for c in range(c0, c1 + 1):
-            chunk_writers[(r.path, c)].add(r.rank)
         unaligned += r.offset % MiB != 0
     per_rank_ops = Counter(r.rank for r in w)
     return {
@@ -69,60 +57,30 @@ def write_report(records, root: str) -> dict:
         "size_hist": size_hist(sizes),
         "frag_lt_64KiB_ratio": round(sum(s < (64 << 10) for s in sizes) / max(len(sizes), 1), 4),
         "unaligned_1MiB_ratio": round(unaligned / max(len(w), 1), 4),
-        "chunk_ops_after_split": chunk_ops,
         "files": len(per_file),
         "max_writers_per_file": max((len(v) for v in per_file.values()), default=0),
-        "max_writers_per_64MiB_chunk": max((len(v) for v in chunk_writers.values()), default=0),
         "ops_per_rank_min_max": [min(per_rank_ops.values(), default=0), max(per_rank_ops.values(), default=0)],
     }
 
 
-def kv_report(records) -> dict:
-    kv = [r for r in records if r.op == "kv_put"]
-    dns = Counter(r.level for r in kv)
+def read_report(records, file_bytes: int) -> dict:
+    r = [x for x in records if x.op == "pread"]
+    read_bytes = sum(x.size for x in r)
     return {
-        "kv_put_ops": len(kv),
-        "kv_size_p50": int(np.percentile([r.size for r in kv], 50)) if kv else 0,
-        "kv_size_p99": int(np.percentile([r.size for r in kv], 99)) if kv else 0,
-        "kv_per_dn": dict(sorted(dns.items())),
-    }
-
-
-def read_report(counters: dict, records, file_bytes: int) -> dict:
-    l3 = [r for r in records if r.op == "pread"]
-    l3_block = counters.get("L3_block_bytes", 0) or counters.get("L3_bytes", 0)
-    return {
-        "requested_bytes": counters["requested_bytes"],
-        "L1_bytes": counters.get("L1_bytes", 0),
-        "L2_p2p_bytes": counters.get("L2_bytes", 0),
-        "L2_p2p_transfer_bytes": counters.get("L2_block_bytes", counters.get("L2_bytes", 0)),
-        "L3_store_bytes": counters.get("L3_bytes", 0),
-        "L3_store_read_bytes": l3_block,
-        "L3_ops": len(l3),
+        "pread_ops": len(r),
+        "pread_bytes": read_bytes,
         "unique_file_bytes": file_bytes,
-        "store_read_amplification": round(l3_block / max(file_bytes, 1), 3),
-        "served_ratio_L1_L2_L3": [round(counters.get(k, 0) / max(counters["requested_bytes"], 1), 4)
-                                  for k in ("L1_bytes", "L2_bytes", "L3_bytes")],
+        "read_amplification": round(read_bytes / max(file_bytes, 1), 3),
     }
 
 
 def dump_trace(records, path: str, t0: float) -> None:
     with open(path, "w", newline="") as f:
         wr = csv.writer(f)
-        wr.writerow(["t_us", "rank", "op", "level", "file", "offset", "size", "chunk"])
+        wr.writerow(["t_us", "rank", "op", "file", "offset", "size"])
         for r in sorted(records, key=lambda r: r.t):
-            wr.writerow([int((r.t - t0) * 1e6), r.rank, r.op, r.level, os.path.basename(r.path).replace(".tmp", ""),
-                         r.offset, r.size, r.offset // CHUNK_BYTES])
-
-
-def _make_cache(kind: str, ranks_per_node: int):
-    if kind == "none":
-        return None
-    if kind == "host":
-        return P2PReadCache(ranks_per_node)  # replicas grow with readers
-    if kind == "eic":
-        return P2PReadCache(ranks_per_node, max_replicas=eic_replica_policy)
-    raise ValueError(kind)
+            wr.writerow([int((r.t - t0) * 1e6), r.rank, r.op, os.path.basename(r.path).replace(".tmp", ""),
+                         r.offset, r.size])
 
 
 def main(argv=None) -> dict:
@@ -143,15 +101,9 @@ def main(argv=None) -> dict:
     ap.add_argument("--layout", default="hf", choices=["hf", "single", "per_rank", "rank_multi", "per_stage"])
     ap.add_argument("--format", default="safetensors", choices=["safetensors", "distcp"])
     ap.add_argument("--hf-shards", type=int, default=2)
-    ap.add_argument("--ranks-per-node", type=int, default=8)
-    ap.add_argument("--backend", default="file", choices=["file", "omnifs"])
-    ap.add_argument("--omnifs-chunk", type=int, default=CHUNK_BYTES, help="chunk bytes (default 64 MiB)")
-    ap.add_argument("--n-dn", type=int, default=8, help="simulated DN count")
-    ap.add_argument("--sink", action="store_true", help="[omnifs] sink SSD -> HDFS before load")
-    ap.add_argument("--cache", default="host", choices=["host", "eic", "none"])
     ap.add_argument("--aggregate-tp", action="store_true",
-                    help="gather TP dim1 shards inside a TP group, one pwrite per slot")
-    ap.add_argument("--processes", action="store_true", help="[file] fork one process per rank for save")
+                    help="business layout: one TP rank stores each dim1-sharded tensor whole")
+    ap.add_argument("--processes", action="store_true", help="fork one process per rank for save")
     ap.add_argument("--report", default=None)
     a = ap.parse_args(argv)
 
@@ -166,61 +118,34 @@ def main(argv=None) -> dict:
     t = time.perf_counter()
     ct = compute_table(m, p)
     mode = "hf" if a.layout in ("hf", "single", "per_stage") else "mirror"
-    st = storage_table(ct, p, mode, aggregate_tp=(a.aggregate_tp and a.backend == "omnifs"))
-    fmt = "safetensors" if a.backend == "omnifs" else a.format
-    lay = layout_builder(a.layout, st, p, fmt, a.hf_shards)
+    st = storage_table(ct, p, mode, aggregate_tp=a.aggregate_tp)
+    lay = layout_builder(a.layout, st, p, a.format, a.hf_shards)
     check_physical_layout(st, lay).unwrap()
     index = build_payload_index(st, lay)
     t_plan = time.perf_counter() - t
 
-    extra_kv = {}
     # ---- save
     t0 = time.perf_counter()
-    if a.backend == "file":
-        if a.processes:
-            res, wrecs, _ = run_processes("save", ct, st, lay, a.root, p.world, fill=fill_pattern)
-        else:
-            fab = ComputeFabric(ct).allocate(fill=fill_pattern)
-            res, wio = save_threads(ct, st, lay, a.root, fab, p.world)
-            wrecs = wio.tracer.records
+    if a.processes:
+        res, wrecs, _ = run_processes("save", ct, st, lay, a.root, p.world, fill=fill_pattern)
     else:
-        cfg = OmniFsConfig(a.root, "proj", 0, a.omnifs_chunk, a.n_dn)
-        wio = OmniFsIO(cfg)
-        from .coord import ThreadCoordinator
-        sv = make_omnifs_storage_view(st.tensor_ids, st, lay, cfg, wio, ThreadCoordinator(p.world))
         fab = ComputeFabric(ct).allocate(fill=fill_pattern)
-        res = reshard_threads(p.world, lambda r: compute_view(ct, fab, r), lambda r: sv,
-                              coalesce_storage=a.aggregate_tp)
+        res, wio = save_threads(ct, st, lay, a.root, fab, p.world)
         wrecs = wio.tracer.records
     t_save = time.perf_counter() - t0
-    bad = {r: x.error for r, x in res.items() if not x.ok}
+    bad = {r: x.value for r, x in res.items() if not x.ok}
     if bad:
         raise SystemExit(f"save failed: {bad}")
 
-    # ---- optional sink (omnifs only)
-    sink_stats = None
-    if a.backend == "omnifs" and a.sink:
-        sink_stats = sink_snapshot(cfg, os.path.join(a.root, "hdfs"))
-
-    # ---- load with read cache
-    if a.backend == "file":
-        data_bytes = sum(os.path.getsize(os.path.join(a.root, f)) for f in index.files)
-    else:
-        data_bytes = sum(f["size"] for f in Manifest.load(cfg.manifest_path).files.values()
-                         if f["kind"] == "safetensors")
-    cache = _make_cache(a.cache, a.ranks_per_node)
+    # ---- load
+    data_bytes = sum(os.path.getsize(os.path.join(a.root, f)) for f in index.files)
     ct2 = compute_table(m, lp)
     fab2 = ComputeFabric(ct2).allocate()
     t1 = time.perf_counter()
-    if a.backend == "file":
-        rio = FileIO(IoTracer(), cache)
-        res2, _ = load_threads(ct2, st, lay, a.root, fab2, lp.world, rio)
-    else:
-        rio = OmniFsIO(cfg, IoTracer(), cache)
-        sv2 = make_omnifs_storage_view(st.tensor_ids, st, lay, cfg, rio)
-        res2 = reshard_threads(lp.world, lambda r: sv2, lambda r: compute_view(ct2, fab2, r))
+    rio = FileIO(IoTracer())
+    res2, _ = load_threads(ct2, st, lay, a.root, fab2, lp.world, rio)
     t_load = time.perf_counter() - t1
-    bad = {r: x.error for r, x in res2.items() if not x.ok}
+    bad = {r: x.value for r, x in res2.items() if not x.ok}
     if bad:
         raise SystemExit(f"load failed: {bad}")
     ok = all(np.array_equal(buf, fill_pattern(ct2.named_d_tensors[ct2._order[tid]], fab2.intervals(r, tid)))
@@ -228,28 +153,22 @@ def main(argv=None) -> dict:
 
     report = {
         "model": m.__dict__,
-        "backend": a.backend,
         "save_parallel": {"tp": p.tp, "dp": p.dp, "pp": p.pp, "world": p.world},
         "load_parallel": {"tp": lp.tp, "dp": lp.dp, "pp": lp.pp, "world": lp.world},
-        "layout": a.layout, "format": fmt, "tensors": len(st.named_d_tensors),
+        "layout": a.layout, "format": a.format, "tensors": len(st.named_d_tensors),
         "aggregate_tp": a.aggregate_tp,
-        "cache": a.cache,
         "files": {path: fp.payload_size for path, fp in sorted(index.files.items())},
         "seconds": {"plan_layout": round(t_plan, 3), "save": round(t_save, 3), "load": round(t_load, 3)},
-        "write": write_report(wrecs, a.root),
-        "read": read_report(rio.tracer.counters, rio.tracer.records, data_bytes),
+        "write": write_report(wrecs),
+        "read": read_report(rio.tracer.records, data_bytes),
         "load_bytes_verified": bool(ok),
     }
-    if a.backend == "omnifs":
-        report["write"].update(kv_report(wrecs))
-        if sink_stats is not None:
-            report["sink"] = sink_stats
     with open(os.path.join(out_dir, "report.json"), "w") as f:
         json.dump(report, f, indent=2, default=str)
     dump_trace(wrecs, os.path.join(out_dir, "write_trace.csv"), t0)
     dump_trace(rio.tracer.records, os.path.join(out_dir, "read_trace.csv"), t1)
-    print(json.dumps({k: report[k] for k in ("backend", "save_parallel", "load_parallel", "layout", "format",
-                                              "aggregate_tp", "cache", "seconds", "write", "read",
+    print(json.dumps({k: report[k] for k in ("save_parallel", "load_parallel", "layout", "format",
+                                              "aggregate_tp", "seconds", "write", "read",
                                               "load_bytes_verified")}, indent=1, default=str))
     return report
 

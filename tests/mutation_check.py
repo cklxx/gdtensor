@@ -24,7 +24,6 @@ DETECTORS = [
     "tests/test_checks.py",
     "tests/test_matrix.py",
     "tests/test_adversarial.py",
-    "tests/test_omnifs.py",
     "tests/test_consistency.py",
 ]
 
@@ -98,17 +97,9 @@ MUTATIONS = [
      "payload slot order"),
     ("gdtensor/layout.py", "if path in files:\n            raise ResultError(f\"two lists map to one path {path}\")",
      "if False:\n            raise ResultError(f\"two lists map to one path {path}\")", "duplicate path guard"),
-    # ---- omnifs coverage
-    ("gdtensor/omnifs.py", 'if b.chunk_offset < a.chunk_offset + a.length:',
-     'if b.chunk_offset < a.chunk_offset + a.length - 1:', "KV overlap off-by-one"),
-    ("gdtensor/omnifs.py", 'if e.chunk_offset != pos:', 'if False:  # mutation', "KV gap check"),
-    ("gdtensor/omnifs.py", "if pos != want:", "if pos + 1 != want:", "full coverage off-by-one"),
-    ("gdtensor/omnifs.py", "if old is not None and old.crc != e.crc:", "if False:  # mutation", "KV conflict check"),
     # ---- formats whole-tensor detection
     ("gdtensor/formats.py", "ok = iv[0, 0] == 0 and iv[-1, 1] == numel and bool(np.all(iv[1:, 0] == iv[:-1, 1]))",
      "ok = iv[0, 0] == 0 and iv[-1, 1] == numel", "whole-tensor contiguity check"),
-    # ---- p2p peer pick: the original hash()-salt bug is pinned directly by
-    # test_p2p_peer_pick_is_hash_seed_independent, so no flip mutation here.
 ]
 
 
