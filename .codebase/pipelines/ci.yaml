@@ -8,7 +8,7 @@ trigger:
 jobs:
   gate:
     name: lint + full non-torch tests
-    image: hub.byted.org/codebase/ci_debian_bullseye
+    image: hub.byted.org/codebase/ci_python_311
     steps:
       - name: Install dependencies
         commands:
