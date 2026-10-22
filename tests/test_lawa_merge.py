@@ -24,7 +24,9 @@ import torch.distributed as dist  # noqa: E402
 from torch.distributed.tensor import Replicate as TRep, distribute_tensor, init_device_mesh  # noqa: E402
 
 from conftest import assert_all_ok  # noqa: E402
-from gdtensor.builder import get_gd_tensor, get_tensor_ids, make_gd_tensor, reset_d_tensor  # noqa: E402
+from gdtensor._dtensor import tensor_ids_of as _ids  # noqa: E402
+from gdtensor.builder import get_gd_tensor, get_tensor_ids, reset_d_tensor  # noqa: E402
+from gdtensor._torch_bridge import gd_for_layout  # noqa: E402
 from gdtensor._dtensor import DTensorTable, NamedDTensor, named_of, global_tensor_meta_of  # noqa: E402
 from gdtensor._models import ParallelConfig, layout_builder, storage_table  # noqa: E402
 from gdtensor._runner import compute_view, load_threads, save_threads  # noqa: E402
@@ -59,7 +61,7 @@ def _table_and_layout(shape=SHAPE):
     mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
     g = torch.zeros(shape, dtype=torch.float32)
     dt = distribute_tensor(g, mesh, [TRep()])
-    gd = make_gd_tensor(dt, "w", p=P, placements=PLS).unwrap()
+    gd = gd_for_layout(dt, "w", p=P, placements=PLS).unwrap()
     ct = DTensorTable([NamedDTensor("w", gd)])
     st = storage_table(ct, P, "hf")
     lay = layout_builder("single", st, P, "safetensors")
@@ -160,7 +162,7 @@ def test_lawa_uses_bridge_functions_not_core_reduce(monkeypatch):
         assert not hasattr(gdtensor, forbidden)
         assert not hasattr(builder, forbidden)
     # bridge functions the section-10 flow relies on do exist
-    for fn in (get_tensor_ids, get_gd_tensor, make_gd_tensor, reset_d_tensor):
+    for fn in (get_tensor_ids, get_gd_tensor, gd_for_layout, reset_d_tensor):
         assert callable(fn)
 
 
@@ -176,19 +178,19 @@ def test_lawa_meta_mismatch_is_rejected(tmp_path):
     from gdtensor._formats import make_storage_view
     mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
     v = torch.zeros(SHAPE, dtype=torch.float32)
-    gd32 = make_gd_tensor(distribute_tensor(v, mesh, [TRep()]), "w",
+    gd32 = gd_for_layout(distribute_tensor(v, mesh, [TRep()]), "w",
                           p=P, placements=PLS).unwrap()
-    gd64 = make_gd_tensor(distribute_tensor(v.double(), mesh, [TRep()]), "w",
+    gd64 = gd_for_layout(distribute_tensor(v.double(), mesh, [TRep()]), "w",
                           p=P, placements=PLS).unwrap()
     t32 = DTensorTable([NamedDTensor("w", gd32)])
     t64 = DTensorTable([NamedDTensor("w", gd64)])
     st64 = storage_table(t64, P, "hf"); lay64 = layout_builder("single", st64, P, "safetensors")
-    sv64 = make_storage_view(st64.tensor_ids, st64, lay64, "/nonexistent")
+    sv64 = make_storage_view(_ids(st64), st64, lay64, "/nonexistent")
     cv32 = compute_view(t32, ComputeFabric(t32).allocate(), 0)
     # f32 compute -> f64 storage: global_tensor_meta differs -> rejected
     r = d_tensors_view_rank_plan_save(0, cv32, sv64)
     assert not r.ok and "global_tensor_meta differs" in r.error
     # equal meta is accepted (sanity)
     st32 = storage_table(t32, P, "hf"); lay32 = layout_builder("single", st32, P, "safetensors")
-    sv32 = make_storage_view(st32.tensor_ids, st32, lay32, "/nonexistent")
+    sv32 = make_storage_view(_ids(st32), st32, lay32, "/nonexistent")
     assert d_tensors_view_rank_plan_save(0, cv32, sv32).ok

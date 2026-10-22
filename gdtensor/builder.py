@@ -1,92 +1,80 @@
-"""Compute <-> torch.DTensor bridge and the view-map constructor (spec 5.5/5.6).
+"""gdtensor.builder: user-facing product types, view map, and helpers (C.3 / C.4).
 
-torch is an optional dependency. When it is absent, make_gd_tensor raises
-InvalidArgumentError; the metadata-only lite path still works.
-
-Short names per C.3 live at package top level (get_tensor_ids,
-get_gd_tensor, make_gd_tensor, get_d_tensor, reset_d_tensor).
+Implementations live in internal modules; this namespace re-exports exactly
+what table C.3 / C.4 names. The compute/torch bridge five functions are at
+package top level (5.6).
 """
 from __future__ import annotations
 
 from typing import Callable, Optional
 
-from ._dtensor import DTensorTable, NamedDTensor, NaiveDTensor, ReshapedDTensor, named_of
-from ._result import catch
-from .tag import (
-    InvalidArgumentError, NotFoundError, Ok, Replicate, Shard,
+from ._dtensor import (
+    DTensorTable, GenericDTensor, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
+    Placement, ReshapedDTensor, global_tensor_meta_of, named_of, tensor_order_value_of,
 )
-from ._views import ComputeDTensorsView, StorageDTensorsView
+from ._layout import (
+    ContainerFormat, DisjointStorageMeshList, PhysicalLayoutTable,
+    TensorComponentPos, file_path_of, leader_tensor_component_pos_of,
+)
+from ._mesh import (
+    ArrangedMesh, ComputeMesh, ContentSlotsMesh, LiteralMesh, OuterProductMesh,
+    PermutedMesh, ReshapedMesh, Slice, SlicedMesh, StorageMesh,
+)
+from ._result import (
+    CheckFailedError, ConstraintViolationError, ERROR_TYPES,
+    GDTensorIOError, InvalidArgumentError, NotFoundError,
+)
+from ._views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
 
 
-# ------------------------------------------------------------------ 5.6 bridge
+# ------------------------------------------------------------------ 5.6 bridge (top-level names)
 
 
-def get_tensor_ids(view: ComputeDTensorsView):
+def get_tensor_ids(view):
+    # compute_d_tensors_view_get_tensor_ids
+    from .tag import Ok
     return Ok(list(view.tensor_ids))
 
 
-@catch
-def get_gd_tensor(view: ComputeDTensorsView, tensor_id: str):
-    # B.1.4: returns the GenericDTensor (the .d_tensor of the NamedDTensor).
-    try:
-        return named_of(view.d_tensor_table, tensor_id).d_tensor
-    except Exception as exc:
-        if "not in DTensorTable" in str(exc):
-            raise NotFoundError(str(exc), key_name="tensor_id", key=tensor_id) from None
-        raise
+def get_gd_tensor(view, tensor_id: str):
+    # compute_d_tensors_view_get_gd_tensor
+    from ._result import catch
+    @catch
+    def fn():
+        nd = named_of(view.d_tensor_table, tensor_id)
+        return nd.d_tensor
+    return fn()
 
 
-def _torch_bridge():
-    from . import _torch_bridge as tb
-    return tb
-
-
-@catch
-def make_gd_tensor(d_tensor, tensor_id=None, p=None, stage: int = 0, placements=None):
-    """gd_tensor_make: torch.DTensor -> gdtensor GenericDTensor (spec 5.6).
-
-    torch is optional. tensor_id/p/stage/placements name the gdtensor tensor
-    and topology for mesh mapping; without torch returns InvalidArgumentError.
-    """
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        raise InvalidArgumentError(
-            "make_gd_tensor requires torch (torch.distributed.tensor)",
-            argument_name="d_tensor",
-        ) from None
-    from ._torch_bridge import make_gd_tensor as _impl
-    if tensor_id is None:
-        tensor_id = getattr(d_tensor, "name", None) or "tensor"
-    return _impl(d_tensor, tensor_id, p, stage, placements)
+def make_gd_tensor(d_tensor):
+    # gd_tensor_make: torch.DTensor -> GenericDTensor[ComputeMesh]
+    from . import _torch_bridge
+    return _torch_bridge.gd_tensor_make(d_tensor)
 
 
 def get_d_tensor(gd_tensor):
-    """Underlying torch.DTensor, or None when metadata-only."""
-    if isinstance(gd_tensor, ReshapedDTensor):
-        gd_tensor = gd_tensor.naive
-    if isinstance(gd_tensor, NaiveDTensor):
-        return Ok(getattr(gd_tensor, "torch_d_tensor", None))
-    raise InvalidArgumentError("not a GenericDTensor", argument_name="gd_tensor")
+    # gd_tensor_get_d_tensor: torch.DTensor or nil
+    from .tag import Ok
+    dt = gd_tensor if type(gd_tensor) is NaiveDTensor else gd_tensor.underlying_d_tensor
+    return Ok(getattr(dt, "torch_d_tensor", None))
 
 
 def reset_d_tensor(gd_tensor, d_tensor) -> None:
-    """Replace the underlying torch.DTensor. Meta/placements/mesh must match."""
-    if isinstance(gd_tensor, ReshapedDTensor):
-        gd_tensor = gd_tensor.naive
-    if not isinstance(gd_tensor, NaiveDTensor):
-        raise InvalidArgumentError("not a GenericDTensor", argument_name="gd_tensor")
-    try:
-        object.__setattr__(gd_tensor, "torch_d_tensor", d_tensor)
-    except Exception as exc:  # frozen dataclass
-        raise InvalidArgumentError(str(exc), argument_name="d_tensor") from None
+    # gd_tensor_reset_d_tensor: replace the underlying torch.DTensor
+    from ._result import invalid
+    from .tag import Err
+    target = gd_tensor if type(gd_tensor) is NaiveDTensor else gd_tensor.underlying_d_tensor
+    if type(target) is not NaiveDTensor:
+        raise invalid("gd_tensor", "not a GenericDTensor")
+    target.torch_d_tensor = d_tensor
 
 
 # ------------------------------------------------------------------ 5.5 view map
 
 
 class DTensorsViewMapCore:
-    """Four optional callbacks. None means identity (tensors) or skip (sessions)."""
+    """Four optional callbacks. A nil tensor callback means identity; a nil
+    session callback means skip that session."""
 
     def __init__(
         self,
@@ -101,61 +89,75 @@ class DTensorsViewMapCore:
         self.convert_each_storage_save_session = convert_each_storage_save_session
 
 
-@catch
+def _ok_value(v, name):
+    from .tag import Err, Ok
+    if v is None:
+        return None
+    if type(v) is Ok:
+        return v.value
+    if type(v) is Err:
+        return v
+    # plain return is accepted as success
+    return v
+
+
 def d_tensors_view_map(origin, map_core: DTensorsViewMapCore):
-    """Convert a view in place structurally; no range selection, no I/O."""
-    if isinstance(origin, ComputeDTensorsView):
+    from .tag import Ok, Err
+
+    def _result_of(v):
+        if type(v) in (Ok, Err):
+            return v
+        return Ok(v)
+
+    if type(origin) is ComputeDTensorsView:
         fn = map_core.convert_each_compute_view
         if fn is None:
-            return origin
-        new = []
+            return Ok(origin)
+        named = []
         for nd in origin.d_tensor_table.named_d_tensors:
-            out = fn(nd.d_tensor)
-            if out is None:
-                raise InvalidArgumentError("compute view callback returned nil", argument_name="map_core")
-            new.append(NamedDTensor(nd.global_tensor_id, out, nd.alias))
-        table = DTensorTable(new)
-        return ComputeDTensorsView(origin.tensor_ids, table, origin.data_accessor)
-    if isinstance(origin, StorageDTensorsView):
+            r = _result_of(fn(nd.d_tensor))
+            if type(r) is Err:
+                return r
+            named.append(NamedDTensor(nd.global_tensor_id, r.value, nd.alias))
+        return Ok(ComputeDTensorsView(origin.tensor_ids, DTensorTable(named), origin.data_accessor))
+
+    if type(origin) is StorageDTensorsView:
         fn = map_core.convert_each_storage_view
         if fn is None:
-            return origin
-        new = []
+            return Ok(origin)
+        named = []
         for nd in origin.d_tensor_table.named_d_tensors:
-            out = fn(nd.d_tensor)
-            if out is None:
-                raise InvalidArgumentError("storage view callback returned nil", argument_name="map_core")
-            new.append(NamedDTensor(nd.global_tensor_id, out, nd.alias))
-        table = DTensorTable(new)
-        # sessions are only converted when a callback is supplied; no I/O here
-        return StorageDTensorsView(
-            origin.tensor_ids, table, origin.data_accessor, origin.physical_layout,
-            origin.begin_save, origin.begin_load,
-        )
-    raise InvalidArgumentError(f"unknown view type {type(origin).__name__}", argument_name="origin")
+            r = _result_of(fn(nd.d_tensor))
+            if type(r) is Err:
+                return r
+            named.append(NamedDTensor(nd.global_tensor_id, r.value, nd.alias))
+        # session callbacks are applied by the caller when sessions open; the
+        # view constructor itself does no I/O.
+        return Ok(StorageDTensorsView(
+            origin.tensor_ids, DTensorTable(named), origin.data_accessor,
+            origin.physical_layout, origin.begin_save, origin.begin_load))
+
+    return Err(InvalidArgumentError(argument_name="origin",
+                                    msg=f"unknown view type {type(origin).__name__}"))
 
 
+Error = tuple(ERROR_TYPES)
 
-
-
-# ------------------------------------------------------------------ C.3 re-exports
-# The builder namespace is the single import surface for every product type,
-# mesh, layout, typed error, and helper listed in design table C.3. The
-# implementations live in their own modules; this block only re-exports them.
-from ._dtensor import (  # noqa: E402
-    DTensorTable, GenericDTensor, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
-    ReshapedDTensor, global_tensor_meta_of, tensor_order_value_of,
-)
-from ._layout import (  # noqa: E402
-    ContainerFormat, DisjointStorageMeshList, PhysicalLayoutTable,
-    TensorComponentPos, file_path_of, leader_tensor_component_pos_of,
-)
-from ._mesh import (  # noqa: E402
-    ArrangedMesh, ComputeMesh, ContentSlotsMesh, LiteralMesh, OuterProductMesh,
-    PermutedMesh, ReshapedMesh, Slice, SlicedMesh, StorageMesh,
-)
-from .tag import (  # noqa: E402
-    CheckFailedError, ConstraintViolationError, GDTensorIOError,
-    InvalidArgumentError, NotFoundError, Placement,
-)
-from ._views import ComputeDTensorsView, DTensorsView, StorageDTensorsView  # noqa: E402
+__all__ = [
+    # views / tables / tensors
+    "DTensorsView", "ComputeDTensorsView", "StorageDTensorsView",
+    "DTensorsViewMapCore", "d_tensors_view_map",
+    "DTensorTable", "NamedDTensor", "GenericDTensor", "NaiveDTensor", "ReshapedDTensor",
+    "GlobalTensorMeta", "Placement",
+    "ComputeMesh", "StorageMesh", "OuterProductMesh", "ContentSlotsMesh",
+    "LiteralMesh", "ArrangedMesh", "ReshapedMesh", "PermutedMesh", "SlicedMesh", "Slice",
+    "PhysicalLayoutTable", "DisjointStorageMeshList", "ContainerFormat", "TensorComponentPos",
+    # errors
+    "ConstraintViolationError", "CheckFailedError", "NotFoundError",
+    "InvalidArgumentError", "GDTensorIOError", "Error",
+    # helpers (C.4)
+    "global_tensor_meta_of", "tensor_order_value_of", "file_path_of",
+    "leader_tensor_component_pos_of",
+    # bridge five (also at package top level)
+    "get_tensor_ids", "get_gd_tensor", "make_gd_tensor", "get_d_tensor", "reset_d_tensor",
+]

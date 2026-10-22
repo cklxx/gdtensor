@@ -1,19 +1,23 @@
-"""Views and accessors (DTensorsView B.2.1.1, B.2.2.1, B.2.3.1, B.2.3.2).
+"""Views and accessors (design B.2.1.1, B.2.2.1, B.2.3.1, B.2.3.2).
 
-Lite deviation: the accessor callbacks get one ``memoryview`` instead of
-``(buffer_ptr, buffer_len)``. The memoryview carries both values.
+Accessor callbacks follow C.2: ``callback(buffer_ptr, buffer_len) ->
+Result[None]``. ``buffer_ptr`` is the address of a host buffer that stays
+valid during the call. ``read_to_buffer`` hands the range bytes to the
+callback; ``write_from_buffer`` asks the callback to fill a buffer, then
+writes it to the range.
 """
 from __future__ import annotations
 
+import ctypes
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
+from ._builder_mixin import make_builder_mixin
 from ._dtensor import (
     DTensorTable,
-    NamedDTensor,
     global_tensor_meta_of,
     iv_prefix,
     iv_total,
@@ -22,16 +26,35 @@ from ._dtensor import (
     participants_of,
 )
 from ._iobackend import FileIO
-from ._layout import PayloadIndex, PhysicalLayoutTable, build_payload_index
+from ._layout import PayloadIndex, PhysicalLayoutTable
 from ._ranges import RangeFromComputeView, RangeFromStorageView
-from ._result import Result, ResultError, catch
+from ._result import Fail, catch, invalid, io_error
+from .access import DTensorDataAccessor
+from .tag import Err, Ok
 
-Callback = Callable[[memoryview], object]
+
+def buffer_address(buf) -> int:
+    """Address of a writable numpy array or bytearray."""
+    if isinstance(buf, np.ndarray):
+        return int(buf.ctypes.data)
+    return ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
 
 
-def _check_cb(out: object) -> None:
-    if out is not None and getattr(out, "ok", True) is False:
-        raise ResultError(out.error)
+def call_buffer_callback(callback, buf) -> None:
+    out = callback(buffer_address(buf) if len(buf) else 0, len(buf))
+    if type(out) is Err:
+        raise Fail(out.value)
+    if type(out) is not Ok:
+        raise invalid("callback", f"buffer callback must return a Result, got {out!r}")
+
+
+def copy_from_ptr(buffer_ptr: int, buffer_len: int) -> bytes:
+    return ctypes.string_at(buffer_ptr, buffer_len) if buffer_len else b""
+
+
+def copy_to_ptr(buffer_ptr: int, data) -> None:
+    if len(data):
+        ctypes.memmove(buffer_ptr, bytes(data), len(data))
 
 
 # ===================================================================== compute
@@ -41,9 +64,9 @@ class ComputeFabric:
     """Simulated device memory of every rank in one job.
 
     ``buffers[rank][tensor_id]`` is the local shard: owned elements in
-    ascending global order (= row-major order of the owned box).
-    Reads of ranges that a rank does not own go through the fabric; this
-    stands for collective communication (compute -> compute reshard).
+    ascending global order (= row-major order of the owned box). Reads of
+    ranges a rank does not own go through the fabric; this stands for
+    collective communication (compute -> compute reshard).
     """
 
     def __init__(self, table: DTensorTable) -> None:
@@ -69,22 +92,20 @@ class ComputeFabric:
                 n = iv_total(iv)
                 if n == 0:
                     continue
-                isz = global_tensor_meta_of(nd).itemsize
-                buf = np.zeros(n * isz, dtype=np.uint8)
+                buf = np.zeros(n * global_tensor_meta_of(nd).itemsize, dtype=np.uint8)
                 if fill is not None:
                     buf[:] = fill(nd, iv)
                 bufs[nd.global_tensor_id] = buf
         return self
 
-    def locate(self, rank: int, rng: RangeFromComputeView, prefer_local: bool = True):
+    def locate(self, rank: int, rng: RangeFromComputeView):
         nd = named_of(self.table, rng.global_tensor_id)
         isz = global_tensor_meta_of(nd).itemsize
         if rng.global_tensor_offset % isz or rng.size % isz:
-            raise ResultError(f"compute range {rng} is not element aligned")
+            raise invalid("global_range", f"compute range {rng} is not element aligned")
         e0 = rng.global_tensor_offset // isz
         e1 = e0 + rng.size // isz
-        order = [rank] + [r for r in self.buffers if r != rank] if prefer_local else list(self.buffers)
-        for r in order:
+        for r in [rank] + [r for r in self.buffers if r != rank]:
             buf = self.buffers.get(r, {}).get(rng.global_tensor_id)
             if buf is None:
                 continue
@@ -93,110 +114,134 @@ class ComputeFabric:
             if k >= 0 and iv[k, 1] >= e1:
                 local = int(iv_prefix(iv, np.array([e0]))[0]) * isz
                 return r, buf[local:local + rng.size]
-        raise ResultError(f"no rank owns compute range {rng}")
+        raise invalid("global_range", f"no rank owns compute range {rng}")
 
 
-@dataclass
-class ComputeDataAccessor:
+class ComputeDataAccessor(DTensorDataAccessor):
     """DTensorDataAccessor[RangeFromComputeView] bound to one rank."""
 
-    rank: int
-    fabric: ComputeFabric
+    def __init__(self, rank: int, fabric: ComputeFabric) -> None:
+        self.rank = rank
+        self.fabric = fabric
 
     @catch
-    def read_to_buffer(self, global_range: RangeFromComputeView, read_to_buffer: Callback) -> None:
+    def read_to_buffer(self, global_range: RangeFromComputeView, read_to_buffer) -> None:
         owner, view = self.fabric.locate(self.rank, global_range)
         if owner != self.rank:
             self.fabric.comm_bytes += global_range.size
-        _check_cb(read_to_buffer(memoryview(view)))
+        call_buffer_callback(read_to_buffer, np.ascontiguousarray(view))
 
     @catch
-    def write_from_buffer(self, global_range: RangeFromComputeView, write_from_buffer: Callback) -> None:
+    def write_from_buffer(self, global_range: RangeFromComputeView, write_from_buffer) -> None:
         owner, view = self.fabric.locate(self.rank, global_range)
         if owner != self.rank:
-            raise ResultError(f"rank {self.rank} writes compute range it does not own: {global_range}")
-        _check_cb(write_from_buffer(memoryview(view)))
+            raise invalid("global_range", f"rank {self.rank} writes compute range it does not own: {global_range}")
+        call_buffer_callback(write_from_buffer, view)
 
 
-@dataclass
-class ComputeDTensorsView:
+ComputeDTensorsViewBuilderMixin = make_builder_mixin(
+    "ComputeDTensorsView", [("tensor_ids", "list"), ("d_tensor_table", "object"), ("data_accessor", "scalar")])
+
+
+@dataclass(eq=False)
+class ComputeDTensorsView(ComputeDTensorsViewBuilderMixin):
+    tensor_ids: List[str] = field(default_factory=list)
+    d_tensor_table: DTensorTable = field(default_factory=DTensorTable)
+    data_accessor: Any = None
+
+    def __post_init__(self) -> None:
+        self.tensor_ids = list(self.tensor_ids)
+
     def check_constraints(self):
-        from ._constraints import check_constraints as _check
-        return _check(self)
-
-    tensor_ids: List[str]
-    d_tensor_table: DTensorTable
-    data_accessor: ComputeDataAccessor
+        from ._constraints import check_constraints
+        return check_constraints(self)
 
 
 # ===================================================================== storage
 
 
-class StorageDataAccessor:
+class StorageDataAccessor(DTensorDataAccessor):
     """DTensorDataAccessor[RangeFromStorageView].
 
-    It only knows contiguous_payload_offset. The active session maps it to
-    the real file offset through ``get_file_offset``. The session binding is
-    thread-local, so one view serves many rank threads.
+    It knows ``contiguous_payload_offset`` only. A session maps it to the file
+    offset through ``get_file_offset``. A view-level accessor uses the session
+    that the executor binds for the current thread; a session-bound accessor
+    (``init_data_accessor``) always uses its own session.
     """
 
-    def __init__(self, index: PayloadIndex, io: FileIO) -> None:
+    def __init__(self, index: PayloadIndex, io: FileIO, session=None) -> None:
         self.index = index
         self.io = io
+        self._fixed = session
         self._local = threading.local()
 
     @property
     def session(self):
-        return getattr(self._local, "session", None)
+        return self._fixed if self._fixed is not None else getattr(self._local, "session", None)
 
-    @session.setter
-    def session(self, value) -> None:
-        self._local.session = value
+    def bind(self, session) -> None:
+        self._local.session = session
 
     def _file_offset(self, rng: RangeFromStorageView):
-        if self.session is None:
-            raise ResultError("storage accessor used outside a session")
+        s = self.session
+        if s is None:
+            raise invalid("session", "storage accessor used outside a session")
         fp = self.index.files.get(rng.file_path)
         if fp is None:
-            raise ResultError(f"unknown file {rng.file_path}")
-        starts = [s.contiguous_payload_offset for s in fp.slots]
+            raise invalid("global_range", f"unknown file {rng.file_path}")
+        starts = [x.contiguous_payload_offset for x in fp.slots]
         k = int(np.searchsorted(starts, rng.contiguous_payload_offset, side="right")) - 1
         if k < 0:
-            raise ResultError(f"offset {rng.contiguous_payload_offset} before first slot")
+            raise invalid("global_range", f"offset {rng.contiguous_payload_offset} before first slot")
         slot = fp.slots[k]
         if rng.contiguous_payload_offset + rng.size > slot.contiguous_payload_offset + slot.nbytes:
-            raise ResultError(f"storage range {rng} crosses a slot boundary")
-        base = self.session.get_file_offset(slot.pos).unwrap()
-        return self.session.abspath(rng.file_path), base + rng.contiguous_payload_offset - slot.contiguous_payload_offset
+            raise invalid("global_range", f"storage range {rng} crosses a slot boundary")
+        base = s.get_file_offset(slot.pos)
+        if type(base) is Err:
+            raise Fail(base.value)
+        return s, s.abspath(rng.file_path), base.value + rng.contiguous_payload_offset - slot.contiguous_payload_offset
 
     @catch
-    def read_to_buffer(self, global_range: RangeFromStorageView, read_to_buffer: Callback) -> None:
-        path, off = self._file_offset(global_range)
-        data = self.io.pread(self.session.rank, path, off, global_range.size)
-        _check_cb(read_to_buffer(memoryview(data)))
+    def read_to_buffer(self, global_range: RangeFromStorageView, read_to_buffer) -> None:
+        s, path, off = self._file_offset(global_range)
+        try:
+            data = self.io.pread(s.rank, path, off, global_range.size)
+        except OSError as exc:
+            raise io_error("read", str(exc), path) from None
+        call_buffer_callback(read_to_buffer, bytearray(data))
 
     @catch
-    def write_from_buffer(self, global_range: RangeFromStorageView, write_from_buffer: Callback) -> None:
-        path, off = self._file_offset(global_range)
+    def write_from_buffer(self, global_range: RangeFromStorageView, write_from_buffer) -> None:
+        s, path, off = self._file_offset(global_range)
         buf = bytearray(global_range.size)
-        _check_cb(write_from_buffer(memoryview(buf)))
-        self.io.pwrite(self.session.rank, path, off, buf)
+        call_buffer_callback(write_from_buffer, buf)
+        try:
+            self.io.pwrite(s.rank, path, off, buf)
+        except OSError as exc:
+            raise io_error("write", str(exc), path) from None
 
 
-@dataclass
-class StorageDTensorsView:
+StorageDTensorsViewBuilderMixin = make_builder_mixin(
+    "StorageDTensorsView", [("tensor_ids", "list"), ("d_tensor_table", "object"), ("data_accessor", "scalar"),
+                            ("physical_layout", "object"), ("begin_save", "scalar"), ("begin_load", "scalar")])
+
+
+@dataclass(eq=False)
+class StorageDTensorsView(StorageDTensorsViewBuilderMixin):
+    tensor_ids: List[str] = field(default_factory=list)
+    d_tensor_table: DTensorTable = field(default_factory=DTensorTable)
+    data_accessor: Any = None
+    physical_layout: PhysicalLayoutTable = field(default_factory=PhysicalLayoutTable)
+    # Function fields, called as view.begin_save(view, rank) / view.begin_load(view, rank).
+    begin_save: Optional[Callable] = field(default=None, repr=False)
+    begin_load: Optional[Callable] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.tensor_ids = list(self.tensor_ids)
+
     def check_constraints(self):
-        from ._constraints import check_constraints as _check
-        return _check(self)
-
-    tensor_ids: List[str]
-    d_tensor_table: DTensorTable
-    data_accessor: StorageDataAccessor
-    physical_layout: PhysicalLayoutTable
-    # Function fields, called as view.begin_save(view, rank) per the spec.
-    begin_save: Callable[["StorageDTensorsView", int], Result] = field(repr=False, default=None)
-    begin_load: Callable[["StorageDTensorsView", int], Result] = field(repr=False, default=None)
+        from ._constraints import check_constraints
+        return check_constraints(self)
 
 
-# DTensorsView = $compute ComputeDTensorsView | $storage StorageDTensorsView
-DTensorsView = Union[ComputeDTensorsView, StorageDTensorsView]
+DTensorsView = ComputeDTensorsView | StorageDTensorsView

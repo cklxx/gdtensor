@@ -20,7 +20,7 @@ from torch.distributed.tensor import (  # noqa: E402
 
 import safetensors
 from conftest import assert_all_ok  # noqa: E402
-from gdtensor.builder import make_gd_tensor  # noqa: E402
+from gdtensor._torch_bridge import gd_for_layout  # noqa: E402
 from gdtensor._dtensor import DTensorTable, NamedDTensor  # noqa: E402
 from gdtensor._models import ParallelConfig, layout_builder, storage_table  # noqa: E402
 from gdtensor._runner import load_threads, save_threads  # noqa: E402
@@ -55,7 +55,7 @@ def test_torch_dtensor_roundtrip(tmp_path, shape, pls):
     mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
     g = torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(shape)
     dt = distribute_tensor(g, mesh, [TRep()])
-    gd = make_gd_tensor(dt, "w", p=p, placements=pls).unwrap()
+    gd = gd_for_layout(dt, "w", p=p, placements=pls).unwrap()
     ct = DTensorTable([NamedDTensor("w", gd)])
     st = storage_table(ct, p, "hf")
     lay = layout_builder("single", st, p, "safetensors")
@@ -90,8 +90,8 @@ def test_two_tensor_table_roundtrip(tmp_path):
     dta = distribute_tensor(a, mesh, [TRep()])
     dtb = distribute_tensor(b, mesh, [TRep()])
     pls = (Replicate(), Shard(0), Replicate())
-    gda = make_gd_tensor(dta, "a", p=p, placements=pls).unwrap()
-    gdb = make_gd_tensor(dtb, "b", p=p, placements=pls).unwrap()
+    gda = gd_for_layout(dta, "a", p=p, placements=pls).unwrap()
+    gdb = gd_for_layout(dtb, "b", p=p, placements=pls).unwrap()
     ct = DTensorTable([NamedDTensor("a", gda), NamedDTensor("b", gdb)])
     st = storage_table(ct, p, "hf")
     lay = layout_builder("single", st, p, "safetensors")

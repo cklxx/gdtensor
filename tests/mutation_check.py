@@ -72,8 +72,6 @@ MUTATIONS = [
     ("gdtensor/_dtensor.py", "while k < len(b) and b[k, 0] < e:", "while k < len(b) and b[k, 0] <= e:", "subtract inner condition"),
     ("gdtensor/_dtensor.py", "if bs > cur:", "if bs >= cur:", "subtract output boundary"),
     ("gdtensor/_dtensor.py", "cur = max(cur, be)", "cur = cur + be", "subtract progress arithmetic"),
-    # NOTE: j is global across a-intervals by design; mutating it to reset
-    # per interval would change semantics, so it is asserted separately.
     # ---- iv_prefix
     ("gdtensor/_dtensor.py", "np.searchsorted(iv[:, 0], points, side=\"right\") - 1",
      "np.searchsorted(iv[:, 0], points, side=\"left\") - 1", "prefix search side"),
@@ -87,16 +85,16 @@ MUTATIONS = [
     # ---- plan _pair
     ("gdtensor/_plan.py", "todo = iv_subtract(todo, piece)",
      "todo = iv_subtract(todo, src_iv)", "pair subtraction scope"),
-    ("gdtensor/_plan.py", 'raise ResultError(f"no source covers {iv_total(todo)} destination elements")',
+    ("gdtensor/_plan.py", 'raise invalid("src_view", f"no source covers {iv_total(todo)} destination elements")',
      'pass  # mutation: coverage check removed', "pair full-coverage enforcement"),
     ("gdtensor/_plan.py", "if todo.size == 0:\n                break",
      "if False:  # mutation\n                break", "pair early-exit guard"),
     # ---- layout slot ordering
-    ("gdtensor/_layout.py", "for t, w in lst.cells:  # row-major: header order, then column order",
-     "for t, w in sorted(lst.cells, key=lambda c: (c[1], c[0])):  # mutation: column-major",
+    ("gdtensor/_layout.py", "for t, w in list_cells(lst):  # row-major: header order, then column order",
+     "for t, w in sorted(list_cells(lst), key=lambda c: (c[1], c[0])):  # mutation: column-major",
      "payload slot order"),
-    ("gdtensor/_layout.py", "if path in files:\n            raise ResultError(f\"two lists map to one path {path}\")",
-     "if False:\n            raise ResultError(f\"two lists map to one path {path}\")", "duplicate path guard"),
+    ("gdtensor/_layout.py", "if path in files:\n            raise invalid(\"file_paths\", f\"two lists map to one path {path}\")",
+     "if False:\n            raise invalid(\"file_paths\", f\"two lists map to one path {path}\")", "duplicate path guard"),
     # ---- formats whole-tensor detection
     ("gdtensor/_formats.py", "ok = iv[0, 0] == 0 and iv[-1, 1] == numel and bool(np.all(iv[1:, 0] == iv[:-1, 1]))",
      "ok = iv[0, 0] == 0 and iv[-1, 1] == numel", "whole-tensor contiguity check"),

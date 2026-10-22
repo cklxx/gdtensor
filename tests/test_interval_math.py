@@ -10,7 +10,7 @@ import pytest
 from gdtensor._dtensor import iv_intersect, iv_normalize, iv_prefix, iv_subtract
 from gdtensor._plan import _pair
 from gdtensor._ranges import RangeFromComputeView, RangeFromStorageView
-from gdtensor._result import ResultError
+from gdtensor._result import Fail
 
 
 def _iv(lst):
@@ -184,7 +184,7 @@ def test_pair_dst_split_by_src_gap():
     src = [(_iv([(0, 40)]), ("storage", "f", 0, 1)),
            (_iv([(60, 100)]), ("storage", "f", 60, 1))]
     # dst [40,60) has no src -> must raise (full coverage invariant)
-    with pytest.raises(ResultError, match="no source covers"):
+    with pytest.raises(Fail, match="no source covers"):
         _pair(dst, src)
 
 
@@ -210,7 +210,7 @@ def test_pair_src_larger_than_dst():
 def test_pair_empty_plan_when_no_overlap():
     dst = [(_iv([(0, 10)]), ("compute", "t", 1))]
     src = [(_iv([(20, 30)]), ("storage", "f", 20, 1))]
-    with pytest.raises(ResultError, match="no source covers"):
+    with pytest.raises(Fail, match="no source covers"):
         _pair(dst, src)
 
 

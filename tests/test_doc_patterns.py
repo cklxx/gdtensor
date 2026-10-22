@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from conftest import assert_all_ok, verify_safetensors_dir
+from gdtensor._dtensor import tensor_ids_of as _ids  # noqa: E402
 from gdtensor._dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor
 from gdtensor._models import (
     ModelConfig, ParallelConfig, compute_mesh, compute_table, fill_pattern, layout_builder,
@@ -52,11 +53,11 @@ def test_qwen3_tp4_write_pattern():
     p, ct = _qwen3_layer0_table(4)
     st = storage_table(ct, p, "hf")
     lay = layout_builder("single", st, p, "safetensors")
-    by_tensor = {tid: [] for tid in ct.tensor_ids}
+    by_tensor = {tid: [] for tid in _ids(ct)}
     for r in range(p.world):
         cv = compute_view(ct, None, r)
         cv.data_accessor = ComputeDataAccessor(r, None)
-        plan = d_tensors_view_rank_plan_save(r, cv, make_storage_view(st.tensor_ids, st, lay, "/nonexistent")).unwrap()
+        plan = d_tensors_view_rank_plan_save(r, cv, make_storage_view(_ids(st), st, lay, "/nonexistent")).unwrap()
         for _, d in plan:
             by_tensor[_tid_of(plan, d)].append(d)
     q = by_tensor["q_proj"]
@@ -86,7 +87,7 @@ def test_q_proj_and_o_proj_offsets_unaligned():
     lay = layout_builder("single", st, p, "safetensors")
     data_start = len(safetensors_header(st, build_payload_index(st, lay), "model.safetensors"))
     assert data_start % MiB != 0
-    sv = make_storage_view(st.tensor_ids, st, lay, "/nonexistent")
+    sv = make_storage_view(_ids(st), st, lay, "/nonexistent")
     seen = []
     for r in range(p.world):
         cv = compute_view(ct, None, r)
@@ -103,7 +104,7 @@ def test_o_proj_one_chunk_many_writers():
     p, ct = _qwen3_layer0_table(4)
     st = storage_table(ct, p, "hf")
     lay = layout_builder("single", st, p, "safetensors")
-    sv = make_storage_view(st.tensor_ids, st, lay, "/nonexistent")
+    sv = make_storage_view(_ids(st), st, lay, "/nonexistent")
     per_chunk = collections.defaultdict(set)
     for r in range(p.world):
         cv = compute_view(ct, None, r)
@@ -126,7 +127,7 @@ def test_aggregate_switch_moves_dim1_writes_to_one_rank(tmp_path):
     p = ParallelConfig(tp=4, dp=2, pp=1)
     ct = compute_table(m, p)
     dim1 = [nd.global_tensor_id for nd in ct.named_d_tensors
-            if isinstance(nd.d_tensor, NaiveDTensor) and nd.d_tensor.placements[2] == Shard(1)]
+            if isinstance(nd.d_tensor, NaiveDTensor) and type(nd.d_tensor.placements[2]) is Shard and nd.d_tensor.placements[2].value == 1]
     assert dim1
     writers = {}
     for agg in (False, True):
@@ -134,7 +135,7 @@ def test_aggregate_switch_moves_dim1_writes_to_one_rank(tmp_path):
         st = storage_table(ct, p, "hf", aggregate_tp=agg)
         lay = layout_builder("single", st, p, "safetensors")
         fab = ComputeFabric(ct).allocate(fill=fill_pattern)
-        sv = make_storage_view(st.tensor_ids, st, lay, d, FileIO(), ThreadCoordinator(p.world))
+        sv = make_storage_view(_ids(st), st, lay, d, FileIO(), ThreadCoordinator(p.world))
         assert_all_ok(reshard_threads(p.world, lambda r: compute_view(ct, fab, r), lambda r: sv))
         verify_safetensors_dir(d, st)
         from gdtensor._plan import d_tensors_view_rank_plan_reshard
@@ -161,7 +162,7 @@ def test_zero_flat_shard_size(tmp_path):
     table = DTensorTable(ct.named_d_tensors + [m])
     st = storage_table(table, p, "hf")
     lay = layout_builder("single", st, p, "safetensors")
-    sv = make_storage_view(st.tensor_ids, st, lay, "/nonexistent")
+    sv = make_storage_view(_ids(st), st, lay, "/nonexistent")
     sizes = []
     for r in range(p.world):
         cv = compute_view(table, None, r)

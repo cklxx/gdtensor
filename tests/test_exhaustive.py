@@ -20,6 +20,7 @@ import os
 import numpy as np
 import pytest
 
+from gdtensor._dtensor import tensor_ids_of as _ids  # noqa: E402
 from gdtensor._formats import make_storage_view
 from gdtensor._layout import build_payload_index
 from gdtensor._models import (
@@ -43,7 +44,7 @@ LAYOUTS = [
 
 
 def _plans(ct, st, lay, world, op):
-    sv = make_storage_view(st.tensor_ids, st, lay, "/nonexistent")
+    sv = make_storage_view(_ids(st), st, lay, "/nonexistent")
     index = sv.data_accessor.index
     plans = {}
     fn = d_tensors_view_rank_plan_save if op == "save" else d_tensors_view_rank_plan_load

@@ -1,105 +1,81 @@
-"""Builder methods and new_* factories (spec 5.7 / C.1).
+"""BuilderMixin generation (design C.1).
 
-Every product data class gets protobuf-style build methods:
+``make_builder_mixin(name, fields)`` creates ``<name>BuilderMixin`` with
+protobuf-style methods for the given fields:
 
-    get_<field>() / set_<field>(v)
-    add_<field>(v)       list fields
-    mutable_<field>()    nested object / dict / list handle
-    clear_<field>()
+* ``get_<f>`` / ``set_<f>`` for every field;
+* ``add_<singular>`` for list fields (``named_d_tensors`` -> ``add_named_d_tensor``);
+* ``mutable_<f>`` for list / dict / nested object fields;
+* ``clear_<f>`` for list / dict / nullable fields.
 
-plus a module-level ``new_<lower_name>()`` factory registered in
-``gdtensor.builder``.
-
-No has_*/which_*: null checks use get_x() is None; oneof branches use type().
-
-Methods are installed directly on the dataclass (not via a changed MRO), which
-keeps frozen dataclasses working: scalar set_* uses object.__setattr__, while
-list/dict containers are mutated in place.
+The mixin holds no data; it reads and writes ``self.<field>``. No has_* /
+which_* methods. ``check_constraints`` stays on the data class.
 """
 from __future__ import annotations
 
-import dataclasses
-from typing import Any, Dict, List, Tuple
+from typing import Dict, Iterable, Tuple
 
-_FACTORIES: Dict[str, type] = {}
-
-
-def _kind(f: dataclasses.Field) -> str:
-    t = str(f.type)
-    if "Dict" in t or "dict" in t:
-        return "dict"
-    if "List" in t or "list" in t or "Tuple" in t or "tuple" in t:
-        return "list"
-    return "scalar"
+# kind: "scalar" | "list" | "dict" | "object" | "nullable"
+FieldSpec = Tuple[str, str]
 
 
-def attach_builders(cls: type) -> type:
-    """Install get/set/add/mutable/clear methods and register new_* factory."""
-    for f in dataclasses.fields(cls):
-        if not f.init:
-            continue
-        fname, kind = f.name, _kind(f)
+def _singular(name: str) -> str:
+    if name.endswith("ies"):
+        return name[:-3] + "y"
+    if name.endswith("s"):
+        return name[:-1]
+    return name
 
-        def make_getter(name=fname):
-            def getter(self):
-                return getattr(self, name)
-            getter.__name__ = f"get_{name}"
-            return getter
 
-        def make_setter(name=fname):
-            def setter(self, value) -> None:
-                object.__setattr__(self, name, value)
-            setter.__name__ = f"set_{name}"
-            return setter
+def field_hash(self) -> int:
+    """Hash a product data class by its fields (C.2: products are dict keys)."""
+    def freeze(v):
+        if isinstance(v, list) or isinstance(v, tuple):
+            return tuple(freeze(x) for x in v)
+        if isinstance(v, dict):
+            # order-insensitive without comparing keys directly
+            return tuple((type(k).__name__, getattr(k, "tensor_id", None), getattr(k, "rank", None),
+                          freeze(x)) if hasattr(k, "tensor_id") else (k, freeze(x))
+                         for k, x in v.items())
+        return v
+    return hash((type(self),) + tuple(freeze(v) for v in self.__dict__.values()))
 
-        setattr(cls, f"get_{fname}", make_getter())
-        setattr(cls, f"set_{fname}", make_setter())
 
+def make_builder_mixin(class_name: str, fields: Iterable[FieldSpec]) -> type:
+    ns: Dict[str, object] = {"__slots__": (), "__module__": "gdtensor.builder"}
+    for fname, kind in fields:
+        def getter(self, _f=fname):
+            return getattr(self, _f)
+
+        def setter(self, value, _f=fname) -> None:
+            setattr(self, _f, value)
+
+        ns[f"get_{fname}"] = getter
+        ns[f"set_{fname}"] = setter
         if kind == "list":
-            def make_adder(name=fname):
-                def adder(self, value) -> None:
-                    getattr(self, name).append(value)
-                adder.__name__ = f"add_{name}"
-                return adder
+            def adder(self, value, _f=fname) -> None:
+                getattr(self, _f).append(value)
 
-            def make_mutable(name=fname):
-                def mutable(self):
-                    return getattr(self, name)
-                mutable.__name__ = f"mutable_{name}"
-                return mutable
+            def clear_list(self, _f=fname) -> None:
+                setattr(self, _f, [])
 
-            def make_clear(name=fname):
-                def clearer(self) -> None:
-                    object.__setattr__(self, name, [])
-                clearer.__name__ = f"clear_{name}"
-                return clearer
-
-            setattr(cls, f"add_{fname}", make_adder())
-            setattr(cls, f"mutable_{fname}", make_mutable())
-            setattr(cls, f"clear_{fname}", make_clear())
+            ns[f"add_{_singular(fname)}"] = adder
+            ns[f"mutable_{fname}"] = getter
+            ns[f"clear_{fname}"] = clear_list
         elif kind == "dict":
-            def make_mutable(name=fname):
-                def mutable(self):
-                    return getattr(self, name)
-                mutable.__name__ = f"mutable_{name}"
-                return mutable
+            def clear_dict(self, _f=fname) -> None:
+                setattr(self, _f, {})
 
-            def make_clear(name=fname):
-                def clearer(self) -> None:
-                    object.__setattr__(self, name, {})
-                clearer.__name__ = f"clear_{name}"
-                return clearer
+            ns[f"mutable_{fname}"] = getter
+            ns[f"clear_{fname}"] = clear_dict
+        elif kind == "object":
+            ns[f"mutable_{fname}"] = getter
+        elif kind == "nullable":
+            def clear_none(self, _f=fname) -> None:
+                setattr(self, _f, None)
 
-            setattr(cls, f"mutable_{fname}", make_mutable())
-            setattr(cls, f"clear_{fname}", make_clear())
-
-    _FACTORIES[cls.__name__] = cls
-    return cls
-
-
-def new_(type_name: str, *args, **kwargs):
-    """Factory: new_<type> -> call the constructor with no/empty args."""
-    cls = _FACTORIES.get(type_name)
-    if cls is None:
-        raise KeyError(f"no builder-registered type {type_name!r}")
-    return cls(*args, **kwargs)
+            ns[f"clear_{fname}"] = clear_none
+    for name, fn in ns.items():
+        if callable(fn):
+            fn.__name__ = name
+    return type(f"{class_name}BuilderMixin", (), ns)

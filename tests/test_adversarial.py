@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from conftest import assert_all_ok, verify_fabric
+from gdtensor._dtensor import tensor_ids_of as _ids  # noqa: E402
 from gdtensor._api import d_tensors_view_rank_save
 from gdtensor._coord import ThreadCoordinator
 from gdtensor._dtensor import (
@@ -110,7 +111,7 @@ def test_reshard_storage_to_same_storage(tmp_path):
     os.makedirs(root)
     fab = ComputeFabric(ct).allocate(fill=fill_pattern)
     assert_all_ok(save_threads(ct, st, lay, root, fab, p.world)[0])
-    sv = make_storage_view(st.tensor_ids, st, lay, root, coord=ThreadCoordinator(p.world))
+    sv = make_storage_view(_ids(st), st, lay, root, coord=ThreadCoordinator(p.world))
     # reshard from storage to the *same* storage view (should be a no-op copy)
     assert_all_ok(reshard_threads(p.world, lambda r: sv, lambda r: sv))
 
@@ -126,7 +127,7 @@ def test_abort_then_rewrite_succeeds(tmp_path):
     lay = layout_builder("single", st, p, "safetensors")
     root = str(tmp_path / "ck")
     fab = ComputeFabric(ct).allocate(fill=fill_pattern)
-    sv = make_storage_view(st.tensor_ids, st, lay, root, coord=ThreadCoordinator(p.world))
+    sv = make_storage_view(_ids(st), st, lay, root, coord=ThreadCoordinator(p.world))
 
     def fn(r):
         if r == 3:
@@ -144,7 +145,7 @@ def test_abort_then_rewrite_succeeds(tmp_path):
     assert not res[0].ok  # other ranks see the failure
     assert not any(f.endswith(".safetensors") for f in os.listdir(root))  # nothing published
 
-    sv2 = make_storage_view(st.tensor_ids, st, lay, root, coord=ThreadCoordinator(p.world))
+    sv2 = make_storage_view(_ids(st), st, lay, root, coord=ThreadCoordinator(p.world))
     assert_all_ok(_run_threads(p.world, lambda r: d_tensors_view_rank_save(r, compute_view(ct, fab, r), sv2)))
     from conftest import verify_safetensors_dir
     verify_safetensors_dir(root, st)

@@ -16,11 +16,13 @@ import pytest
 
 from conftest import assert_all_ok
 from gdtensor._api import d_tensors_view_rank_plan_reshard
+from gdtensor._dtensor import tensor_ids_of as _ids
 from gdtensor._layout import (
     DisjointStorageMeshList, PhysicalLayoutTable, TensorComponentPos, build_payload_index,
     leader_tensor_component_pos_of,
 )
 from gdtensor._mesh import ArrangedMesh, storage_mesh_cells
+from gdtensor.tag import ConstantOne, TensorCount, WorldSize
 from gdtensor._models import ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table
 
 M = ModelConfig(layers=4, hidden=32, ffn=64, vocab=128)
@@ -42,7 +44,7 @@ def _fixture(m=M, p=P, kind="hf", mode="hf"):
     st = storage_table(ct, p, mode)
     lay = layout_builder(kind, st, p, "safetensors")
     fab = ComputeFabric(ct).allocate()
-    sv = make_storage_view(st.tensor_ids, st, lay, "/nonexistent")
+    sv = make_storage_view(_ids(st), st, lay, "/nonexistent")
     return ct, st, lay, fab, sv
 
 
@@ -132,14 +134,14 @@ def test_layout_rejects_row_label_mismatch():
     bad = copy.deepcopy(lay)
     pos = next(iter(bad.tensor_entries))
     lst = bad.tensor_entries[pos]
-    bad.tensor_entries[pos] = DisjointStorageMeshList(lst.disjoint_storage_mesh_list, tuple(reversed(lst.tensor_ids)))
+    bad.tensor_entries[pos] = DisjointStorageMeshList(lst.disjoint_storage_mesh_list, tuple(reversed(_ids(st))))
     res = check_physical_layout(st, bad)
     assert not res.ok and "rows differ" in res.error
 
 
 def test_storage_mesh_disjoint_rejects_overlap():
     from gdtensor._mesh import OuterProductMesh, Slice, SlicedMesh
-    base = OuterProductMesh(ArrangedMesh(2, "tensor_count"), ArrangedMesh(4, "world_size"))
+    base = OuterProductMesh(ArrangedMesh(TensorCount(2)), ArrangedMesh(WorldSize(4)))
     a = SlicedMesh(base, (Slice(0, 1), Slice(0, 2)))
     c = SlicedMesh(base, (Slice(0, 2), Slice(1, 3)))
     res = check_storage_mesh_disjoint(a, c)
@@ -148,7 +150,7 @@ def test_storage_mesh_disjoint_rejects_overlap():
 
 def test_storage_mesh_disjoint_accepts_touching_boundary():
     from gdtensor._mesh import OuterProductMesh, Slice, SlicedMesh
-    base = OuterProductMesh(ArrangedMesh(1, "tensor_count"), ArrangedMesh(4, "world_size"))
+    base = OuterProductMesh(ArrangedMesh(TensorCount(1)), ArrangedMesh(WorldSize(4)))
     a = SlicedMesh(base, (None, Slice(0, 2)))
     b = SlicedMesh(base, (None, Slice(2, 4)))
     assert check_storage_mesh_disjoint(a, b).ok
@@ -159,7 +161,7 @@ def test_empty_slot_layout_passes():
     from gdtensor._dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard
     from gdtensor._mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
     W = 3
-    base = OuterProductMesh(ArrangedMesh(1, "constant_one"), ArrangedMesh(W, "world_size"))
+    base = OuterProductMesh(ArrangedMesh(ConstantOne(1)), ArrangedMesh(WorldSize(W)))
     a = NamedDTensor("A", NaiveDTensor(GlobalTensorMeta((200,), "U8", 1),
                                        (Replicate(), Shard(0)),
                                        SlicedMesh(base, (None, Slice(0, 3, 2)))))
@@ -267,8 +269,8 @@ def test_reshard_storage_to_storage_passes_checks():
     src_lay = layout_builder("hf", src_st, P, "safetensors", 2)
     dst_st = storage_table(ct, P, "mirror")
     dst_lay = layout_builder("per_rank", dst_st, P, "safetensors")
-    ssv = make_storage_view(src_st.tensor_ids, src_st, src_lay, "/nonexistent")
-    dsv = make_storage_view(dst_st.tensor_ids, dst_st, dst_lay, "/nonexistent")
+    ssv = make_storage_view(_ids(src_st), src_st, src_lay, "/nonexistent")
+    dsv = make_storage_view(_ids(dst_st), dst_st, dst_lay, "/nonexistent")
     # Destination side only: pair each storage dst with a zero-size compute src
     # so the check filters in exactly the dst storage ranges.
     union_dst = []
@@ -299,7 +301,7 @@ def test_reshard_compute_to_compute_per_rank_disjoint_and_covering():
 
 def _cv(table, rank):
     from gdtensor._views import ComputeDataAccessor, ComputeDTensorsView
-    cv = ComputeDTensorsView(table.tensor_ids, table, ComputeDataAccessor(rank, None))
+    cv = ComputeDTensorsView(_ids(table), table, ComputeDataAccessor(rank, None))
     cv.data_accessor = ComputeDataAccessor(rank, None)
     return cv
 
@@ -312,7 +314,7 @@ def test_two_lists_mapping_to_one_path_is_rejected():
     ct = compute_table(M, P)
     st = storage_table(ct, P, "mirror")
     lay = layout_builder("per_rank", st, P, "safetensors")
-    leaders = sorted(lay.file_paths)
+    leaders = sorted(lay.file_paths, key=lambda k: (k.tensor_id, k.rank))
     assert len(leaders) >= 2
     victim_paths = dict(lay.file_paths)
     victim_paths[leaders[1]] = victim_paths[leaders[0]]

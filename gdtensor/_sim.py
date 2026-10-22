@@ -22,6 +22,7 @@ import numpy as np
 
 from ._iobackend import FileIO, IoTracer, MiB
 from ._layout import build_payload_index
+from ._dtensor import tensor_ids_of
 from ._models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
 from ._plan import check_physical_layout
 from ._runner import load_threads, run_processes, save_threads

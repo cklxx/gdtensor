@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from conftest import assert_all_ok, verify_fabric
+from gdtensor._dtensor import tensor_ids_of as _ids  # noqa: E402
 from gdtensor._coord import ThreadCoordinator
 from gdtensor._dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard,
@@ -220,8 +221,8 @@ def test_arrange_tensor_reshard_storage_to_storage(tmp_path):
     fab = ComputeFabric(ct).allocate(fill=_arrange_fill)
     assert_all_ok(save_threads(ct, src_st, src_lay, src_root, fab, P.world)[0])
 
-    sv_src = make_storage_view(src_st.tensor_ids, src_st, src_lay, src_root)
-    sv_dst = make_storage_view(dst_st.tensor_ids, dst_st, dst_lay, dst_root,
+    sv_src = make_storage_view(_ids(src_st), src_st, src_lay, src_root)
+    sv_dst = make_storage_view(_ids(dst_st), dst_st, dst_lay, dst_root,
                                coord=ThreadCoordinator(P.world))
     assert_all_ok(reshard_threads(P.world, lambda r: sv_src, lambda r: sv_dst))
 

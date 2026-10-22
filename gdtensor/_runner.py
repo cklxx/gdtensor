@@ -16,7 +16,7 @@ from typing import Callable, Dict, List, Optional
 
 from ._api import d_tensors_view_rank_load, d_tensors_view_rank_reshard, d_tensors_view_rank_save
 from ._coord import ProcessCoordinator, ThreadCoordinator
-from ._dtensor import DTensorTable
+from ._dtensor import DTensorTable, tensor_ids_of
 from ._formats import make_storage_view
 from ._iobackend import FileIO
 from ._layout import PhysicalLayoutTable
@@ -25,7 +25,7 @@ from ._views import ComputeDataAccessor, ComputeDTensorsView, ComputeFabric
 
 
 def compute_view(table: DTensorTable, fabric: ComputeFabric, rank: int) -> ComputeDTensorsView:
-    return ComputeDTensorsView(table.tensor_ids, table, ComputeDataAccessor(rank, fabric))
+    return ComputeDTensorsView(tensor_ids_of(table), table, ComputeDataAccessor(rank, fabric))
 
 
 def _run_threads(world: int, fn: Callable[[int], object]) -> Dict[int, object]:
@@ -42,14 +42,14 @@ def _run_threads(world: int, fn: Callable[[int], object]) -> Dict[int, object]:
 
 def save_threads(table, storage_table, layout, root, fabric, world, io: Optional[FileIO] = None):
     io = io or FileIO()
-    sv = make_storage_view(storage_table.tensor_ids, storage_table, layout, root, io, ThreadCoordinator(world))
+    sv = make_storage_view(tensor_ids_of(storage_table), storage_table, layout, root, io, ThreadCoordinator(world))
     res = _run_threads(world, lambda r: d_tensors_view_rank_save(r, compute_view(table, fabric, r), sv))
     return res, io
 
 
 def load_threads(table, storage_table, layout, root, fabric, world, io: Optional[FileIO] = None):
     io = io or FileIO()
-    sv = make_storage_view(storage_table.tensor_ids, storage_table, layout, root, io)
+    sv = make_storage_view(tensor_ids_of(storage_table), storage_table, layout, root, io)
     res = _run_threads(world, lambda r: d_tensors_view_rank_load(r, compute_view(table, fabric, r), sv))
     return res, io
 
@@ -65,13 +65,13 @@ def _proc_main(rank, op, table, storage_table, layout, root, coord, fill, q):
     try:
         io = FileIO()
         fabric = ComputeFabric(table).allocate([rank], fill=fill if op == "save" else None)
-        sv = make_storage_view(storage_table.tensor_ids, storage_table, layout, root, io, coord)
+        sv = make_storage_view(tensor_ids_of(storage_table), storage_table, layout, root, io, coord)
         cv = compute_view(table, fabric, rank)
         if op == "save":
             res = d_tensors_view_rank_save(rank, cv, sv)
         else:
             res = d_tensors_view_rank_load(rank, cv, sv)
-        q.put((rank, res.ok, getattr(res, "error", ""), io.tracer.records,
+        q.put((rank, type(res).__name__ == "Ok", getattr(res, "value", ""), io.tracer.records,
                fabric.buffers.get(rank, {}) if op == "load" else {}))
     except Exception as exc:  # noqa: BLE001
         q.put((rank, False, f"{exc}\n{traceback.format_exc()}", [], {}))

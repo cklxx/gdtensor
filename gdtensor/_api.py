@@ -1,85 +1,50 @@
-"""Main APIs (B.1.1): thin executors over the plan APIs.
+"""IO APIs (design B.1.1 / 5.4): thin executors over the plan APIs.
 
-They call the plan, open sessions, copy every (src, dst) pair through the
-view accessors, and close sessions. They never re-select ranges.
+Each executor calls the plan, opens sessions, copies every (src, dst) pair
+through the view accessors, and closes sessions. It never re-selects ranges.
 """
 from __future__ import annotations
-
-from typing import Optional
 
 from ._plan import (
     d_tensors_view_rank_plan_load,
     d_tensors_view_rank_plan_reshard,
     d_tensors_view_rank_plan_save,
 )
-from ._ranges import CopyPlan, is_compute
-from ._result import ResultError, catch
-from ._views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
+from ._ranges import CopyPlan
+from ._result import catch, invalid, must_ok
+from ._views import StorageDTensorsView, copy_from_ptr, copy_to_ptr
+from .tag import Ok
 
 
-def _accessor(view: DTensorsView):
-    return view.data_accessor
-
-
-def _copy(plan: CopyPlan, src_view: DTensorsView, dst_view: DTensorsView) -> None:
-    src_acc, dst_acc = _accessor(src_view), _accessor(dst_view)
+def _copy(plan: CopyPlan, src_view, dst_view) -> None:
+    src_acc, dst_acc = src_view.data_accessor, dst_view.data_accessor
     for src, dst in plan:
         if src.size != dst.size:
-            raise ResultError(f"size mismatch in plan pair {src} -> {dst}")
+            raise invalid("copy_plan", f"size mismatch in plan pair {src} -> {dst}")
         box = {}
 
-        def take(buf: memoryview) -> None:
-            box["data"] = bytes(buf)
+        def take(buffer_ptr: int, buffer_len: int):
+            box["data"] = copy_from_ptr(buffer_ptr, buffer_len)
+            return Ok(None)
 
-        src_acc.read_to_buffer(src, take).unwrap()
+        must_ok(src_acc.read_to_buffer(src, take))
 
-        def give(buf: memoryview) -> None:
-            buf[:] = box["data"]
+        def give(buffer_ptr: int, buffer_len: int):
+            copy_to_ptr(buffer_ptr, box["data"])
+            return Ok(None)
 
-        dst_acc.write_from_buffer(dst, give).unwrap()
-
-
-def _copy_storage_coalesced(plan: CopyPlan, src_view: DTensorsView, dst_view: DTensorsView) -> None:
-    """Reshard into storage with aggregation.
-
-    All destination pieces of one slot are assembled into the slot's full
-    buffer first, so each slot is one pwrite. Read semantics stay on the
-    plan ranges: this changes IO scheduling only, not range selection.
-    """
-    import numpy as np
-
-    src_acc, dst_acc = _accessor(src_view), _accessor(dst_view)
-    index = dst_view.data_accessor.index
-    groups: dict = {}
-    for src, dst in plan:
-        fp = index.files[dst.file_path]
-        starts = np.array([s.contiguous_payload_offset for s in fp.slots])
-        k = int(np.searchsorted(starts, dst.contiguous_payload_offset, side="right")) - 1
-        slot = fp.slots[k]
-        groups.setdefault((dst.file_path, slot.pos), []).append(
-            (dst.contiguous_payload_offset, dst.size, src))
-    for (path, pos), entries in groups.items():
-        slot = index.slots[pos][1]
-        buf = bytearray(slot.nbytes)
-        base = slot.contiguous_payload_offset
-        for off, size, src in sorted(entries, key=lambda x: x[0]):
-            piece = {}
-            src_acc.read_to_buffer(src, lambda data: piece.update(data=bytes(data))).unwrap()
-            buf[off - base: off - base + size] = piece["data"]
-        from ._ranges import RangeFromStorageView
-        whole = RangeFromStorageView(path, base, slot.nbytes)
-        dst_acc.write_from_buffer(whole, lambda data: data.__setitem__(slice(None), buf)).unwrap()
+        must_ok(dst_acc.write_from_buffer(dst, give))
 
 
-def _bind(view: DTensorsView, session) -> None:
-    if isinstance(view, StorageDTensorsView):
-        view.data_accessor.session = session
+def _bind(view, session) -> None:
+    if type(view) is StorageDTensorsView:
+        view.data_accessor.bind(session)
 
 
 @catch
-def d_tensors_view_rank_save(rank: int, compute_view: ComputeDTensorsView, storage_view: StorageDTensorsView) -> None:
-    plan = d_tensors_view_rank_plan_save(rank, compute_view, storage_view).unwrap()
-    session = storage_view.begin_save(storage_view, rank).unwrap()
+def d_tensors_view_rank_save(rank: int, compute_view, storage_view) -> None:
+    plan = must_ok(d_tensors_view_rank_plan_save(rank, compute_view, storage_view))
+    session = must_ok(storage_view.begin_save(storage_view, rank))
     _bind(storage_view, session)
     try:
         _copy(plan, compute_view, storage_view)
@@ -88,37 +53,33 @@ def d_tensors_view_rank_save(rank: int, compute_view: ComputeDTensorsView, stora
         raise
     finally:
         _bind(storage_view, None)
-    session.commit().unwrap()
+    must_ok(session.commit())
 
 
 @catch
-def d_tensors_view_rank_load(rank: int, compute_view: ComputeDTensorsView, storage_view: StorageDTensorsView) -> None:
-    plan = d_tensors_view_rank_plan_load(rank, compute_view, storage_view).unwrap()
-    files = sorted({src.file_path for src, _ in plan})
-    session = storage_view.begin_load(storage_view, rank, files).unwrap()
+def d_tensors_view_rank_load(rank: int, compute_view, storage_view) -> None:
+    plan = must_ok(d_tensors_view_rank_plan_load(rank, compute_view, storage_view))
+    session = must_ok(storage_view.begin_load(storage_view, rank))
     _bind(storage_view, session)
     try:
         _copy(plan, storage_view, compute_view)
     finally:
         _bind(storage_view, None)
-        session.finish()
+    must_ok(session.finish())
 
 
 @catch
-def d_tensors_view_rank_reshard(rank: int, src_view: DTensorsView, dst_view: DTensorsView,
-                                coalesce_storage: bool = False) -> None:
-    plan = d_tensors_view_rank_plan_reshard(rank, src_view, dst_view).unwrap()
+def d_tensors_view_rank_reshard(rank: int, src_view, dst_view) -> None:
+    plan = must_ok(d_tensors_view_rank_plan_reshard(rank, src_view, dst_view))
     src_session = dst_session = None
     try:
-        if isinstance(src_view, StorageDTensorsView):
-            files = sorted({s.file_path for s, _ in plan if not is_compute(s)})
-            src_session = src_view.begin_load(src_view, rank, files).unwrap()
+        if type(src_view) is StorageDTensorsView:
+            src_session = must_ok(src_view.begin_load(src_view, rank))
             _bind(src_view, src_session)
-        if isinstance(dst_view, StorageDTensorsView):
-            dst_session = dst_view.begin_save(dst_view, rank).unwrap()
+        if type(dst_view) is StorageDTensorsView:
+            dst_session = must_ok(dst_view.begin_save(dst_view, rank))
             _bind(dst_view, dst_session)
-        copy = _copy_storage_coalesced if coalesce_storage and isinstance(dst_view, StorageDTensorsView) else _copy
-        copy(plan, src_view, dst_view)
+        _copy(plan, src_view, dst_view)
     except BaseException:
         if dst_session is not None:
             dst_session.abort()
@@ -129,6 +90,6 @@ def d_tensors_view_rank_reshard(rank: int, src_view: DTensorsView, dst_view: DTe
         _bind(src_view, None)
         _bind(dst_view, None)
     if dst_session is not None:
-        dst_session.commit().unwrap()
+        must_ok(dst_session.commit())
     if src_session is not None:
-        src_session.finish().unwrap()
+        must_ok(src_session.finish())

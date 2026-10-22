@@ -19,6 +19,7 @@ import pytest
 import gdtensor
 import gdtensor.builder as builder
 import gdtensor.io as gio
+import gdtensor.access as access
 import gdtensor.session as session
 import gdtensor.tag as tag
 
@@ -51,7 +52,8 @@ BUILDER_HELPERS = [
     "leader_tensor_component_pos_of",
 ]
 
-SESSION_TYPES = ["StorageSaveSession", "StorageLoadSession", "DTensorDataAccessor"]
+SESSION_TYPES = ["StorageSaveSession", "StorageLoadSession"]
+ACCESS_TYPES = ["DTensorDataAccessor"]
 
 TAG_TYPES = ["Ok", "Err", "Shard", "Replicate", "Partial",
              "ConstantOne", "TensorCount", "WorldSize"]
@@ -81,6 +83,11 @@ def test_builder_helpers(name):
 @pytest.mark.parametrize("name", SESSION_TYPES)
 def test_session_types(name):
     assert hasattr(session, name), name
+
+
+@pytest.mark.parametrize("name", ACCESS_TYPES)
+def test_access_types(name):
+    assert hasattr(access, name), name
 
 
 @pytest.mark.parametrize("name", TAG_TYPES)
