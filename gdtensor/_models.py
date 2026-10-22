@@ -16,7 +16,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .dtensor import (
+from ._dtensor import (
     DTensorTable,
     GlobalTensorMeta,
     NaiveDTensor,
@@ -27,8 +27,10 @@ from .dtensor import (
     global_tensor_meta_of,
     naive_of,
 )
-from .layout import ContainerFormat, PhysicalLayoutTable, build_layout
-from .mesh import ArrangedMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh
+from ._dtensor import nbytes_of
+from ._layout import ContainerFormat, PhysicalLayoutTable, build_layout
+from ._mesh import ArrangedMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh
+from .tag import ConstantOne, TensorCount, WorldSize
 
 R = Replicate()
 
@@ -126,11 +128,11 @@ def _slices(stage: int, dp: Optional[int] = None, tp: Optional[int] = None):
 
 
 def compute_mesh(p: ParallelConfig, stage: int, dp: Optional[int] = None, tp: Optional[int] = None):
-    return SlicedMesh(ReshapedMesh(ArrangedMesh(p.world, "world_size"), _world_shape(p)), _slices(stage, dp, tp))
+    return SlicedMesh(ReshapedMesh(ArrangedMesh(WorldSize(p.world)), _world_shape(p)), _slices(stage, dp, tp))
 
 
 def storage_mesh(p_world: int, shape, slices):
-    base = OuterProductMesh(ArrangedMesh(1, "constant_one"), ArrangedMesh(p_world, "world_size"))
+    base = OuterProductMesh(ArrangedMesh(ConstantOne(1)), ArrangedMesh(WorldSize(p_world)))
     return SlicedMesh(ReshapedMesh(base, shape), slices)
 
 
@@ -172,7 +174,7 @@ def storage_table(compute: DTensorTable, p: ParallelConfig, mode: str = "hf",
     * ``hf``    : HF file layout. Columns = the dedup writer group of the
                   tensor; Shard(0) along the flat or row axis, so the slots
                   concatenate to the full tensor in row-major order. A TP
-                  dim1 shard then writes strided pieces (OmniFS pattern).
+                  dim1 shard then writes strided pieces.
     * ``mirror``: DCP-like layout. Storage boxes = writer compute boxes; the
                   flat ``zero`` tensors keep their flat shard.
 
@@ -191,7 +193,7 @@ def storage_table(compute: DTensorTable, p: ParallelConfig, mode: str = "hf",
         # Fix each Replicate dim of size > 1 to the designated writer coordinate.
         for d, pl in enumerate(naive.placements):
             size = (cmesh.underlying_mesh.shape[d] if slices[d] is None else 1)
-            if isinstance(pl, Replicate) and size > 1:
+            if type(pl) is Replicate and size > 1:
                 k = order % size
                 slices[d] = Slice(k, k + 1)
         smesh = storage_mesh(p.world, shape, tuple(slices))
@@ -200,9 +202,9 @@ def storage_table(compute: DTensorTable, p: ParallelConfig, mode: str = "hf",
         elif mode == "hf":
             # Any Shard(axis) becomes Shard(0) of the naive shape (flat for
             # ZeRO tensors): slots then concatenate in row-major order.
-            placements = tuple(Shard(0) if isinstance(pl, Shard) else R for pl in naive.placements)
+            placements = tuple(Shard(0) if type(pl) is Shard else R for pl in naive.placements)
             tp_dim = 2
-            if (aggregate_tp and isinstance(naive.placements[tp_dim], Shard) and naive.placements[tp_dim].axis == 1
+            if (aggregate_tp and isinstance(naive.placements[tp_dim], Shard) and naive.placements[tp_dim].value == 1
                     and slices[tp_dim] is None):
                 placements = placements[:tp_dim] + (R,) + placements[tp_dim + 1:]
                 k = order % p.tp
@@ -228,7 +230,7 @@ def layout_builder(kind: str, table: DTensorTable, p: ParallelConfig, fmt: Conta
     """Business layout builders. ``kind``:
 
     hf        : tensors grouped into ``hf_shards`` files by size; every file is
-                shared by many ranks (OmniFS).
+                shared by many ranks.
     single    : one file for everything.
     per_rank  : one file per content column (rank).
     rank_multi: up to three files per rank (tensor row mod 3).
@@ -236,7 +238,7 @@ def layout_builder(kind: str, table: DTensorTable, p: ParallelConfig, fmt: Conta
     """
     ext = "safetensors" if fmt == "safetensors" else "distcp"
     if kind == "hf":
-        sizes = [global_tensor_meta_of(nd).nbytes for nd in table.named_d_tensors]
+        sizes = [nbytes_of(global_tensor_meta_of(nd)) for nd in table.named_d_tensors]
         total = sum(sizes)
         target = -(-total // hf_shards)
         shard_of, acc, cur = [], 0, 0

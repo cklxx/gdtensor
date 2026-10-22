@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gdtensor.dtensor import iv_normalize, iv_intersect, iv_subtract, iv_total
+from gdtensor._dtensor import iv_normalize, iv_intersect, iv_subtract, iv_total
 
 RNG_SEEDS = range(60)
 MAX_POINT = 40

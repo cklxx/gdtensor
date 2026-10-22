@@ -1,7 +1,7 @@
-"""DTensor entities (DTensorsView B.2.3.3 - B.2.3.10) and ownership math.
+"""DTensor entities (design B.2.3.3 - B.2.3.10) and ownership math (internal).
 
-Ownership model (lite):
-* A participant (compute rank or storage column) owns a box of the *naive*
+Ownership model:
+* A participant (compute rank or storage column) owns a box of the naive
   global shape. ``Shard(axis)`` splits that axis with torch.chunk rules
   (chunk = ceil(n / parts)); several mesh dims may shard one axis, nested in
   mesh order. ``Replicate`` keeps the full extent. ``Partial`` is not
@@ -9,119 +9,145 @@ Ownership model (lite):
 * A box maps to sorted, disjoint element intervals of the flat row-major
   tensor. Row-major order of a box equals ascending global order, so a local
   buffer offset is a prefix sum over these intervals.
-* ``ReshapedDTensor`` keeps element order. Ownership is computed on the naive
-  shape; the reshaped ``shape`` is the logical (global meta) shape.
+* ``ReshapedDTensor`` keeps element order. Ownership is computed on the
+  underlying naive shape; ``shape`` is the logical (global meta) shape.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
-from typing import Dict, Generic, List, Optional, Sequence, Tuple, TypeVar, Union
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .mesh import (
-    ComputeMesh,
-    StorageMesh,
-    mesh_coords,
-    resolve_compute_mesh,
-    resolve_storage_mesh,
-)
-from .result import Result, ResultError, catch
-from .constraints import check_constraints as _cc
-from .builder_mixin import attach_builders as _attach
+from ._builder_mixin import field_hash, make_builder_mixin
+from ._mesh import mesh_coords, resolve_compute_mesh, resolve_storage_mesh
+from ._result import Fail, catch, invalid, not_found
+from .tag import Partial, Replicate, Shard
 
 
-def _check(self):
-    return _cc(self)
+def _cc(self):
+    from ._constraints import check_constraints
+    return check_constraints(self)
 
-MeshT = TypeVar("MeshT")
+
+Placement = Shard | Replicate | Partial
+
+GlobalTensorMetaBuilderMixin = make_builder_mixin(
+    "GlobalTensorMeta", [("global_shape", "list"), ("dtype", "scalar"), ("itemsize", "scalar")])
+NaiveDTensorBuilderMixin = make_builder_mixin(
+    "NaiveDTensor", [("global_tensor_meta", "object"), ("placements", "list"), ("mesh", "object"),
+                     ("torch_d_tensor", "nullable")])
+ReshapedDTensorBuilderMixin = make_builder_mixin(
+    "ReshapedDTensor", [("underlying_d_tensor", "object"), ("shape", "list")])
+NamedDTensorBuilderMixin = make_builder_mixin(
+    "NamedDTensor", [("global_tensor_id", "scalar"), ("d_tensor", "object"), ("alias", "list")])
+DTensorTableBuilderMixin = make_builder_mixin("DTensorTable", [("named_d_tensors", "list")])
+
 
 # ---------------------------------------------------------------- B.2.3.6
 
 
-@dataclass(frozen=True)
-class GlobalTensorMeta:
-    global_shape: Tuple[int, ...]
-    dtype: str
-    itemsize: int
+@dataclass(eq=True)
+class GlobalTensorMeta(GlobalTensorMetaBuilderMixin):
+    global_shape: List[int] = field(default_factory=list)
+    dtype: str = ""
+    itemsize: int = 0
+    __hash__ = field_hash
+
+    def __post_init__(self) -> None:
+        self.global_shape = list(self.global_shape)
 
     def check_constraints(self):
-        return _check(self)
-
-    @property
-    def numel(self) -> int:
-        return int(math.prod(self.global_shape))
-
-    @property
-    def nbytes(self) -> int:
-        return self.numel * self.itemsize
+        return _cc(self)
 
 
-# ---------------------------------------------------------------- B.2.3.7
+def numel_of(meta: GlobalTensorMeta) -> int:
+    return int(math.prod(meta.global_shape))
 
 
-from .tag import Partial, Replicate, Shard
+def nbytes_of(meta: GlobalTensorMeta) -> int:
+    return numel_of(meta) * meta.itemsize
 
-Placement = Union[Shard, Replicate, Partial]
 
 # ---------------------------------------------------------------- B.2.3.5 / B.2.3.4
 
 
-@dataclass(frozen=True)
-class NaiveDTensor(Generic[MeshT]):
-    global_tensor_meta: GlobalTensorMeta
-    placements: Tuple[Placement, ...]
-    mesh: MeshT
-    # B.2.3.5: underlying torch.DTensor for compute-side processing; None
-    # means metadata-only. Storage-side tensors keep it None.
-    torch_d_tensor: object = None
-
-
-@dataclass(frozen=True)
-class ReshapedDTensor(Generic[MeshT]):
-    """$reshaped (NaiveDTensor * $shape): element-order-preserving reshape."""
-
-    naive: NaiveDTensor
-    shape: Tuple[int, ...]
+@dataclass(eq=True)
+class NaiveDTensor(NaiveDTensorBuilderMixin):
+    global_tensor_meta: GlobalTensorMeta = None
+    placements: List[Any] = field(default_factory=list)
+    mesh: Any = None
+    # torch.DTensor for compute-side processing; None means metadata-only.
+    torch_d_tensor: Any = field(default=None, compare=False)
+    __hash__ = field_hash
 
     def __post_init__(self) -> None:
-        if math.prod(self.shape) != self.naive.global_tensor_meta.numel:
-            raise ResultError(
-                f"reshape {self.naive.global_tensor_meta.global_shape} -> {self.shape} changes numel"
-            )
+        self.placements = list(self.placements)
+
+    def __class_getitem__(cls, item):
+        return cls
+
+    def check_constraints(self):
+        return _cc(self)
 
 
-GenericDTensor = Union[NaiveDTensor, ReshapedDTensor]
+@dataclass(eq=True)
+class ReshapedDTensor(ReshapedDTensorBuilderMixin):
+    underlying_d_tensor: NaiveDTensor = None
+    shape: List[int] = field(default_factory=list)
+    __hash__ = field_hash
+
+    def __post_init__(self) -> None:
+        self.shape = list(self.shape)
+
+    def __class_getitem__(cls, item):
+        return cls
+
+    def check_constraints(self):
+        return _cc(self)
+
+
+GenericDTensor = NaiveDTensor | ReshapedDTensor
+
 
 # ---------------------------------------------------------------- B.2.3.3 / B.2.3.8
 
 
-@dataclass(frozen=True)
-class NamedDTensor(Generic[MeshT]):
-    global_tensor_id: str
-    d_tensor: GenericDTensor
-    alias: Tuple[str, ...] = ()
-
-
-@dataclass
-class DTensorTable(Generic[MeshT]):
-    named_d_tensors: List[NamedDTensor] = field(default_factory=list)
-    _order: Dict[str, int] = field(default_factory=dict, init=False, repr=False, compare=False)
+@dataclass(eq=True)
+class NamedDTensor(NamedDTensorBuilderMixin):
+    global_tensor_id: str = ""
+    d_tensor: Any = None
+    alias: List[str] = field(default_factory=list)
+    __hash__ = field_hash
 
     def __post_init__(self) -> None:
-        self._order = {}
-        for i, nd in enumerate(self.named_d_tensors):
-            if nd.global_tensor_id in self._order:
-                raise ResultError(f"duplicate tensor id {nd.global_tensor_id}")
-            self._order[nd.global_tensor_id] = i
+        self.alias = list(self.alias)
+
+    def __class_getitem__(cls, item):
+        return cls
 
     def check_constraints(self):
-        return _check(self)
+        return _cc(self)
 
-    @property
-    def tensor_ids(self) -> List[str]:
-        return [nd.global_tensor_id for nd in self.named_d_tensors]
+
+@dataclass(eq=True)
+class DTensorTable(DTensorTableBuilderMixin):
+    named_d_tensors: List[NamedDTensor] = field(default_factory=list)
+    __hash__ = field_hash
+
+    def __post_init__(self) -> None:
+        self.named_d_tensors = list(self.named_d_tensors)
+
+    def __class_getitem__(cls, item):
+        return cls
+
+    def check_constraints(self):
+        return _cc(self)
+
+
+def tensor_ids_of(table: DTensorTable) -> List[str]:
+    return [nd.global_tensor_id for nd in table.named_d_tensors]
 
 
 # ---------------------------------------------------------------- B.2.3.9 / B.2.3.10
@@ -129,34 +155,38 @@ class DTensorTable(Generic[MeshT]):
 
 def naive_of(nd: NamedDTensor) -> NaiveDTensor:
     dt = nd.d_tensor
-    return dt.naive if isinstance(dt, ReshapedDTensor) else dt
+    return dt.underlying_d_tensor if type(dt) is ReshapedDTensor else dt
 
 
 def global_tensor_meta_of(named_d_tensor: NamedDTensor) -> GlobalTensorMeta:
     """Naive and reshaped branches map to one global meta (logical shape)."""
     dt = named_d_tensor.d_tensor
-    if isinstance(dt, ReshapedDTensor):
-        return replace(dt.naive.global_tensor_meta, global_shape=tuple(dt.shape))
+    if type(dt) is ReshapedDTensor:
+        m = dt.underlying_d_tensor.global_tensor_meta
+        return GlobalTensorMeta(list(dt.shape), m.dtype, m.itemsize)
     return dt.global_tensor_meta
 
 
 @catch
 def tensor_order_value_of(d_tensor_table: DTensorTable, tensor_id: str) -> int:
-    try:
-        return d_tensor_table._order[tensor_id]
-    except KeyError:
-        raise ResultError(f"tensor {tensor_id!r} not in DTensorTable") from None
+    for i, nd in enumerate(d_tensor_table.named_d_tensors):
+        if nd.global_tensor_id == tensor_id:
+            return i
+    raise not_found("tensor_id", tensor_id, f"tensor {tensor_id!r} not in DTensorTable")
 
 
 def order_of(table: DTensorTable, tensor_id: str) -> int:
-    return tensor_order_value_of(table, tensor_id).unwrap()
+    r = tensor_order_value_of(table, tensor_id)
+    if type(r).__name__ != "Ok":
+        raise Fail(r.value)
+    return r.value
 
 
 def named_of(table: DTensorTable, tensor_id: str) -> NamedDTensor:
     return table.named_d_tensors[order_of(table, tensor_id)]
 
 
-# ---------------------------------------------------------------- intervals
+# ---------------------------------------------------------------- intervals (internal)
 
 EMPTY = np.zeros((0, 2), dtype=np.int64)
 
@@ -187,7 +217,6 @@ def iv_intersect(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Intersection of two normalized interval lists (vectorized sweep)."""
     if a.size == 0 or b.size == 0:
         return EMPTY
-    # For each a-interval, candidate b-intervals overlapping it.
     lo = np.searchsorted(b[:, 1], a[:, 0], side="right")
     hi = np.searchsorted(b[:, 0], a[:, 1], side="left")
     counts = np.maximum(hi - lo, 0)
@@ -231,7 +260,7 @@ def iv_prefix(iv: np.ndarray, points: np.ndarray) -> np.ndarray:
     cum = np.concatenate([[0], np.cumsum(lens)])
     k = np.searchsorted(iv[:, 0], points, side="right") - 1
     if np.any(k < 0) or np.any(points >= iv[np.maximum(k, 0), 1]):
-        raise ResultError("point outside owned intervals")
+        raise invalid("range", "point outside owned intervals")
     return cum[k] + (points - iv[k, 0])
 
 
@@ -257,7 +286,7 @@ def box_to_intervals(shape: Sequence[int], lo: Sequence[int], hi: Sequence[int])
     return np.stack([starts, starts + run], axis=1).astype(np.int64)
 
 
-# ---------------------------------------------------------------- ownership
+# ---------------------------------------------------------------- ownership (internal)
 
 
 def _chunk(n: int, parts: int, idx: int) -> Tuple[int, int]:
@@ -269,23 +298,24 @@ def _chunk(n: int, parts: int, idx: int) -> Tuple[int, int]:
 def box_of(naive: NaiveDTensor, mesh_shape: Tuple[int, ...], coords: Tuple[int, ...]) -> Tuple[List[int], List[int]]:
     shape = list(naive.global_tensor_meta.global_shape)
     if len(naive.placements) != len(mesh_shape):
-        raise ResultError(f"{len(naive.placements)} placements for mesh ndim {len(mesh_shape)}")
+        raise invalid("placements", f"{len(naive.placements)} placements for mesh ndim {len(mesh_shape)}")
     lo, hi = [0] * len(shape), list(shape)
     for d, p in enumerate(naive.placements):
-        if isinstance(p, Shard):
-            if not 0 <= p.axis < len(shape):
-                raise ResultError(f"Shard axis {p.axis} out of range for shape {shape}")
-            s, e = _chunk(hi[p.axis] - lo[p.axis], mesh_shape[d], coords[d])
-            lo[p.axis], hi[p.axis] = lo[p.axis] + s, lo[p.axis] + e
-        elif isinstance(p, Partial):
-            raise ResultError("Partial placement is not persistable")
+        if type(p) is Shard:
+            axis = p.value
+            if not 0 <= axis < len(shape):
+                raise invalid("placements", f"Shard axis {axis} out of range for shape {shape}")
+            s, e = _chunk(hi[axis] - lo[axis], mesh_shape[d], coords[d])
+            lo[axis], hi[axis] = lo[axis] + s, lo[axis] + e
+        elif type(p) is Partial:
+            raise invalid("placements", "Partial placement is not persistable")
     return lo, hi
 
 
 def resolve_mesh(nd: NamedDTensor, side: str) -> np.ndarray:
     """Participant ndarray: compute ranks, or storage columns (row t=0 only).
 
-    Empty literal cells (-1) stay -1; mesh_coords treats them as unowned.
+    Cells a LiteralMesh does not select stay -1; mesh_coords treats them as unowned.
     """
     naive = naive_of(nd)
     if side == "compute":
@@ -293,7 +323,7 @@ def resolve_mesh(nd: NamedDTensor, side: str) -> np.ndarray:
     cells, w_size = resolve_storage_mesh(naive.mesh)
     valid = cells >= 0
     if np.any(valid & (cells // w_size != 0)):
-        raise ResultError(f"{nd.global_tensor_id}: SingleTensorStorageMesh covers tensor row != 0")
+        raise invalid("mesh", f"{nd.global_tensor_id}: SingleTensorStorageMesh covers tensor row != 0")
     out = cells % w_size
     out[~valid] = -1
     return out
@@ -321,10 +351,6 @@ def owned_intervals(nd: NamedDTensor, side: str, participant: int) -> np.ndarray
     return box_to_intervals(naive_of(nd).global_tensor_meta.global_shape, *box)
 
 
-def participants_of(nd: NamedDTensor, side: str) -> List[int]:
-    return sorted(int(x) for x in resolve_mesh(nd, side).ravel())
-
-
 def is_designated_writer(nd: NamedDTensor, rank: int, tensor_order: int) -> bool:
     """Dedup rule for replicated compute dims: one coordinate per replicate dim
     writes, rotated by tensor order to balance writes across replicas."""
@@ -334,15 +360,9 @@ def is_designated_writer(nd: NamedDTensor, rank: int, tensor_order: int) -> bool
     if coords is None:
         return False
     for d, p in enumerate(naive.placements):
-        if isinstance(p, Partial):
-            raise ResultError(f"{nd.global_tensor_id}: Partial placement is not persistable")
-        if isinstance(p, Replicate) and cells.shape[d] > 1:
+        if type(p) is Partial:
+            raise invalid("placements", f"{nd.global_tensor_id}: Partial placement is not persistable")
+        if type(p) is Replicate and cells.shape[d] > 1:
             if coords[d] != tensor_order % cells.shape[d]:
                 return False
     return True
-
-
-# C.1 builder registration
-from .builder_mixin import attach_builders as _ab
-for _c in (GlobalTensorMeta, NaiveDTensor, ReshapedDTensor, NamedDTensor, DTensorTable):
-    _ab(_c)

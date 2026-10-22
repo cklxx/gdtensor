@@ -24,7 +24,6 @@ DETECTORS = [
     "tests/test_checks.py",
     "tests/test_matrix.py",
     "tests/test_adversarial.py",
-    "tests/test_omnifs.py",
     "tests/test_consistency.py",
 ]
 
@@ -60,55 +59,45 @@ EQUIVALENT = {
 # (file, find, replace, description). find must be unique in the file.
 MUTATIONS = [
     # ---- iv_normalize
-    ("gdtensor/dtensor.py", "iv[:, 1] > iv[:, 0]", "iv[:, 1] >= iv[:, 0]", "normalize keeps empty intervals"),
-    ("gdtensor/dtensor.py", "new[1:] = starts[1:] > ends[:-1]", "new[1:] = starts[1:] >= ends[:-1]", "normalize merge boundary"),
+    ("gdtensor/_dtensor.py", "iv[:, 1] > iv[:, 0]", "iv[:, 1] >= iv[:, 0]", "normalize keeps empty intervals"),
+    ("gdtensor/_dtensor.py", "new[1:] = starts[1:] > ends[:-1]", "new[1:] = starts[1:] >= ends[:-1]", "normalize merge boundary"),
     # ---- iv_intersect
-    ("gdtensor/dtensor.py", 'np.searchsorted(b[:, 1], a[:, 0], side="right")',
+    ("gdtensor/_dtensor.py", 'np.searchsorted(b[:, 1], a[:, 0], side="right")',
      'np.searchsorted(b[:, 1], a[:, 0], side="left")', "intersect lo boundary"),
-    ("gdtensor/dtensor.py", 'np.searchsorted(b[:, 0], a[:, 1], side="left")',
+    ("gdtensor/_dtensor.py", 'np.searchsorted(b[:, 0], a[:, 1], side="left")',
      'np.searchsorted(b[:, 0], a[:, 1], side="right")', "intersect hi boundary"),
-    ("gdtensor/dtensor.py", "keep = e > s", "keep = e >= s", "intersect touching intervals"),
+    ("gdtensor/_dtensor.py", "keep = e > s", "keep = e >= s", "intersect touching intervals"),
     # ---- iv_subtract
-    ("gdtensor/dtensor.py", "while j < len(b) and b[j, 1] <= cur:", "while j < len(b) and b[j, 1] < cur:", "subtract advance condition"),
-    ("gdtensor/dtensor.py", "while k < len(b) and b[k, 0] < e:", "while k < len(b) and b[k, 0] <= e:", "subtract inner condition"),
-    ("gdtensor/dtensor.py", "if bs > cur:", "if bs >= cur:", "subtract output boundary"),
-    ("gdtensor/dtensor.py", "cur = max(cur, be)", "cur = cur + be", "subtract progress arithmetic"),
-    # NOTE: j is global across a-intervals by design; mutating it to reset
-    # per interval would change semantics, so it is asserted separately.
+    ("gdtensor/_dtensor.py", "while j < len(b) and b[j, 1] <= cur:", "while j < len(b) and b[j, 1] < cur:", "subtract advance condition"),
+    ("gdtensor/_dtensor.py", "while k < len(b) and b[k, 0] < e:", "while k < len(b) and b[k, 0] <= e:", "subtract inner condition"),
+    ("gdtensor/_dtensor.py", "if bs > cur:", "if bs >= cur:", "subtract output boundary"),
+    ("gdtensor/_dtensor.py", "cur = max(cur, be)", "cur = cur + be", "subtract progress arithmetic"),
     # ---- iv_prefix
-    ("gdtensor/dtensor.py", "np.searchsorted(iv[:, 0], points, side=\"right\") - 1",
+    ("gdtensor/_dtensor.py", "np.searchsorted(iv[:, 0], points, side=\"right\") - 1",
      "np.searchsorted(iv[:, 0], points, side=\"left\") - 1", "prefix search side"),
-    ("gdtensor/dtensor.py", "np.any(points >= iv[np.maximum(k, 0), 1])",
+    ("gdtensor/_dtensor.py", "np.any(points >= iv[np.maximum(k, 0), 1])",
      "np.any(points > iv[np.maximum(k, 0), 1])", "prefix range end check"),
     # ---- box_to_intervals
-    ("gdtensor/dtensor.py", "while k > 0 and lo[k] == 0 and hi[k] == shape[k]:",
+    ("gdtensor/_dtensor.py", "while k > 0 and lo[k] == 0 and hi[k] == shape[k]:",
      "while k > 0 and lo[k] == 0:", "box interval trailing-axis rule"),
-    ("gdtensor/dtensor.py", "c = -(-n // parts) if n else 0", "c = n // parts if n else 0", "torch.chunk ceil rule"),
-    ("gdtensor/dtensor.py", "return s, min(s + c, n)", "return s, s + c", "chunk no clamp at end"),
+    ("gdtensor/_dtensor.py", "c = -(-n // parts) if n else 0", "c = n // parts if n else 0", "torch.chunk ceil rule"),
+    ("gdtensor/_dtensor.py", "return s, min(s + c, n)", "return s, s + c", "chunk no clamp at end"),
     # ---- plan _pair
-    ("gdtensor/plan.py", "todo = iv_subtract(todo, piece)",
+    ("gdtensor/_plan.py", "todo = iv_subtract(todo, piece)",
      "todo = iv_subtract(todo, src_iv)", "pair subtraction scope"),
-    ("gdtensor/plan.py", 'raise ResultError(f"no source covers {iv_total(todo)} destination elements")',
+    ("gdtensor/_plan.py", 'raise invalid("src_view", f"no source covers {iv_total(todo)} destination elements")',
      'pass  # mutation: coverage check removed', "pair full-coverage enforcement"),
-    ("gdtensor/plan.py", "if todo.size == 0:\n                break",
+    ("gdtensor/_plan.py", "if todo.size == 0:\n                break",
      "if False:  # mutation\n                break", "pair early-exit guard"),
     # ---- layout slot ordering
-    ("gdtensor/layout.py", "for t, w in lst.cells:  # row-major: header order, then column order",
-     "for t, w in sorted(lst.cells, key=lambda c: (c[1], c[0])):  # mutation: column-major",
+    ("gdtensor/_layout.py", "for t, w in list_cells(lst):  # row-major: header order, then column order",
+     "for t, w in sorted(list_cells(lst), key=lambda c: (c[1], c[0])):  # mutation: column-major",
      "payload slot order"),
-    ("gdtensor/layout.py", "if path in files:\n            raise ResultError(f\"two lists map to one path {path}\")",
-     "if False:\n            raise ResultError(f\"two lists map to one path {path}\")", "duplicate path guard"),
-    # ---- omnifs coverage
-    ("gdtensor/omnifs.py", 'if b.chunk_offset < a.chunk_offset + a.length:',
-     'if b.chunk_offset < a.chunk_offset + a.length - 1:', "KV overlap off-by-one"),
-    ("gdtensor/omnifs.py", 'if e.chunk_offset != pos:', 'if False:  # mutation', "KV gap check"),
-    ("gdtensor/omnifs.py", "if pos != want:", "if pos + 1 != want:", "full coverage off-by-one"),
-    ("gdtensor/omnifs.py", "if old is not None and old.crc != e.crc:", "if False:  # mutation", "KV conflict check"),
+    ("gdtensor/_layout.py", "if path in files:\n            raise invalid(\"file_paths\", f\"two lists map to one path {path}\")",
+     "if False:\n            raise invalid(\"file_paths\", f\"two lists map to one path {path}\")", "duplicate path guard"),
     # ---- formats whole-tensor detection
-    ("gdtensor/formats.py", "ok = iv[0, 0] == 0 and iv[-1, 1] == numel and bool(np.all(iv[1:, 0] == iv[:-1, 1]))",
+    ("gdtensor/_formats.py", "ok = iv[0, 0] == 0 and iv[-1, 1] == numel and bool(np.all(iv[1:, 0] == iv[:-1, 1]))",
      "ok = iv[0, 0] == 0 and iv[-1, 1] == numel", "whole-tensor contiguity check"),
-    # ---- p2p peer pick: the original hash()-salt bug is pinned directly by
-    # test_p2p_peer_pick_is_hash_seed_independent, so no flip mutation here.
 ]
 
 

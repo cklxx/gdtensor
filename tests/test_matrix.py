@@ -8,23 +8,25 @@ import numpy as np
 import pytest
 
 from conftest import assert_all_ok, raw_header, verify_distcp_dir, verify_fabric, verify_safetensors_dir
-from gdtensor.dtensor import (
+from gdtensor._dtensor import nbytes_of, tensor_ids_of as _ids  # noqa: E402
+from gdtensor._dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard, global_tensor_meta_of,
 )
-from gdtensor.formats import make_storage_view
-from gdtensor.layout import TensorComponentPos, build_layout, build_payload_index, file_path_of
-from gdtensor.mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
-from gdtensor.models import (
+from gdtensor._formats import make_storage_view
+from gdtensor._layout import TensorComponentPos, build_layout, build_payload_index, file_path_of
+from gdtensor._mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
+from gdtensor.tag import ConstantOne, TensorCount, WorldSize
+from gdtensor._models import (
     ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table,
 )
-from gdtensor.plan import (
+from gdtensor._plan import (
     check_compute_d_tensors_access_disjoint, check_compute_d_tensors_access_full_covering,
     check_physical_layout, check_storage_d_tensors_access_disjoint, check_storage_d_tensors_access_full_covering,
     check_storage_mesh_disjoint, d_tensors_view_rank_plan_load, d_tensors_view_rank_plan_reshard,
     d_tensors_view_rank_plan_save,
 )
-from gdtensor.runner import compute_view, load_threads, reshard_threads, run_processes, save_threads
-from gdtensor.views import ComputeFabric
+from gdtensor._runner import compute_view, load_threads, reshard_threads, run_processes, save_threads
+from gdtensor._views import ComputeFabric
 
 M = ModelConfig(layers=4, hidden=32, ffn=64, vocab=128)
 MOE = ModelConfig(layers=2, hidden=32, ffn=48, vocab=128, experts=4)
@@ -97,7 +99,7 @@ def test_tensor_across_files(root):
 def test_replicated_written_once(root):
     """DP=4 replicas: payload bytes written == file payload size (no dup)."""
     ct, st, lay, io = roundtrip(root, M, ParallelConfig(tp=2, dp=4, pp=1), "hf", "single", "safetensors")
-    total_payload = sum(global_tensor_meta_of(x).nbytes for x in st.named_d_tensors)
+    total_payload = sum(nbytes_of(global_tensor_meta_of(x)) for x in st.named_d_tensors)
     _, data_start = raw_header(os.path.join(root, "model.safetensors"))
     payload_written = sum(r.size for r in io.tracer.records if r.op == "pwrite" and r.offset >= data_start)
     assert payload_written == total_payload
@@ -115,14 +117,14 @@ def test_load_with_other_parallelism(root):
 
 def _empty_slot_fixture():
     W = 3
-    base = OuterProductMesh(ArrangedMesh(1, "constant_one"), ArrangedMesh(W, "world_size"))
+    base = OuterProductMesh(ArrangedMesh(ConstantOne(1)), ArrangedMesh(WorldSize(W)))
     A = NamedDTensor("A", NaiveDTensor(GlobalTensorMeta((200,), "U8", 1), (Replicate(), Shard(0)),
                                        SlicedMesh(base, (None, Slice(0, 3, 2)))))  # columns 0, 2; column 1 empty
     B = NamedDTensor("B", NaiveDTensor(GlobalTensorMeta((200,), "U8", 1), (Replicate(), Replicate()),
                                        SlicedMesh(base, (None, Slice(0, 1)))))
     st = DTensorTable([A, B])
-    cA = NamedDTensor("A", NaiveDTensor(GlobalTensorMeta((200,), "U8", 1), (Shard(0),), ArrangedMesh(W)))
-    cB = NamedDTensor("B", NaiveDTensor(GlobalTensorMeta((200,), "U8", 1), (Replicate(),), ArrangedMesh(W)))
+    cA = NamedDTensor("A", NaiveDTensor(GlobalTensorMeta((200,), "U8", 1), (Shard(0),), ArrangedMesh(WorldSize(W))))
+    cB = NamedDTensor("B", NaiveDTensor(GlobalTensorMeta((200,), "U8", 1), (Replicate(),), ArrangedMesh(WorldSize(W))))
     ct = DTensorTable([cA, cB])
     lay = build_layout(st, W, "safetensors", lambda t, w, nd: "f.safetensors")
     return ct, st, lay
@@ -133,13 +135,13 @@ def test_empty_slot_offsets(root):
     ct, st, lay = _empty_slot_fixture()
     idx = build_payload_index(st, lay)
     cpo = {pos: s.contiguous_payload_offset for pos, (_, s) in idx.slots.items()}
-    assert cpo == {("A", 0): 0, ("A", 2): 100, ("B", 0): 200}
+    assert cpo == {TensorComponentPos("A", 0): 0, TensorComponentPos("A", 2): 100, TensorComponentPos("B", 0): 200}
     assert TensorComponentPos("A", 1) not in lay.tensor_entries  # empty slot: no key
     fab = ComputeFabric(ct).allocate(fill=fill_pattern)
-    sv = make_storage_view(st.tensor_ids, st, lay, root)
+    sv = make_storage_view(_ids(st), st, lay, root)
     session = sv.begin_save(sv, 0).unwrap()
     data_start = raw_header(os.path.join(root, "f.safetensors.tmp"))[1]
-    got = {k: session.get_file_offset(TensorComponentPos(*k)).unwrap() for k in cpo}
+    got = {k: session.get_file_offset(k).unwrap() for k in cpo}
     assert got == {k: data_start + v for k, v in cpo.items()}
     session.abort().unwrap()
     res, _ = save_threads(ct, st, lay, root, fab, 3)
@@ -156,9 +158,9 @@ def test_reshard_storage_to_storage_hf_to_dcp(tmp_path):
     ct, st, lay, _ = roundtrip(src, M, P, "hf", "hf", "safetensors")
     st2 = storage_table(ct, P, "mirror")
     lay2 = layout_builder("per_rank", st2, P, "distcp")
-    from gdtensor.coord import ThreadCoordinator
-    sv_src = make_storage_view(st.tensor_ids, st, lay, src)
-    sv_dst = make_storage_view(st2.tensor_ids, st2, lay2, dst, coord=ThreadCoordinator(P.world))
+    from gdtensor._coord import ThreadCoordinator
+    sv_src = make_storage_view(_ids(st), st, lay, src)
+    sv_dst = make_storage_view(_ids(st2), st2, lay2, dst, coord=ThreadCoordinator(P.world))
     assert_all_ok(reshard_threads(P.world, lambda r: sv_src, lambda r: sv_dst))
     verify_distcp_dir(dst, st2)
 
@@ -168,7 +170,7 @@ def test_reshard_storage_to_compute(root):
     p2 = ParallelConfig(tp=1, dp=8, pp=1)
     ct2 = compute_table(M, p2)
     fab = ComputeFabric(ct2).allocate()
-    sv = make_storage_view(st.tensor_ids, st, lay, root)
+    sv = make_storage_view(_ids(st), st, lay, root)
     assert_all_ok(reshard_threads(p2.world, lambda r: sv, lambda r: compute_view(ct2, fab, r)))
     verify_fabric(fab, ct2)
 
@@ -190,7 +192,7 @@ def test_reshard_assert_meta_mismatch():
     other = compute_table(ModelConfig(layers=4, hidden=32, ffn=64, vocab=256), P)
     fab, fab2 = ComputeFabric(ct).allocate(), ComputeFabric(other).allocate()
     res = d_tensors_view_rank_plan_reshard(0, compute_view(ct, fab, 0), compute_view(other, fab2, 0))
-    assert not res.ok and "global_tensor_meta differs" in res.error
+    assert type(res).__name__ == 'Err' and "global_tensor_meta differs" in res.value.msg
 
 
 # ------------------------------------------------------------------ mixed format
@@ -219,20 +221,20 @@ def test_plan_union_disjoint_and_covering(kind):
     st = storage_table(ct, P, "hf" if kind in ("hf", "single", "per_stage") else "mirror")
     lay = layout_builder(kind, st, P, "safetensors")
     fab = ComputeFabric(ct).allocate()
-    sv = make_storage_view(st.tensor_ids, st, lay, "/nonexistent")
+    sv = make_storage_view(_ids(st), st, lay, "/nonexistent")
     paths = sorted(set(lay.file_paths.values()))
     union_save, union_load = [], []
     for r in range(P.world):
         cv = compute_view(ct, fab, r)
         ps = d_tensors_view_rank_plan_save(r, cv, sv).unwrap()
         pl = d_tensors_view_rank_plan_load(r, cv, sv).unwrap()
-        assert check_compute_d_tensors_access_disjoint(ct, pl).ok  # per-rank load dst disjoint
+        assert type(check_compute_d_tensors_access_disjoint(ct, pl)).__name__ == "Ok"
         union_save += ps
         union_load += pl
-    # OmniFS invariant: all ranks' storage writes are disjoint and cover every file.
-    assert check_storage_d_tensors_access_disjoint(st, lay, paths, union_save).ok
-    assert check_storage_d_tensors_access_full_covering(st, lay, paths, union_save).ok
-    assert check_compute_d_tensors_access_full_covering(ct, union_save).ok
+    # Shared-file invariant: all ranks' storage writes are disjoint and cover every file.
+    assert type(check_storage_d_tensors_access_disjoint(st, lay, paths, union_save)).__name__ == 'Ok'
+    assert type(check_storage_d_tensors_access_full_covering(st, lay, paths, union_save)).__name__ == 'Ok'
+    assert type(check_compute_d_tensors_access_full_covering(ct, union_save)).__name__ == 'Ok'
 
 
 def test_check_detects_overlap():
@@ -240,7 +242,7 @@ def test_check_detects_overlap():
     st = storage_table(ct, P, "hf")
     lay = layout_builder("single", st, P, "safetensors")
     fab = ComputeFabric(ct).allocate()
-    sv = make_storage_view(st.tensor_ids, st, lay, "/nonexistent")
+    sv = make_storage_view(_ids(st), st, lay, "/nonexistent")
     plan = d_tensors_view_rank_plan_save(0, compute_view(ct, fab, 0), sv).unwrap()
     res = check_storage_d_tensors_access_disjoint(st, lay, ["model.safetensors"], plan + plan[:1])
     assert not res.ok and "overlap" in res.error
@@ -249,7 +251,7 @@ def test_check_detects_overlap():
 
 
 def test_storage_mesh_disjoint_check():
-    base = OuterProductMesh(ArrangedMesh(2, "tensor_count"), ArrangedMesh(4, "world_size"))
+    base = OuterProductMesh(ArrangedMesh(TensorCount(2)), ArrangedMesh(WorldSize(4)))
     a = SlicedMesh(base, (Slice(0, 1), Slice(0, 2)))
     b = SlicedMesh(base, (Slice(0, 1), Slice(2, 4)))
     c = SlicedMesh(base, (Slice(0, 2), Slice(1, 3)))
@@ -262,8 +264,9 @@ def test_layout_is_deterministic_and_serializable():
     st = storage_table(ct, P, "hf")
     a = layout_builder("hf", st, P, "safetensors", 3)
     b = layout_builder("hf", storage_table(compute_table(MOE, P), P, "hf"), P, "safetensors", 3)
-    assert json.dumps(a.to_json(), sort_keys=True) == json.dumps(b.to_json(), sort_keys=True)
-    from gdtensor.formats import safetensors_header
+    # section 6: PhysicalLayoutTable is deterministic configuration data.
+    assert a == b and hash(a) == hash(b)
+    from gdtensor._formats import safetensors_header
     ia, ib = build_payload_index(st, a), build_payload_index(st, b)
     for path in ia.files:
         assert safetensors_header(st, ia, path) == safetensors_header(st, ib, path)
@@ -273,7 +276,7 @@ def test_shared_header_has_no_rank_info():
     ct = compute_table(M, P)
     st = storage_table(ct, P, "hf")
     lay = layout_builder("single", st, P, "safetensors")
-    from gdtensor.formats import safetensors_header
+    from gdtensor._formats import safetensors_header
     h = safetensors_header(st, build_payload_index(st, lay), "model.safetensors")
     assert b"slot" not in h and b"rank" not in h
 
@@ -285,9 +288,9 @@ def test_abort_on_one_rank_discards_shared_file(root):
     ct = compute_table(M, P)
     st = storage_table(ct, P, "hf")
     lay = layout_builder("single", st, P, "safetensors")
-    from gdtensor.coord import ThreadCoordinator
-    from gdtensor.runner import _run_threads
-    sv = make_storage_view(st.tensor_ids, st, lay, root, coord=ThreadCoordinator(P.world))
+    from gdtensor._coord import ThreadCoordinator
+    from gdtensor._runner import _run_threads
+    sv = make_storage_view(_ids(st), st, lay, root, coord=ThreadCoordinator(P.world))
 
     def rank_fn(r):
         s = sv.begin_save(sv, r).unwrap()
@@ -300,7 +303,7 @@ def test_abort_on_one_rank_discards_shared_file(root):
 
 def test_load_session_states(root):
     ct, st, lay, _ = roundtrip(root, M, ParallelConfig(tp=2, dp=1, pp=1), "hf", "single", "safetensors")
-    sv = make_storage_view(st.tensor_ids, st, lay, root)
+    sv = make_storage_view(_ids(st), st, lay, root)
     s = sv.begin_load(sv, 0).unwrap()
     assert s.finish().ok
     assert not s.finish().ok and not s.get_file_offset(TensorComponentPos("lm_head.weight", 0)).ok
@@ -309,7 +312,7 @@ def test_load_session_states(root):
 def test_distcp_without_metadata_fails(root):
     ct, st, lay, _ = roundtrip(root, M, P, "mirror", "per_rank", "distcp")
     os.remove(os.path.join(root, ".metadata"))
-    sv = make_storage_view(st.tensor_ids, st, lay, root)
+    sv = make_storage_view(_ids(st), st, lay, root)
     res = sv.begin_load(sv, 0)
     assert not res.ok and ".metadata is missing" in res.error
 

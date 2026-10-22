@@ -1,8 +1,8 @@
-"""Physical model (DTensorsView B.2.2.2 / B.2.2.3) plus lite payload maps.
+"""Physical model (design B.2.2.2 / B.2.2.3) and payload maps (internal).
 
-Terms used here:
+Terms:
 * cell (t, w): slot of tensor row ``t`` (DTensorTable order) and content
-  column ``w`` (global rank). It is *non-empty* when ``w`` is on the tensor's
+  column ``w`` (global rank). It is non-empty when ``w`` is on the tensor's
   SingleTensorStorageMesh and the column owns > 0 elements.
 * A file payload is the concatenation of its non-empty cells, ordered by
   tensor row (header order), then by column. Empty cells use 0 bytes.
@@ -10,123 +10,116 @@ Terms used here:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from functools import cached_property
-from typing import Dict, List, Literal, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from .dtensor import (
+from ._builder_mixin import field_hash, make_builder_mixin
+from ._dtensor import (
     DTensorTable,
     NamedDTensor,
     global_tensor_meta_of,
     iv_total,
     owned_intervals,
     participants_of,
+    tensor_ids_of,
 )
-from .mesh import (
-    ArrangedMesh,
-    OuterProductMesh,
-    Slice,
-    SlicedMesh,
-    StorageMesh,
-    is_multi_tensors_storage_mesh,
-    storage_mesh_cells,
-)
-from .result import Result, ResultError, catch
-from .constraints import check_constraints as _check
-
-ContainerFormat = Literal["safetensors", "distcp"]
+from ._mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh, is_multi_tensors_storage_mesh, storage_mesh_cells
+from ._result import catch, invalid, not_found
+from .tag import TensorCount, WorldSize
 
 
-class TensorComponentPos(NamedTuple):
-    tensor_id: str
-    rank: int
+def _cc(self):
+    from ._constraints import check_constraints
+    return check_constraints(self)
 
 
-@dataclass(frozen=True)
-class DisjointStorageMeshList:
+ContainerFormat = str  # "safetensors" / "distcp"
+
+TensorComponentPosBuilderMixin = make_builder_mixin("TensorComponentPos", [("tensor_id", "scalar"), ("rank", "scalar")])
+DisjointStorageMeshListBuilderMixin = make_builder_mixin(
+    "DisjointStorageMeshList", [("disjoint_storage_mesh_list", "list"), ("tensor_ids", "list")])
+PhysicalLayoutTableBuilderMixin = make_builder_mixin(
+    "PhysicalLayoutTable", [("container_format", "scalar"), ("tensor_entries", "dict"), ("file_paths", "dict")])
+
+
+@dataclass(eq=True)
+class TensorComponentPos(TensorComponentPosBuilderMixin):
+    tensor_id: str = ""
+    rank: int = 0
+    __hash__ = field_hash
+
     def check_constraints(self):
-        return _check(self)
+        return _cc(self)
 
-    """One logical list per physical file.
 
-    ``tensor_ids`` is a lite addition: the row labels of the "tensor_count"
-    axis. It lets ``leader_tensor_component_pos_of`` stay a pure function of
-    the list, as the spec signature requires.
-    """
+def pos_key(pos: TensorComponentPos) -> Tuple[str, int]:
+    return (pos.tensor_id, pos.rank)
 
-    disjoint_storage_mesh_list: Tuple[StorageMesh, ...]
-    tensor_ids: Tuple[str, ...]
+
+@dataclass(eq=True)
+class DisjointStorageMeshList(DisjointStorageMeshListBuilderMixin):
+    disjoint_storage_mesh_list: List[Any] = field(default_factory=list)
+    # Open design point: row labels of the "tensor_count" axis. The design
+    # signature leader_tensor_component_pos_of(list) needs them to name the
+    # leader tensor; the design type has no such field.
+    tensor_ids: List[str] = field(default_factory=list)
+    __hash__ = field_hash
 
     def __post_init__(self) -> None:
-        for m in self.disjoint_storage_mesh_list:
-            if not is_multi_tensors_storage_mesh(m):
-                raise ResultError("DisjointStorageMeshList holds MultiTensorsStorageMesh only")
+        self.disjoint_storage_mesh_list = list(self.disjoint_storage_mesh_list)
+        self.tensor_ids = list(self.tensor_ids)
 
-    @cached_property
-    def cells(self) -> Tuple[Tuple[int, int], ...]:
-        out: set = set()
-        for m in self.disjoint_storage_mesh_list:
-            c = storage_mesh_cells(m)
-            if out & c:
-                raise ResultError("meshes inside one DisjointStorageMeshList overlap")
-            out |= c
-        return tuple(sorted(out))
+    def check_constraints(self):
+        return _cc(self)
+
+
+def list_cells(lst: DisjointStorageMeshList) -> List[Tuple[int, int]]:
+    """Sorted (row, column) cells of a list; meshes must be multi-tensor and disjoint."""
+    out: set = set()
+    for m in lst.disjoint_storage_mesh_list:
+        if not is_multi_tensors_storage_mesh(m):
+            raise invalid("disjoint_storage_mesh_list", "list holds MultiTensorsStorageMesh only")
+        c = storage_mesh_cells(m)
+        if out & c:
+            raise invalid("disjoint_storage_mesh_list", "meshes inside one list overlap")
+        out |= c
+    return sorted(out)
 
 
 def leader_tensor_component_pos_of(disjoint_storage_meshes: DisjointStorageMeshList) -> TensorComponentPos:
-    """Canonical key: the lexicographically smallest (row, column) cell."""
-    cells = disjoint_storage_meshes.cells
+    """Canonical key: the smallest (row, column) cell."""
+    cells = list_cells(disjoint_storage_meshes)
     if not cells:
-        raise ResultError("empty DisjointStorageMeshList has no leader")
+        raise invalid("disjoint_storage_meshes", "empty DisjointStorageMeshList has no leader")
     t, w = cells[0]
     return TensorComponentPos(disjoint_storage_meshes.tensor_ids[t], w)
 
 
-@dataclass
-class PhysicalLayoutTable:
+@dataclass(eq=True)
+class PhysicalLayoutTable(PhysicalLayoutTableBuilderMixin):
+    container_format: ContainerFormat = ""
+    tensor_entries: Dict[TensorComponentPos, DisjointStorageMeshList] = field(default_factory=dict)
+    file_paths: Dict[TensorComponentPos, str] = field(default_factory=dict)
+    __hash__ = field_hash
+
     def check_constraints(self):
-        return _check(self)
-
-    """Pure configuration data. No function fields; JSON-serializable."""
-
-    container_format: ContainerFormat
-    tensor_entries: Dict[TensorComponentPos, DisjointStorageMeshList]
-    file_paths: Dict[TensorComponentPos, str]
-
-    def to_json(self) -> dict:
-        lists = {}
-        for pos, lst in self.tensor_entries.items():
-            lists.setdefault(leader_tensor_component_pos_of(lst), lst)
-        return {
-            "container_format": self.container_format,
-            "files": [
-                {
-                    "leader": list(leader),
-                    "path": self.file_paths[leader],
-                    "cells": [list(c) for c in lst.cells],
-                }
-                for leader, lst in sorted(lists.items())
-            ],
-            "tensor_entries": sorted(
-                [list(pos), list(leader_tensor_component_pos_of(lst))] for pos, lst in self.tensor_entries.items()
-            ),
-        }
+        return _cc(self)
 
 
 @catch
 def file_path_of(layout: PhysicalLayoutTable, pos: TensorComponentPos) -> str:
     """tensor_entries[pos] -> list -> leader -> file_paths."""
-    lst = layout.tensor_entries.get(TensorComponentPos(*pos))
+    lst = layout.tensor_entries.get(pos)
     if lst is None:
-        raise ResultError(f"{tuple(pos)} has no physical file")
+        raise not_found("tensor_entries", pos_key(pos), f"{pos_key(pos)} has no physical file")
     leader = leader_tensor_component_pos_of(lst)
     if leader not in layout.file_paths:
-        raise ResultError(f"leader {tuple(leader)} has no file path")
+        raise not_found("file_paths", pos_key(leader), f"leader {pos_key(leader)} has no file path")
     return layout.file_paths[leader]
 
 
-# ------------------------------------------------------------- payload maps
+# ------------------------------------------------------------- payload maps (internal)
 
 
 @dataclass(frozen=True)
@@ -170,20 +163,26 @@ def nonempty_columns(nd: NamedDTensor) -> Dict[int, np.ndarray]:
     return out
 
 
+def unique_lists(layout: PhysicalLayoutTable) -> Dict[TensorComponentPos, DisjointStorageMeshList]:
+    """leader -> list, in a deterministic order."""
+    lists: Dict[TensorComponentPos, DisjointStorageMeshList] = {}
+    for lst in layout.tensor_entries.values():
+        lists.setdefault(leader_tensor_component_pos_of(lst), lst)
+    return dict(sorted(lists.items(), key=lambda kv: pos_key(kv[0])))
+
+
 def build_payload_index(table: DTensorTable, layout: PhysicalLayoutTable) -> PayloadIndex:
     files: Dict[str, FilePayload] = {}
     slots: Dict[TensorComponentPos, Tuple[str, SlotPayload]] = {}
     cols_by_row = [nonempty_columns(nd) for nd in table.named_d_tensors]
-    lists: Dict[TensorComponentPos, DisjointStorageMeshList] = {}
-    for lst in layout.tensor_entries.values():
-        lists.setdefault(leader_tensor_component_pos_of(lst), lst)
+    lists = unique_lists(layout)
     for leader, lst in sorted(lists.items(), key=lambda kv: layout.file_paths.get(kv[0], "")):
         if leader not in layout.file_paths:
-            raise ResultError(f"leader {tuple(leader)} has no file path")
+            raise not_found("file_paths", pos_key(leader), f"leader {pos_key(leader)} has no file path")
         path = layout.file_paths[leader]
         fp = FilePayload(path=path, leader=leader)
         off = 0
-        for t, w in lst.cells:  # row-major: header order, then column order
+        for t, w in list_cells(lst):  # row-major: header order, then column order
             iv = cols_by_row[t].get(w)
             if iv is None:
                 continue  # empty slot: 0 bytes, no offset accumulation
@@ -194,18 +193,21 @@ def build_payload_index(table: DTensorTable, layout: PhysicalLayoutTable) -> Pay
             fp.slots.append(sp)
             slots[pos] = (path, sp)
         if path in files:
-            raise ResultError(f"two lists map to one path {path}")
+            raise invalid("file_paths", f"two lists map to one path {path}")
         files[path] = fp
     return PayloadIndex(files, slots)
 
 
-# ------------------------------------------------------------- business builder
+# ------------------------------------------------------------- generic layout builder (business)
 
 
-def _cells_to_meshes(cells: List[Tuple[int, int]], n_tensors: int, world: int) -> Tuple[StorageMesh, ...]:
+def _cells_to_meshes(cells: List[Tuple[int, int]], n_tensors: int, world: int) -> List[Any]:
     """Cover a cell set with disjoint rectangles: per row, contiguous column
     runs; identical runs on consecutive rows merge into one rectangle."""
-    base = OuterProductMesh(ArrangedMesh(n_tensors, "tensor_count"), ArrangedMesh(world, "world_size"))
+    from ._mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
+    from .tag import TensorCount, WorldSize
+
+    base = OuterProductMesh(ArrangedMesh(TensorCount(n_tensors)), ArrangedMesh(WorldSize(world)))
     by_row: Dict[int, List[int]] = {}
     for t, w in cells:
         by_row.setdefault(t, []).append(w)
@@ -221,9 +223,8 @@ def _cells_to_meshes(cells: List[Tuple[int, int]], n_tensors: int, world: int) -
         runs_by_row[t] = runs
     rects: List[Tuple[int, int, int, int]] = []
     open_: Dict[Tuple[int, int], int] = {}  # run -> start row
-    rows = sorted(runs_by_row)
     prev_row = None
-    for t in rows:
+    for t in sorted(runs_by_row):
         cur = set(runs_by_row[t])
         contiguous = prev_row is not None and t == prev_row + 1
         for run in list(open_):
@@ -236,26 +237,19 @@ def _cells_to_meshes(cells: List[Tuple[int, int]], n_tensors: int, world: int) -
     for run, t0 in open_.items():
         rects.append((t0, prev_row + 1, *run))
     rects.sort()
-    return tuple(SlicedMesh(base, (Slice(t0, t1), Slice(w0, w1))) for t0, t1, w0, w1 in rects)
+    return [SlicedMesh(base, [Slice(t0, t1), Slice(w0, w1)]) for t0, t1, w0, w1 in rects]
 
 
-def build_layout(
-    table: DTensorTable,
-    world_size: int,
-    container_format: ContainerFormat,
-    file_of_cell,
-) -> PhysicalLayoutTable:
-    """Generic layout builder (business layer, not core).
-
-    ``file_of_cell(t, w, named_d_tensor) -> path`` assigns each non-empty cell
-    to one file. Empty cells get no entry.
-    """
-    ids = tuple(table.tensor_ids)
+def build_layout(table: DTensorTable, world_size: int, container_format: ContainerFormat,
+                 file_of_cell) -> PhysicalLayoutTable:
+    """``file_of_cell(t, w, named_d_tensor) -> path`` assigns each non-empty
+    cell to one file. Empty cells get no entry."""
+    ids = tensor_ids_of(table)
     groups: Dict[str, List[Tuple[int, int]]] = {}
     for t, nd in enumerate(table.named_d_tensors):
         for w in nonempty_columns(nd):
             if not 0 <= w < world_size:
-                raise ResultError(f"{nd.global_tensor_id}: column {w} outside world {world_size}")
+                raise invalid("world_size", f"{nd.global_tensor_id}: column {w} outside world {world_size}")
             groups.setdefault(file_of_cell(t, w, nd), []).append((t, w))
     tensor_entries: Dict[TensorComponentPos, DisjointStorageMeshList] = {}
     file_paths: Dict[TensorComponentPos, str] = {}
@@ -266,8 +260,3 @@ def build_layout(
         for t, w in cells:
             tensor_entries[TensorComponentPos(ids[t], w)] = lst
     return PhysicalLayoutTable(container_format, tensor_entries, file_paths)
-
-
-from .builder_mixin import attach_builders as _ab
-_ab(DisjointStorageMeshList)
-_ab(PhysicalLayoutTable)

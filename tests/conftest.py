@@ -14,8 +14,11 @@ import safetensors
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gdtensor.dtensor import global_tensor_meta_of, iv_normalize, iv_total, named_of, owned_intervals  # noqa: E402
-from gdtensor.models import fill_pattern, full_tensor_bytes, interval_elems, pattern_bytes  # noqa: E402
+from _result_style import install  # noqa: E402
+install()  # noqa: E402
+
+from gdtensor._dtensor import global_tensor_meta_of, iv_normalize, iv_total, named_of, nbytes_of, numel_of, owned_intervals  # noqa: E402
+from gdtensor._models import fill_pattern, full_tensor_bytes, interval_elems, pattern_bytes  # noqa: E402
 
 
 def raw_header(path):
@@ -47,7 +50,7 @@ def verify_safetensors_dir(root, storage_table):
             if slot:
                 iv = owned_intervals(nd, "storage", int(slot))
             else:
-                iv = np.array([[0, global_tensor_meta_of(nd).numel]], dtype=np.int64)
+                iv = np.array([[0, numel_of(global_tensor_meta_of(nd))]], dtype=np.int64)
                 assert list(info["shape"]) == list(global_tensor_meta_of(nd).global_shape)
             want = pattern_bytes(tid, isz, interval_elems(iv)).tobytes()
             assert bytes(info["data"]) == want, f"{f}:{key} payload mismatch"
@@ -57,10 +60,10 @@ def verify_safetensors_dir(root, storage_table):
         idx = json.load(open(idx_path))
         assert set(idx["weight_map"]) == set(seen)
         assert all(idx["weight_map"][k] in files for k in idx["weight_map"])
-        assert idx["metadata"]["total_size"] == sum(global_tensor_meta_of(nd).nbytes for nd in storage_table.named_d_tensors)
+        assert idx["metadata"]["total_size"] == sum(nbytes_of(global_tensor_meta_of(nd)) for nd in storage_table.named_d_tensors)
     for tid, ivs in seen.items():
         nd = named_of(storage_table, tid)
-        numel = global_tensor_meta_of(nd).numel
+        numel = numel_of(global_tensor_meta_of(nd))
         allv = np.concatenate(ivs) if ivs else np.zeros((0, 2), dtype=np.int64)
         assert iv_total(allv) == numel, f"{tid}: stored {iv_total(allv)} of {numel} elements (dup or gap)"
         assert iv_total(iv_normalize(allv)) == numel
@@ -81,7 +84,7 @@ def verify_distcp_dir(root, storage_table):
         seen.setdefault(c["tensor_id"], []).append(iv)
     for nd in storage_table.named_d_tensors:
         ivs = seen.get(nd.global_tensor_id, [])
-        assert iv_total(np.concatenate(ivs)) == global_tensor_meta_of(nd).numel
+        assert iv_total(np.concatenate(ivs)) == numel_of(global_tensor_meta_of(nd))
 
 
 def verify_fabric(fabric, table):
@@ -93,7 +96,8 @@ def verify_fabric(fabric, table):
 
 
 def assert_all_ok(results):
-    bad = {r: x.error for r, x in results.items() if not x.ok}
+    from gdtensor.tag import Err
+    bad = {r: x.value for r, x in results.items() if type(x) is Err}
     assert not bad, bad
 
 

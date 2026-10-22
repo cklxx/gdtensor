@@ -3,8 +3,6 @@
 CRC:
 * file backend: every safetensors tensor payload matches zlib.crc32 of the
   expected pattern bytes; headers are excluded.
-* omnifs backend: every KV entry's stored crc matches the bytes on disk, and
-  the assembled blob matches the file-backend reference.
 
 Arrange tensor:
 * A tensor filled with its global element index (mod 256) is sharded, saved,
@@ -21,22 +19,21 @@ import numpy as np
 import pytest
 
 from conftest import assert_all_ok, verify_fabric
-from gdtensor.coord import ThreadCoordinator
-from gdtensor.dtensor import (
+from gdtensor._dtensor import tensor_ids_of as _ids  # noqa: E402
+from gdtensor._coord import ThreadCoordinator
+from gdtensor._dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard,
     global_tensor_meta_of, owned_intervals,
 )
-from gdtensor.formats import make_storage_view
-from gdtensor.iobackend import MiB
-from gdtensor.layout import build_payload_index
-from gdtensor.models import (
+from gdtensor._formats import make_storage_view
+from gdtensor._iobackend import MiB
+from gdtensor._layout import build_payload_index
+from gdtensor._models import (
     ModelConfig, ParallelConfig, compute_mesh, compute_table, fill_pattern, layout_builder,
     pattern_bytes, storage_table, tensor_seed,
 )
-from gdtensor.omnifs import KvStore, Manifest, OmniFsConfig, OmniFsIO
-from gdtensor.omnifs_view import export_hf_dir, make_omnifs_storage_view
-from gdtensor.runner import _run_threads, compute_view, load_threads, reshard_threads, save_threads
-from gdtensor.views import ComputeFabric
+from gdtensor._runner import _run_threads, compute_view, load_threads, reshard_threads, save_threads
+from gdtensor._views import ComputeFabric
 
 M = ModelConfig(layers=2, hidden=64, ffn=128, vocab=256)
 P = ParallelConfig(tp=2, dp=2, pp=2)
@@ -127,63 +124,6 @@ def test_file_backend_crc_detects_corruption(tmp_path):
         f.seek(size // 2)
         f.write(b"\xff" * 8)  # flip bytes inside a payload
     assert _safetensors_payload_crc(path) != _expected_file_payload_crc(st, lay, "model.safetensors")
-
-
-# ------------------------------------------------------------------ omnifs backend CRC
-
-
-def test_omnifs_kv_entry_crc_matches_disk_bytes(tmp_path):
-    cfg = OmniFsConfig(str(tmp_path / "omnifs"), "train", 1, chunk_bytes=16 * 1024, n_dn=4)
-    ct = compute_table(M, P)
-    st = storage_table(ct, P, "hf")
-    lay = layout_builder("hf", st, P, "safetensors", 2)
-    io = OmniFsIO(cfg)
-    sv = make_omnifs_storage_view(st.tensor_ids, st, lay, cfg, io, ThreadCoordinator(P.world))
-    fab = ComputeFabric(ct).allocate(fill=fill_pattern)
-    assert_all_ok(_run_threads(P.world, lambda r: __import__(
-        "gdtensor.api", fromlist=["d_tensors_view_rank_save"]).d_tensors_view_rank_save(
-        r, compute_view(ct, fab, r), sv)))
-    kv = KvStore(cfg)
-    lay_kv = kv.layout()
-    checked = 0
-    for entries in lay_kv.values():
-        for e in entries:
-            with open(os.path.join(cfg.store_dir, f"dn{e.dn}", f"r{e.rank}.log"), "rb") as f:
-                f.seek(e.log_offset)
-                data = f.read(e.length)
-            assert zlib.crc32(data) == e.crc, e.key
-            checked += 1
-    assert checked > 0
-
-
-def test_omnifs_exported_blob_crc_matches_file_backend(tmp_path):
-    # Save the same table through both backends; the assembled HF files must
-    # be byte-identical (same header + same payload).
-    ct = compute_table(M, P)
-    st = storage_table(ct, P, "hf")
-    lay = layout_builder("single", st, P, "safetensors")
-    fab = ComputeFabric(ct).allocate(fill=fill_pattern)
-
-    file_root = str(tmp_path / "file")
-    os.makedirs(file_root)
-    assert_all_ok(save_threads(ct, st, lay, file_root, fab, P.world)[0])
-
-    cfg = OmniFsConfig(str(tmp_path / "omnifs"), "train", 1, chunk_bytes=16 * 1024, n_dn=4)
-    io = OmniFsIO(cfg)
-    sv = make_omnifs_storage_view(st.tensor_ids, st, lay, cfg, io, ThreadCoordinator(P.world))
-    assert_all_ok(_run_threads(P.world, lambda r: __import__(
-        "gdtensor.api", fromlist=["d_tensors_view_rank_save"]).d_tensors_view_rank_save(
-        r, compute_view(ct, fab, r), sv)))
-    out = str(tmp_path / "export")
-    export_hf_dir(cfg, out)
-
-    for name in os.listdir(file_root):
-        if not name.endswith(".safetensors"):
-            continue
-        a = open(os.path.join(file_root, name), "rb").read()
-        b = open(os.path.join(out, name), "rb").read()
-        assert a == b, f"{name}: omnifs export differs from file backend"
-        assert zlib.crc32(a) == zlib.crc32(b)
 
 
 # ------------------------------------------------------------------ arrange tensor
@@ -281,8 +221,8 @@ def test_arrange_tensor_reshard_storage_to_storage(tmp_path):
     fab = ComputeFabric(ct).allocate(fill=_arrange_fill)
     assert_all_ok(save_threads(ct, src_st, src_lay, src_root, fab, P.world)[0])
 
-    sv_src = make_storage_view(src_st.tensor_ids, src_st, src_lay, src_root)
-    sv_dst = make_storage_view(dst_st.tensor_ids, dst_st, dst_lay, dst_root,
+    sv_src = make_storage_view(_ids(src_st), src_st, src_lay, src_root)
+    sv_dst = make_storage_view(_ids(dst_st), dst_st, dst_lay, dst_root,
                                coord=ThreadCoordinator(P.world))
     assert_all_ok(reshard_threads(P.world, lambda r: sv_src, lambda r: sv_dst))
 

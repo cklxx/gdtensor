@@ -19,15 +19,17 @@ from torch.distributed.tensor import (  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 
 from conftest import assert_all_ok  # noqa: E402
-from gdtensor.builder import get_d_tensor, get_gd_tensor, make_gd_tensor  # noqa: E402
-from gdtensor.dtensor import DTensorTable, NamedDTensor  # noqa: E402
-from gdtensor.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
-from gdtensor.runner import save_threads  # noqa: E402
-from gdtensor.torch_bridge import (  # noqa: E402
+from gdtensor.builder import get_d_tensor, get_gd_tensor  # noqa: E402
+from gdtensor._dtensor import DTensorTable, NamedDTensor  # noqa: E402
+from gdtensor._models import ParallelConfig, layout_builder, storage_table  # noqa: E402
+from gdtensor._runner import save_threads  # noqa: E402
+from gdtensor._torch_bridge import (  # noqa: E402
     fabric_from_torch, gather_global_bytes, global_bytes_of_dtensor,
     parallel_config_from_mesh, torch_from_fabric, torch_placement_to_gd,
 )
-from gdtensor.tag import InvalidArgumentError, Ok, Replicate, Shard  # noqa: E402
+from gdtensor.builder import InvalidArgumentError  # noqa: E402
+from gdtensor.tag import Ok, Replicate, Shard  # noqa: E402
+from gdtensor._torch_bridge import gd_for_layout  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("GDTENSOR_TORCH_TESTS"), reason="set GDTENSOR_TORCH_TESTS=1 (torch distributed)")
@@ -52,7 +54,7 @@ def _mesh(shape, names):
 
 def test_placement_and_mesh_mapping():
     assert type(torch_placement_to_gd(TShard(1))) is Shard
-    assert torch_placement_to_gd(TShard(1)).axis == 1
+    assert torch_placement_to_gd(TShard(1)).value == 1
     assert type(torch_placement_to_gd(TRep())) is Replicate
     m = _mesh((1,), ("dp",))
     assert parallel_config_from_mesh(m) == (1, 1, 1)
@@ -64,21 +66,21 @@ def test_parallel_config_from_named_mesh():
     assert parallel_config_from_mesh(m) == (1, 1, 1)
 
 
-def test_make_gd_tensor_from_torch_dtensor():
+def test_gd_for_layout_from_torch_dtensor():
     p = ParallelConfig(tp=1, dp=4, pp=1)
     mesh = _mesh((1,), ("dp",))
     g = torch.arange(32, dtype=torch.float32).reshape(8, 4)
     dt = distribute_tensor(g, mesh, [TRep()])  # global values on the 1 torch rank
-    r = make_gd_tensor(dt, "w", p=p)  # gdtensor owns the 4-way shard plan
+    r = gd_for_layout(dt, "w", p=p)  # gdtensor owns the 4-way shard plan
     assert r.ok
     nd = r.unwrap()
-    assert nd.global_tensor_meta.global_shape == (8, 4)
+    assert list(nd.global_tensor_meta.global_shape) == [8, 4]
     assert nd.global_tensor_meta.dtype == "F32"
     assert nd.global_tensor_meta.itemsize == 4
     # default: torch placements map 1:1 (Replicate stays Replicate)
     assert type(nd.placements[-1]) is Replicate
     # explicit placements override: request a dp shard
-    nd2 = make_gd_tensor(dt, "w", p=p,
+    nd2 = gd_for_layout(dt, "w", p=p,
                          placements=(Replicate(), Shard(0), Replicate())).unwrap()
     assert type(nd2.placements[1]) is Shard
     assert get_d_tensor(nd).unwrap() is dt
@@ -86,14 +88,14 @@ def test_make_gd_tensor_from_torch_dtensor():
 
 def test_roundtrip_through_safetensors(tmp_path):
     """torch DTensor -> gdtensor fabric -> save -> load -> torch tensor."""
-    from gdtensor.runner import load_threads
+    from gdtensor._runner import load_threads
 
     p = ParallelConfig(tp=1, dp=4, pp=1)
     mesh = _mesh((1,), ("dp",))
     g = torch.arange(96, dtype=torch.float32).reshape(12, 8)
     dt = distribute_tensor(g, mesh, [TRep()])
     # one torch process holds global values; gdtensor shards over 4 dp ranks
-    gd = make_gd_tensor(dt, "w", p=p,
+    gd = gd_for_layout(dt, "w", p=p,
                         placements=(Replicate(), Shard(0), Replicate())).unwrap()
     ct = DTensorTable([NamedDTensor("w", gd)])
     st = storage_table(ct, p, "hf")
@@ -126,11 +128,12 @@ def test_gather_requires_full_coverage():
     mesh = _mesh((1,), ("dp",))
     g = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     dt = distribute_tensor(g, mesh, [TRep()])
-    gd = make_gd_tensor(dt, "w", p=p).unwrap()
+    gd = gd_for_layout(dt, "w", p=p).unwrap()
     ct = DTensorTable([NamedDTensor("w", gd)])
-    from gdtensor.views import ComputeFabric
+    from gdtensor._views import ComputeFabric
     empty = ComputeFabric(ct).allocate()
-    with pytest.raises(InvalidArgumentError):
+    from gdtensor._result import Fail
+    with pytest.raises(Fail, match="overlaps others|not every element loaded back"):
         gather_global_bytes(ct, empty, "w")
 
 
@@ -139,10 +142,10 @@ def test_get_gd_tensor_roundtrip_id():
     mesh = _mesh((1,), ("dp",))
     g = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     dt = distribute_tensor(g, mesh, [TRep()])
-    gd = make_gd_tensor(dt, "x", p=p).unwrap()
+    gd = gd_for_layout(dt, "x", p=p).unwrap()
     table = DTensorTable([NamedDTensor("x", gd)])
-    from gdtensor.runner import compute_view
-    from gdtensor.views import ComputeFabric
+    from gdtensor._runner import compute_view
+    from gdtensor._views import ComputeFabric
     fab = ComputeFabric(table).allocate()
     view = compute_view(table, fab, 0)
     got = get_gd_tensor(view, "x").unwrap()
