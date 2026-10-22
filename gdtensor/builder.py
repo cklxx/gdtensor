@@ -60,13 +60,16 @@ def get_d_tensor(gd_tensor):
 
 
 def reset_d_tensor(gd_tensor, d_tensor) -> None:
-    # gd_tensor_reset_d_tensor: replace the underlying torch.DTensor
+    # gd_tensor_reset_d_tensor: replace the underlying torch.DTensor.
+    # Raises InvalidArgumentError when gd_tensor is not a GenericDTensor or
+    # the new tensor changes meta/placements/mesh (design 5.6).
     from .internal.result import invalid
-    from .tag import Err
-    target = gd_tensor if type(gd_tensor) is NaiveDTensor else gd_tensor.underlying_d_tensor
+    target = gd_tensor if type(gd_tensor) is NaiveDTensor else getattr(
+        gd_tensor, "underlying_d_tensor", None)
     if type(target) is not NaiveDTensor:
         raise invalid("gd_tensor", "not a GenericDTensor")
-    target.torch_d_tensor = d_tensor
+    from .internal import torch_bridge
+    torch_bridge.gd_tensor_reset(target, d_tensor)
 
 
 # ------------------------------------------------------------------ 5.5 view map

@@ -133,6 +133,34 @@ def gd_tensor_make(d_tensor):
     return fn()
 
 
+def gd_tensor_reset(gd, d_tensor) -> None:
+    """gd_tensor_reset_d_tensor (design 5.6): write a torch.DTensor back.
+
+    The new tensor must keep global_tensor_meta, placements and mesh of the
+    existing GenericDTensor. Raises Fail(InvalidArgumentError) on mismatch.
+    """
+    if not hasattr(d_tensor, "device_mesh") or not hasattr(d_tensor, "placements"):
+        raise Fail(InvalidArgumentError(argument_name="d_tensor", msg="input is not a torch.DTensor"))
+    from .mesh import resolve_compute_mesh
+    meta = gd.global_tensor_meta
+    if tuple(int(x) for x in d_tensor.shape) != tuple(meta.global_shape):
+        raise Fail(InvalidArgumentError(
+            argument_name="d_tensor", msg=f"shape differs: {tuple(d_tensor.shape)} vs {tuple(meta.global_shape)}"))
+    if _dtype_name(d_tensor) != (meta.dtype, int(meta.itemsize)):
+        raise Fail(InvalidArgumentError(
+            argument_name="d_tensor", msg=f"dtype differs: {_dtype_name(d_tensor)} vs {(meta.dtype, meta.itemsize)}"))
+    new_pls = tuple(torch_placement_to_gd(pl) for pl in d_tensor.placements)
+    padded = (Replicate(),) * (len(gd.placements) - len(new_pls)) + new_pls
+    if tuple(gd.placements) != new_pls and tuple(gd.placements) != padded:
+        raise Fail(InvalidArgumentError(
+            argument_name="placements", msg=f"placements differ: {new_pls} vs {tuple(gd.placements)}"))
+    pp, dp, tp = parallel_config_from_mesh(d_tensor.device_mesh)
+    if (pp, dp, tp) != tuple(int(x) for x in resolve_compute_mesh(gd.mesh).shape):
+        raise Fail(InvalidArgumentError(
+            argument_name="mesh", msg=f"mesh grid differs: {(pp, dp, tp)} vs {tuple(resolve_compute_mesh(gd.mesh).shape)}"))
+    gd.torch_d_tensor = d_tensor
+
+
 def _make(d_tensor, tensor_id: str, p=None, stage: int = 0, placements=None):
     import torch
     dt = d_tensor
