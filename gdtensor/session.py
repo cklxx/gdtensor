@@ -9,8 +9,8 @@ from __future__ import annotations
 import abc
 from typing import Callable, Generic, TypeVar
 
-from .layout import TensorComponentPos
-from .ranges import RangeFromStorageView
+from ._layout import TensorComponentPos
+from ._ranges import RangeFromStorageView
 from typing import Any
 
 from .tag import Ok
@@ -60,8 +60,8 @@ class DTensorDataAccessor(abc.ABC, Generic[RangeT]):
 # Register the concrete lite sessions/accessor as virtual subclasses so
 # isinstance checks match the spec types without changing their hierarchy.
 def _register_virtuals() -> None:
-    from .formats import DcpLoadSession, DcpSaveSession, SafeTensorsLoadSession, SafeTensorsSaveSession
-    from .views import StorageDataAccessor
+    from ._formats import DcpLoadSession, DcpSaveSession, SafeTensorsLoadSession, SafeTensorsSaveSession
+    from ._views import StorageDataAccessor
 
     for cls in (SafeTensorsSaveSession, DcpSaveSession):
         StorageSaveSession.register(cls)

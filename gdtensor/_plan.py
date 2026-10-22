@@ -18,7 +18,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from .dtensor import (
+from ._dtensor import (
     EMPTY,
     DTensorTable,
     NamedDTensor,
@@ -34,11 +34,11 @@ from .dtensor import (
     owned_intervals,
     participants_of,
 )
-from .layout import PhysicalLayoutTable, TensorComponentPos, build_payload_index, leader_tensor_component_pos_of
-from .mesh import StorageMesh, storage_mesh_cells
-from .ranges import CopyPlan, DTensorRange, RangeFromComputeView, RangeFromStorageView, is_compute, is_storage
-from .result import ResultError, catch
-from .views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
+from ._layout import PhysicalLayoutTable, TensorComponentPos, build_payload_index, leader_tensor_component_pos_of
+from ._mesh import StorageMesh, storage_mesh_cells
+from ._ranges import CopyPlan, DTensorRange, RangeFromComputeView, RangeFromStorageView, is_compute, is_storage
+from ._result import ResultError, catch
+from ._views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
 
 # ------------------------------------------------------------------ helpers
 

@@ -14,7 +14,7 @@ from typing import Optional, Tuple, Union
 
 import numpy as np
 
-from .result import ResultError
+from ._result import ResultError
 
 # ---------------------------------------------------------------- B.3.2
 
@@ -228,6 +228,6 @@ def mesh_coords(cells: np.ndarray, value: int) -> Optional[Tuple[int, ...]]:
     return tuple(int(x) for x in hit[0])
 
 
-from .builder_mixin import attach_builders as _ab
+from ._builder_mixin import attach_builders as _ab
 for _c in (Slice, ArrangedMesh, LiteralMesh, ReshapedMesh, PermutedMesh, SlicedMesh, OuterProductMesh):
     _ab(_c)

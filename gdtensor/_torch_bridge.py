@@ -23,13 +23,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .dtensor import (
+from ._dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
     global_tensor_meta_of, named_of, naive_of, owned_intervals,
 )
-from .mesh import ReshapedMesh, SlicedMesh
+from ._mesh import ReshapedMesh, SlicedMesh
 from .tag import InvalidArgumentError, Ok, Replicate, Shard
-from .views import ComputeFabric
+from ._views import ComputeFabric
 
 _TORCH_DTYPE_TO_NAME = {
     "torch.float32": "F32", "torch.float": "F32",
@@ -92,7 +92,7 @@ def parallel_config_from_mesh(device_mesh) -> Tuple[int, int, int]:
 
 def gd_compute_mesh(p, stage: int):
     """SlicedMesh fixing the PP stage, matching models.compute_mesh."""
-    from .models import compute_mesh
+    from ._models import compute_mesh
     return compute_mesh(p, stage)
 
 
@@ -121,7 +121,7 @@ def make_gd_tensor(d_tensor, tensor_id: str, p=None, stage: int = 0, placements=
     if not hasattr(dt, "device_mesh") or not hasattr(dt, "placements"):
         raise InvalidArgumentError("input is not a torch.DTensor", argument_name="d_tensor")
     if p is None:
-        from .models import ParallelConfig
+        from ._models import ParallelConfig
         pp, dp, tp = parallel_config_from_mesh(dt.device_mesh)
         p = ParallelConfig(tp=tp, dp=dp, pp=pp)
     dtype, itemsize = _dtype_name(dt)

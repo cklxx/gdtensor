@@ -10,12 +10,12 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from .dtensor import DTensorTable, NamedDTensor, NaiveDTensor, ReshapedDTensor, named_of
-from .result import catch
+from ._dtensor import DTensorTable, NamedDTensor, NaiveDTensor, ReshapedDTensor, named_of
+from ._result import catch
 from .tag import (
     InvalidArgumentError, NotFoundError, Ok, Replicate, Shard,
 )
-from .views import ComputeDTensorsView, StorageDTensorsView
+from ._views import ComputeDTensorsView, StorageDTensorsView
 
 
 # ------------------------------------------------------------------ 5.6 bridge
@@ -37,7 +37,7 @@ def get_gd_tensor(view: ComputeDTensorsView, tensor_id: str):
 
 
 def _torch_bridge():
-    from . import torch_bridge as tb
+    from . import _torch_bridge as tb
     return tb
 
 
@@ -55,7 +55,7 @@ def make_gd_tensor(d_tensor, tensor_id=None, p=None, stage: int = 0, placements=
             "make_gd_tensor requires torch (torch.distributed.tensor)",
             argument_name="d_tensor",
         ) from None
-    from .torch_bridge import make_gd_tensor as _impl
+    from ._torch_bridge import make_gd_tensor as _impl
     if tensor_id is None:
         tensor_id = getattr(d_tensor, "name", None) or "tensor"
     return _impl(d_tensor, tensor_id, p, stage, placements)
@@ -142,15 +142,15 @@ def d_tensors_view_map(origin, map_core: DTensorsViewMapCore):
 # The builder namespace is the single import surface for every product type,
 # mesh, layout, typed error, and helper listed in design table C.3. The
 # implementations live in their own modules; this block only re-exports them.
-from .dtensor import (  # noqa: E402
+from ._dtensor import (  # noqa: E402
     DTensorTable, GenericDTensor, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
     ReshapedDTensor, global_tensor_meta_of, tensor_order_value_of,
 )
-from .layout import (  # noqa: E402
+from ._layout import (  # noqa: E402
     ContainerFormat, DisjointStorageMeshList, PhysicalLayoutTable,
     TensorComponentPos, file_path_of, leader_tensor_component_pos_of,
 )
-from .mesh import (  # noqa: E402
+from ._mesh import (  # noqa: E402
     ArrangedMesh, ComputeMesh, ContentSlotsMesh, LiteralMesh, OuterProductMesh,
     PermutedMesh, ReshapedMesh, Slice, SlicedMesh, StorageMesh,
 )
@@ -158,4 +158,4 @@ from .tag import (  # noqa: E402
     CheckFailedError, ConstraintViolationError, GDTensorIOError,
     InvalidArgumentError, NotFoundError, Placement,
 )
-from .views import ComputeDTensorsView, DTensorsView, StorageDTensorsView  # noqa: E402
+from ._views import ComputeDTensorsView, DTensorsView, StorageDTensorsView  # noqa: E402

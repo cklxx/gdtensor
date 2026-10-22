@@ -7,14 +7,14 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .plan import (
+from ._plan import (
     d_tensors_view_rank_plan_load,
     d_tensors_view_rank_plan_reshard,
     d_tensors_view_rank_plan_save,
 )
-from .ranges import CopyPlan, is_compute
-from .result import ResultError, catch
-from .views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
+from ._ranges import CopyPlan, is_compute
+from ._result import ResultError, catch
+from ._views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
 
 
 def _accessor(view: DTensorsView):
@@ -66,7 +66,7 @@ def _copy_storage_coalesced(plan: CopyPlan, src_view: DTensorsView, dst_view: DT
             piece = {}
             src_acc.read_to_buffer(src, lambda data: piece.update(data=bytes(data))).unwrap()
             buf[off - base: off - base + size] = piece["data"]
-        from .ranges import RangeFromStorageView
+        from ._ranges import RangeFromStorageView
         whole = RangeFromStorageView(path, base, slot.nbytes)
         dst_acc.write_from_buffer(whole, lambda data: data.__setitem__(slice(None), buf)).unwrap()
 

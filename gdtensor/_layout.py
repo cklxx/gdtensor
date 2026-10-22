@@ -15,7 +15,7 @@ from typing import Dict, List, Literal, NamedTuple, Optional, Tuple
 
 import numpy as np
 
-from .dtensor import (
+from ._dtensor import (
     DTensorTable,
     NamedDTensor,
     global_tensor_meta_of,
@@ -23,7 +23,7 @@ from .dtensor import (
     owned_intervals,
     participants_of,
 )
-from .mesh import (
+from ._mesh import (
     ArrangedMesh,
     OuterProductMesh,
     Slice,
@@ -32,8 +32,8 @@ from .mesh import (
     is_multi_tensors_storage_mesh,
     storage_mesh_cells,
 )
-from .result import Result, ResultError, catch
-from .constraints import check_constraints as _check
+from ._result import Result, ResultError, catch
+from ._constraints import check_constraints as _check
 
 ContainerFormat = Literal["safetensors", "distcp"]
 
@@ -268,6 +268,6 @@ def build_layout(
     return PhysicalLayoutTable(container_format, tensor_entries, file_paths)
 
 
-from .builder_mixin import attach_builders as _ab
+from ._builder_mixin import attach_builders as _ab
 _ab(DisjointStorageMeshList)
 _ab(PhysicalLayoutTable)

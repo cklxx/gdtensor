@@ -21,12 +21,12 @@ from torch.distributed.tensor import (  # noqa: E402
 import safetensors
 from conftest import assert_all_ok  # noqa: E402
 from gdtensor.builder import make_gd_tensor  # noqa: E402
-from gdtensor.dtensor import DTensorTable, NamedDTensor  # noqa: E402
-from gdtensor.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
-from gdtensor.runner import load_threads, save_threads  # noqa: E402
+from gdtensor._dtensor import DTensorTable, NamedDTensor  # noqa: E402
+from gdtensor._models import ParallelConfig, layout_builder, storage_table  # noqa: E402
+from gdtensor._runner import load_threads, save_threads  # noqa: E402
 from gdtensor.tag import Replicate, Shard  # noqa: E402
-from gdtensor.torch_bridge import fabric_from_torch, torch_from_fabric  # noqa: E402
-from gdtensor.views import ComputeFabric  # noqa: E402
+from gdtensor._torch_bridge import fabric_from_torch, torch_from_fabric  # noqa: E402
+from gdtensor._views import ComputeFabric  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("GDTENSOR_TORCH_TESTS"), reason="set GDTENSOR_TORCH_TESTS=1")

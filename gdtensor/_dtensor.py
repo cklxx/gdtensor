@@ -20,16 +20,16 @@ from typing import Dict, Generic, List, Optional, Sequence, Tuple, TypeVar, Unio
 
 import numpy as np
 
-from .mesh import (
+from ._mesh import (
     ComputeMesh,
     StorageMesh,
     mesh_coords,
     resolve_compute_mesh,
     resolve_storage_mesh,
 )
-from .result import Result, ResultError, catch
-from .constraints import check_constraints as _cc
-from .builder_mixin import attach_builders as _attach
+from ._result import Result, ResultError, catch
+from ._constraints import check_constraints as _cc
+from ._builder_mixin import attach_builders as _attach
 
 
 def _check(self):
@@ -343,6 +343,6 @@ def is_designated_writer(nd: NamedDTensor, rank: int, tensor_order: int) -> bool
 
 
 # C.1 builder registration
-from .builder_mixin import attach_builders as _ab
+from ._builder_mixin import attach_builders as _ab
 for _c in (GlobalTensorMeta, NaiveDTensor, ReshapedDTensor, NamedDTensor, DTensorTable):
     _ab(_c)

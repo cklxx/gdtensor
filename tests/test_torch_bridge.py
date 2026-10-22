@@ -20,10 +20,10 @@ import torch.distributed as dist  # noqa: E402
 
 from conftest import assert_all_ok  # noqa: E402
 from gdtensor.builder import get_d_tensor, get_gd_tensor, make_gd_tensor  # noqa: E402
-from gdtensor.dtensor import DTensorTable, NamedDTensor  # noqa: E402
-from gdtensor.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
-from gdtensor.runner import save_threads  # noqa: E402
-from gdtensor.torch_bridge import (  # noqa: E402
+from gdtensor._dtensor import DTensorTable, NamedDTensor  # noqa: E402
+from gdtensor._models import ParallelConfig, layout_builder, storage_table  # noqa: E402
+from gdtensor._runner import save_threads  # noqa: E402
+from gdtensor._torch_bridge import (  # noqa: E402
     fabric_from_torch, gather_global_bytes, global_bytes_of_dtensor,
     parallel_config_from_mesh, torch_from_fabric, torch_placement_to_gd,
 )
@@ -86,7 +86,7 @@ def test_make_gd_tensor_from_torch_dtensor():
 
 def test_roundtrip_through_safetensors(tmp_path):
     """torch DTensor -> gdtensor fabric -> save -> load -> torch tensor."""
-    from gdtensor.runner import load_threads
+    from gdtensor._runner import load_threads
 
     p = ParallelConfig(tp=1, dp=4, pp=1)
     mesh = _mesh((1,), ("dp",))
@@ -128,7 +128,7 @@ def test_gather_requires_full_coverage():
     dt = distribute_tensor(g, mesh, [TRep()])
     gd = make_gd_tensor(dt, "w", p=p).unwrap()
     ct = DTensorTable([NamedDTensor("w", gd)])
-    from gdtensor.views import ComputeFabric
+    from gdtensor._views import ComputeFabric
     empty = ComputeFabric(ct).allocate()
     with pytest.raises(InvalidArgumentError):
         gather_global_bytes(ct, empty, "w")
@@ -141,8 +141,8 @@ def test_get_gd_tensor_roundtrip_id():
     dt = distribute_tensor(g, mesh, [TRep()])
     gd = make_gd_tensor(dt, "x", p=p).unwrap()
     table = DTensorTable([NamedDTensor("x", gd)])
-    from gdtensor.runner import compute_view
-    from gdtensor.views import ComputeFabric
+    from gdtensor._runner import compute_view
+    from gdtensor._views import ComputeFabric
     fab = ComputeFabric(table).allocate()
     view = compute_view(table, fab, 0)
     got = get_gd_tensor(view, "x").unwrap()

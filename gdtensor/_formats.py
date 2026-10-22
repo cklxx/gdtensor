@@ -32,10 +32,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .dtensor import DTensorTable, global_tensor_meta_of, owned_box
-from .iobackend import FileIO
-from .layout import PayloadIndex, PhysicalLayoutTable, SlotPayload, TensorComponentPos, build_payload_index
-from .result import ResultError, catch
+from ._dtensor import DTensorTable, global_tensor_meta_of, owned_box
+from ._iobackend import FileIO
+from ._layout import PayloadIndex, PhysicalLayoutTable, SlotPayload, TensorComponentPos, build_payload_index
+from ._result import ResultError, catch
 
 METADATA_NAME = ".metadata"
 HF_INDEX_NAME = "model.safetensors.index.json"
@@ -382,7 +382,7 @@ def make_storage_view(
     coord=None,
 ):
     """Build a StorageDTensorsView whose sessions match layout.container_format."""
-    from .views import StorageDataAccessor, StorageDTensorsView
+    from ._views import StorageDataAccessor, StorageDTensorsView
 
     io = io or FileIO()
     index = build_payload_index(table, layout)

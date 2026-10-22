@@ -16,20 +16,20 @@ from gdtensor.builder import (
     DTensorsViewMapCore, d_tensors_view_map, get_gd_tensor, get_tensor_ids,
     get_d_tensor, reset_d_tensor,
 )
-from gdtensor.constraints import check_constraints
-from gdtensor.dtensor import (
+from gdtensor._constraints import check_constraints
+from gdtensor._dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
 )
-from gdtensor.formats import make_storage_view
-from gdtensor.mesh import (
+from gdtensor._formats import make_storage_view
+from gdtensor._mesh import (
     ArrangedMesh, LiteralMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh,
     resolve_compute_mesh, storage_mesh_cells,
 )
-from gdtensor.models import (
+from gdtensor._models import (
     ModelConfig, ParallelConfig, compute_mesh, compute_table, layout_builder,
     storage_mesh as build_storage_mesh, storage_table,
 )
-from gdtensor.runner import compute_view
+from gdtensor._runner import compute_view
 from gdtensor.session import (
     DTensorDataAccessor, StorageLoadSession, StorageSaveSession,
 )
@@ -38,7 +38,7 @@ from gdtensor.tag import (
     GDTensorIOError, InvalidArgumentError, NotFoundError, Ok, Partial,
     Replicate, Shard, TensorCount, WorldSize,
 )
-from gdtensor.views import ComputeFabric, ComputeDataAccessor
+from gdtensor._views import ComputeFabric, ComputeDataAccessor
 
 M = ModelConfig(layers=1, hidden=8, ffn=12, vocab=16)
 
@@ -110,7 +110,7 @@ def test_literal_content_slots_roundtrip():
     cells = storage_mesh_cells(base)
     assert cells == {(0, 0), (0, 2)}
     # participant 1 and 3 resolve to no cell
-    from gdtensor.mesh import resolve_storage_mesh
+    from gdtensor._mesh import resolve_storage_mesh
     table, w = resolve_storage_mesh(base)
     assert w == 4
     # slot ids are t*W+w; w=2 -> id 2; unselected columns are -1
@@ -146,7 +146,7 @@ def test_duplicate_id_rejected_at_construction_and_check():
     with pytest.raises(Exception):
         DTensorTable([a, b])
     # a table built by bypassing __post_init__ is caught by check_constraints
-    import gdtensor.dtensor as D
+    import gdtensor._dtensor as D
     t = object.__new__(DTensorTable)
     object.__setattr__(t, "named_d_tensors", [a, b]) if False else None
     t.__init__.__self__  # noop
@@ -220,8 +220,8 @@ def test_get_and_reset_d_tensor_metadata_only():
 def test_concrete_sessions_are_spec_subclasses(tmp_path):
     import os
     from conftest import assert_all_ok
-    from gdtensor.models import fill_pattern
-    from gdtensor.runner import save_threads
+    from gdtensor._models import fill_pattern
+    from gdtensor._runner import save_threads
     p = ParallelConfig(tp=1, dp=1, pp=1)
     ct = compute_table(M, p)
     st = storage_table(ct, p, "hf")

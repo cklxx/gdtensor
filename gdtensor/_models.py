@@ -16,7 +16,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .dtensor import (
+from ._dtensor import (
     DTensorTable,
     GlobalTensorMeta,
     NaiveDTensor,
@@ -27,8 +27,8 @@ from .dtensor import (
     global_tensor_meta_of,
     naive_of,
 )
-from .layout import ContainerFormat, PhysicalLayoutTable, build_layout
-from .mesh import ArrangedMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh
+from ._layout import ContainerFormat, PhysicalLayoutTable, build_layout
+from ._mesh import ArrangedMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh
 
 R = Replicate()
 

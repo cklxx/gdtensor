@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import pytest
 
-from gdtensor.builder_mixin import new_
-from gdtensor.dtensor import (
+from gdtensor._builder_mixin import new_
+from gdtensor._dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
 )
-from gdtensor.layout import DisjointStorageMeshList, PhysicalLayoutTable
-from gdtensor.mesh import ArrangedMesh, Slice
-from gdtensor.ranges import RangeFromComputeView
+from gdtensor._layout import DisjointStorageMeshList, PhysicalLayoutTable
+from gdtensor._mesh import ArrangedMesh, Slice
+from gdtensor._ranges import RangeFromComputeView
 from gdtensor.tag import Replicate
 
 

@@ -19,14 +19,14 @@ import numpy as np
 import pytest
 
 from conftest import assert_all_ok
-from gdtensor.coord import ThreadCoordinator
-from gdtensor.formats import make_storage_view
-from gdtensor.models import (
+from gdtensor._coord import ThreadCoordinator
+from gdtensor._formats import make_storage_view
+from gdtensor._models import (
     ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table,
 )
-from gdtensor.plan import d_tensors_view_rank_plan_load, d_tensors_view_rank_plan_save
-from gdtensor.runner import _run_threads, compute_view, run_processes, save_threads
-from gdtensor.views import ComputeDataAccessor, ComputeFabric
+from gdtensor._plan import d_tensors_view_rank_plan_load, d_tensors_view_rank_plan_save
+from gdtensor._runner import _run_threads, compute_view, run_processes, save_threads
+from gdtensor._views import ComputeDataAccessor, ComputeFabric
 
 M = ModelConfig(layers=2, hidden=16, ffn=32, vocab=64)
 P = ParallelConfig(tp=2, dp=2, pp=1)
@@ -81,11 +81,11 @@ def test_reversed_rank_start_order_same_bytes(tmp_path):
     r1 = str(tmp_path / "asc"); os.makedirs(r1)
     r2 = str(tmp_path / "desc"); os.makedirs(r2)
     for root, order in [(r1, range(P.world)), (r2, range(P.world - 1, -1, -1))]:
-        io = __import__("gdtensor.iobackend", fromlist=["FileIO"]).FileIO()
+        io = __import__("gdtensor._iobackend", fromlist=["FileIO"]).FileIO()
         sv = make_storage_view(st.tensor_ids, st, lay, root, io, ThreadCoordinator(P.world))
         fab = ComputeFabric(ct).allocate(fill=fill_pattern)
         assert_all_ok(_run_threads(P.world, lambda r: __import__(
-            "gdtensor.api", fromlist=["d_tensors_view_rank_save"]).d_tensors_view_rank_save(
+            "gdtensor._api", fromlist=["d_tensors_view_rank_save"]).d_tensors_view_rank_save(
             r, compute_view(ct, fab, list(order)[r]), sv)))
     assert _snapshot_bytes(r1) == _snapshot_bytes(r2)
 
@@ -121,11 +121,11 @@ def test_plan_and_bytes_are_hash_seed_independent(tmp_path):
         """
         import hashlib, os, sys
         sys.path.insert(0, "tests"); sys.path.insert(0, ".")
-        from gdtensor.formats import make_storage_view
-        from gdtensor.models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
-        from gdtensor.plan import d_tensors_view_rank_plan_save
-        from gdtensor.runner import compute_view, save_threads
-        from gdtensor.views import ComputeFabric
+        from gdtensor._formats import make_storage_view
+        from gdtensor._models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
+        from gdtensor._plan import d_tensors_view_rank_plan_save
+        from gdtensor._runner import compute_view, save_threads
+        from gdtensor._views import ComputeFabric
         m = ModelConfig(layers=2, hidden=16, ffn=32, vocab=64)
         p = ParallelConfig(tp=2, dp=2, pp=1)
         ct = compute_table(m, p); st = storage_table(ct, p, "hf")

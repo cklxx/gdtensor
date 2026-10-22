@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .mesh import ArrangedMesh, LiteralMesh, SlicedMesh
+from ._mesh import ArrangedMesh, LiteralMesh, SlicedMesh
 from .tag import ConstraintViolationError, Ok
 
 _HOOKS = {}
@@ -96,7 +96,7 @@ def _naive(o):
 
 
 def resolve_shape(mesh):
-    from .mesh import (OuterProductMesh, PermutedMesh, ReshapedMesh, SlicedMesh)
+    from ._mesh import (OuterProductMesh, PermutedMesh, ReshapedMesh, SlicedMesh)
     if isinstance(mesh, (ArrangedMesh, LiteralMesh)):
         return (getattr(mesh, "size", None) or mesh.max_,)
     if isinstance(mesh, OuterProductMesh):
@@ -155,7 +155,7 @@ def _list(o):
     if not o.disjoint_storage_mesh_list:
         return _err(o, "list_non_empty", "mesh list is empty")
     seen = set()
-    from .mesh import storage_mesh_cells
+    from ._mesh import storage_mesh_cells
     for m in o.disjoint_storage_mesh_list:
         c = storage_mesh_cells(m)
         if seen & c:
@@ -166,7 +166,7 @@ def _list(o):
 
 @register_hook("PhysicalLayoutTable")
 def _layout(o):
-    from .layout import leader_tensor_component_pos_of
+    from ._layout import leader_tensor_component_pos_of
     if o.container_format not in ("safetensors", "distcp"):
         return _err(o, "container_format", f"unknown format {o.container_format}")
     seen_lists = set()

@@ -25,12 +25,12 @@ from torch.distributed.tensor import Replicate as TRep, distribute_tensor, init_
 
 from conftest import assert_all_ok  # noqa: E402
 from gdtensor.builder import get_gd_tensor, get_tensor_ids, make_gd_tensor, reset_d_tensor  # noqa: E402
-from gdtensor.dtensor import DTensorTable, NamedDTensor, named_of, global_tensor_meta_of  # noqa: E402
-from gdtensor.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
-from gdtensor.runner import compute_view, load_threads, save_threads  # noqa: E402
+from gdtensor._dtensor import DTensorTable, NamedDTensor, named_of, global_tensor_meta_of  # noqa: E402
+from gdtensor._models import ParallelConfig, layout_builder, storage_table  # noqa: E402
+from gdtensor._runner import compute_view, load_threads, save_threads  # noqa: E402
 from gdtensor.tag import Replicate, Shard  # noqa: E402
-from gdtensor.torch_bridge import torch_from_fabric, fabric_from_torch  # noqa: E402
-from gdtensor.views import ComputeFabric  # noqa: E402
+from gdtensor._torch_bridge import torch_from_fabric, fabric_from_torch  # noqa: E402
+from gdtensor._views import ComputeFabric  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("GDTENSOR_TORCH_TESTS"), reason="set GDTENSOR_TORCH_TESTS=1")
@@ -172,8 +172,8 @@ def test_lawa_meta_mismatch_is_rejected(tmp_path):
     loop that hands two differently-typed checkpoints to one view errors
     before any range selection.
     """
-    from gdtensor.api import d_tensors_view_rank_plan_save
-    from gdtensor.formats import make_storage_view
+    from gdtensor._api import d_tensors_view_rank_plan_save
+    from gdtensor._formats import make_storage_view
     mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
     v = torch.zeros(SHAPE, dtype=torch.float32)
     gd32 = make_gd_tensor(distribute_tensor(v, mesh, [TRep()]), "w",

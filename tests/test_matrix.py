@@ -8,23 +8,23 @@ import numpy as np
 import pytest
 
 from conftest import assert_all_ok, raw_header, verify_distcp_dir, verify_fabric, verify_safetensors_dir
-from gdtensor.dtensor import (
+from gdtensor._dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard, global_tensor_meta_of,
 )
-from gdtensor.formats import make_storage_view
-from gdtensor.layout import TensorComponentPos, build_layout, build_payload_index, file_path_of
-from gdtensor.mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
-from gdtensor.models import (
+from gdtensor._formats import make_storage_view
+from gdtensor._layout import TensorComponentPos, build_layout, build_payload_index, file_path_of
+from gdtensor._mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
+from gdtensor._models import (
     ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table,
 )
-from gdtensor.plan import (
+from gdtensor._plan import (
     check_compute_d_tensors_access_disjoint, check_compute_d_tensors_access_full_covering,
     check_physical_layout, check_storage_d_tensors_access_disjoint, check_storage_d_tensors_access_full_covering,
     check_storage_mesh_disjoint, d_tensors_view_rank_plan_load, d_tensors_view_rank_plan_reshard,
     d_tensors_view_rank_plan_save,
 )
-from gdtensor.runner import compute_view, load_threads, reshard_threads, run_processes, save_threads
-from gdtensor.views import ComputeFabric
+from gdtensor._runner import compute_view, load_threads, reshard_threads, run_processes, save_threads
+from gdtensor._views import ComputeFabric
 
 M = ModelConfig(layers=4, hidden=32, ffn=64, vocab=128)
 MOE = ModelConfig(layers=2, hidden=32, ffn=48, vocab=128, experts=4)
@@ -156,7 +156,7 @@ def test_reshard_storage_to_storage_hf_to_dcp(tmp_path):
     ct, st, lay, _ = roundtrip(src, M, P, "hf", "hf", "safetensors")
     st2 = storage_table(ct, P, "mirror")
     lay2 = layout_builder("per_rank", st2, P, "distcp")
-    from gdtensor.coord import ThreadCoordinator
+    from gdtensor._coord import ThreadCoordinator
     sv_src = make_storage_view(st.tensor_ids, st, lay, src)
     sv_dst = make_storage_view(st2.tensor_ids, st2, lay2, dst, coord=ThreadCoordinator(P.world))
     assert_all_ok(reshard_threads(P.world, lambda r: sv_src, lambda r: sv_dst))
@@ -263,7 +263,7 @@ def test_layout_is_deterministic_and_serializable():
     a = layout_builder("hf", st, P, "safetensors", 3)
     b = layout_builder("hf", storage_table(compute_table(MOE, P), P, "hf"), P, "safetensors", 3)
     assert json.dumps(a.to_json(), sort_keys=True) == json.dumps(b.to_json(), sort_keys=True)
-    from gdtensor.formats import safetensors_header
+    from gdtensor._formats import safetensors_header
     ia, ib = build_payload_index(st, a), build_payload_index(st, b)
     for path in ia.files:
         assert safetensors_header(st, ia, path) == safetensors_header(st, ib, path)
@@ -273,7 +273,7 @@ def test_shared_header_has_no_rank_info():
     ct = compute_table(M, P)
     st = storage_table(ct, P, "hf")
     lay = layout_builder("single", st, P, "safetensors")
-    from gdtensor.formats import safetensors_header
+    from gdtensor._formats import safetensors_header
     h = safetensors_header(st, build_payload_index(st, lay), "model.safetensors")
     assert b"slot" not in h and b"rank" not in h
 
@@ -285,8 +285,8 @@ def test_abort_on_one_rank_discards_shared_file(root):
     ct = compute_table(M, P)
     st = storage_table(ct, P, "hf")
     lay = layout_builder("single", st, P, "safetensors")
-    from gdtensor.coord import ThreadCoordinator
-    from gdtensor.runner import _run_threads
+    from gdtensor._coord import ThreadCoordinator
+    from gdtensor._runner import _run_threads
     sv = make_storage_view(st.tensor_ids, st, lay, root, coord=ThreadCoordinator(P.world))
 
     def rank_fn(r):

@@ -11,7 +11,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
 
-from .dtensor import (
+from ._dtensor import (
     DTensorTable,
     NamedDTensor,
     global_tensor_meta_of,
@@ -21,10 +21,10 @@ from .dtensor import (
     owned_intervals,
     participants_of,
 )
-from .iobackend import FileIO
-from .layout import PayloadIndex, PhysicalLayoutTable, build_payload_index
-from .ranges import RangeFromComputeView, RangeFromStorageView
-from .result import Result, ResultError, catch
+from ._iobackend import FileIO
+from ._layout import PayloadIndex, PhysicalLayoutTable, build_payload_index
+from ._ranges import RangeFromComputeView, RangeFromStorageView
+from ._result import Result, ResultError, catch
 
 Callback = Callable[[memoryview], object]
 
@@ -121,7 +121,7 @@ class ComputeDataAccessor:
 @dataclass
 class ComputeDTensorsView:
     def check_constraints(self):
-        from .constraints import check_constraints as _check
+        from ._constraints import check_constraints as _check
         return _check(self)
 
     tensor_ids: List[str]
@@ -186,7 +186,7 @@ class StorageDataAccessor:
 @dataclass
 class StorageDTensorsView:
     def check_constraints(self):
-        from .constraints import check_constraints as _check
+        from ._constraints import check_constraints as _check
         return _check(self)
 
     tensor_ids: List[str]

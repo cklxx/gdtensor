@@ -7,10 +7,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gdtensor.dtensor import iv_intersect, iv_normalize, iv_prefix, iv_subtract
-from gdtensor.plan import _pair
-from gdtensor.ranges import RangeFromComputeView, RangeFromStorageView
-from gdtensor.result import ResultError
+from gdtensor._dtensor import iv_intersect, iv_normalize, iv_prefix, iv_subtract
+from gdtensor._plan import _pair
+from gdtensor._ranges import RangeFromComputeView, RangeFromStorageView
+from gdtensor._result import ResultError
 
 
 def _iv(lst):

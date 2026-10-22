@@ -39,6 +39,6 @@ def is_storage(r: DTensorRange) -> bool:
     return isinstance(r, RangeFromStorageView)
 
 
-from .builder_mixin import attach_builders as _ab
+from ._builder_mixin import attach_builders as _ab
 _ab(RangeFromComputeView)
 _ab(RangeFromStorageView)
