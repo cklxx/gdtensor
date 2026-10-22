@@ -9,6 +9,7 @@
 | C.2 Python 3.12 Result 别名、Error union、tag、抽象接口 | `__init__.py`、`tag.py`、`session.py`、`access.py` | `test_api.py` |
 | B.1.1 IO 与 session 生命周期 | `internal/api.py` | `test_io_contract.py`；初始化、读写、finish、commit 失败与清理 |
 | B.1.2 区间配对、所有权与偏移 | `internal/plan.py`、`internal/dtensor.py`、`internal/layout.py` | `test_data_correctness.py`、`test_matrix.py`、`test_random.py`；独立切片、CRC、逐字节与覆盖计数 |
+| 多 checkpoint 组合读写与调用方合并 | `rank_save/load/reshard`；数值合并由测试调用方执行 | `test_checkpoint_merge_crc.py`；多 rank / tensor / 文件、跨格式重排、普通与加权平均、拆分再合并、源文件不变、等长 payload 跨文件交换 |
 | B.1.4 / 5.6 torch 桥 | `internal/torch_bridge.py`，仅顶层导出 | `test_torch_bridge.py`、`test_lawa.py`；真实原生 mesh、dtype、placements、reset 拒绝不一致输入 |
 | B.2.3.2 分块 buffer 回调 | `access.py`、`internal/api.py` | `test_io_contract.py`；读写分块边界不同、空分块、长度不足、越界、负长度 |
 | B.2.4 递归约束与同一错误对象返回 | `internal/constraints.py` | `test_constraints.py` |

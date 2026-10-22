@@ -37,19 +37,19 @@ def _points(world, axis):
 
 
 def _run(label, world, action):
-    print(f"[review] {label} START ranks={world}", flush=True)
+    print(f"[CRC+ARANGE][WALKTHROUGH] {label} START ranks={world}", flush=True)
     with ThreadPoolExecutor(max_workers=world) as pool:
         results = list(pool.map(action, range(world)))
     for rank, result in enumerate(results):
         assert type(result) is gt.Ok, result
-        print(f"[review] {label} rank={rank} result=Ok", flush=True)
+        print(f"[CRC+ARANGE][WALKTHROUGH] {label} rank={rank} result=Ok", flush=True)
 
 
 def _show_rank_data(label, fabric):
     for rank, buffers in fabric.buffers.items():
         values = buffers["weight"].view(np.int64).tolist()
         print(
-            f"[review] {label} rank={rank} indices={fabric.points[rank]['weight'].tolist()} values={values}",
+            f"[CRC+ARANGE][WALKTHROUGH] {label} rank={rank} indices={fabric.points[rank]['weight'].tolist()} values={values}",
             flush=True,
         )
 
@@ -59,12 +59,14 @@ def _payload(root, fmt):
     raw = path.read_bytes()
     if fmt == "distcp":
         print(
-            f"[review] metadata={json.loads((root / '.metadata').read_bytes())}",
+            f"[CRC+ARANGE][WALKTHROUGH] metadata={json.loads((root / '.metadata').read_bytes())}",
             flush=True,
         )
         return raw
     size = struct.unpack("<Q", raw[:8])[0]
-    print(f"[review] header={json.loads(raw[8 : 8 + size])}", flush=True)
+    print(
+        f"[CRC+ARANGE][WALKTHROUGH] header={json.loads(raw[8 : 8 + size])}", flush=True
+    )
     return raw[8 + size :]
 
 
@@ -72,7 +74,7 @@ def _payload(root, fmt):
 def test_small_arange_crc_and_elastic_load(tmp_path, fmt):
     values = {"weight": np.arange(12, dtype=np.int64).reshape(3, 4)}
     print(
-        f"[review] format={fmt} global_shape=[3, 4] tensors=1 global_values={values['weight'].tolist()}",
+        f"[CRC+ARANGE][WALKTHROUGH] format={fmt} global_shape=[3, 4] tensors=1 global_values={values['weight'].tolist()}",
         flush=True,
     )
     compute = ArrayFabric(_table(2, 1), _points(2, 1), values)
@@ -104,11 +106,11 @@ def test_small_arange_crc_and_elastic_load(tmp_path, fmt):
     payload = _payload(tmp_path, fmt)
     wanted = values["weight"].tobytes()
     print(
-        f"[review] payload_values={np.frombuffer(payload, dtype=np.int64).tolist()}",
+        f"[CRC+ARANGE][WALKTHROUGH] payload_values={np.frombuffer(payload, dtype=np.int64).tolist()}",
         flush=True,
     )
     print(
-        f"[review] crc32 expected={zlib.crc32(wanted):08x} actual={zlib.crc32(payload):08x} bytes={len(payload)}",
+        f"[CRC+ARANGE][WALKTHROUGH] crc32 expected={zlib.crc32(wanted):08x} actual={zlib.crc32(payload):08x} bytes={len(payload)}",
         flush=True,
     )
     assert payload == wanted
@@ -126,4 +128,7 @@ def test_small_arange_crc_and_elastic_load(tmp_path, fmt):
     )
     converted.assert_values(values)
     _show_rank_data("resharded", converted)
-    print(f"[review] format={fmt} CRC / exact bytes / load / reshard PASS", flush=True)
+    print(
+        f"[CRC+ARANGE][WALKTHROUGH] format={fmt} CRC / exact bytes / load / reshard PASS",
+        flush=True,
+    )

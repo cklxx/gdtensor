@@ -204,6 +204,10 @@ def _safetensors_regions(path):
 
 
 def _verify_crc(root, fmt, ct, p, mode, values):
+    print(
+        f"[CRC+ARANGE][VERIFY][START] directory={root.name} format={fmt} ranks={int(np.prod(p))} tensors={len(values)}",
+        flush=True,
+    )
     points = _storage_points(ct, p, mode)
     seen = {tid: np.zeros(value.size, dtype=np.int64) for tid, value in values.items()}
     for tid, slot, info, data, _, _ in _regions(root, fmt):
@@ -227,6 +231,10 @@ def _verify_crc(root, fmt, ct, p, mode, values):
         )
     for counts in seen.values():
         np.testing.assert_array_equal(counts, np.ones_like(counts))
+    print(
+        "[CRC+ARANGE][VERIFY][PASS] checks=payload_crc,exact_bytes,every_element_stored_once",
+        flush=True,
+    )
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
@@ -296,6 +304,10 @@ def test_io_crc_detects_payload_corruption(tmp_path, fmt):
     _run(int(np.prod(SRC)), lambda r: gio.rank_load(r, loaded.view(r), read_view))
     with pytest.raises(AssertionError):
         loaded.assert_values(values)
+    print(
+        f"[CRC+ARANGE][CORRUPTION][PASS] format={fmt} fault=flipped_payload_byte crc=detected arange=detected",
+        flush=True,
+    )
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
