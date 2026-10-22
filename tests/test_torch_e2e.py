@@ -15,7 +15,7 @@ import pytest
 torch = pytest.importorskip("torch", minversion="2.0")
 import torch.distributed as dist  # noqa: E402
 from torch.distributed.tensor import (  # noqa: E402
-    DTensor, Replicate as TRep, Shard as TShard, distribute_tensor, init_device_mesh,
+    Replicate as TRep, distribute_tensor, init_device_mesh,
 )
 
 import safetensors

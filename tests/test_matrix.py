@@ -1,10 +1,8 @@
 """Use case matrix of DTensorsView design section 7, plus invariants (section 6)."""
 from __future__ import annotations
 
-import json
 import os
 
-import numpy as np
 import pytest
 
 from conftest import assert_all_ok, raw_header, verify_distcp_dir, verify_fabric, verify_safetensors_dir

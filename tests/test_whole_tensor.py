@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import struct
 
-import numpy as np
 
 from gdtensor.internal.dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard
 from gdtensor.internal.formats import _whole_tensor_files, safetensors_header

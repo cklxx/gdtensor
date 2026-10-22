@@ -38,7 +38,7 @@ import numpy as np
 from .dtensor import DTensorTable, global_tensor_meta_of, nbytes_of, numel_of, owned_box
 from .iobackend import FileIO
 from .layout import PayloadIndex, PhysicalLayoutTable, SlotPayload, TensorComponentPos, build_payload_index, pos_key
-from .result import Fail, catch, invalid, io_error, not_found
+from .result import catch, invalid, io_error, not_found
 from ..session import StorageLoadSession, StorageSaveSession
 
 METADATA_NAME = ".metadata"

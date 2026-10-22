@@ -24,9 +24,8 @@ from .dtensor import (
     participants_of,
     tensor_ids_of,
 )
-from .mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh, is_multi_tensors_storage_mesh, storage_mesh_cells
+from .mesh import is_multi_tensors_storage_mesh, storage_mesh_cells
 from .result import catch, invalid, not_found
-from ..tag import TensorCount, WorldSize
 
 
 def _cc(self):

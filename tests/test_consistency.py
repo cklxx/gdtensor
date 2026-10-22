@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import os
 
-import numpy as np
-import pytest
 
 from conftest import assert_all_ok
 from gdtensor.internal.dtensor import tensor_ids_of as _ids  # noqa: E402
@@ -113,7 +111,6 @@ def test_plan_is_pure_and_order_independent():
 
 def test_plan_and_bytes_are_hash_seed_independent(tmp_path):
     """Save plans and published bytes must match across PYTHONHASHSEED values."""
-    import hashlib
     import subprocess
     import sys
     import textwrap

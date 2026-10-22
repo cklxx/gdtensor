@@ -9,19 +9,15 @@ invariant at a time.
 from __future__ import annotations
 
 import copy
-import os
 
-import numpy as np
 import pytest
 
-from conftest import assert_all_ok
 from gdtensor.internal.api import d_tensors_view_rank_plan_reshard
 from gdtensor.internal.dtensor import tensor_ids_of as _ids
 from gdtensor.internal.layout import (
-    DisjointStorageMeshList, PhysicalLayoutTable, TensorComponentPos, build_payload_index,
-    leader_tensor_component_pos_of,
+    DisjointStorageMeshList, PhysicalLayoutTable, TensorComponentPos, leader_tensor_component_pos_of,
 )
-from gdtensor.internal.mesh import ArrangedMesh, storage_mesh_cells
+from gdtensor.internal.mesh import ArrangedMesh
 from gdtensor.tag import ConstantOne, TensorCount, WorldSize
 from gdtensor.internal.models import ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table
 
