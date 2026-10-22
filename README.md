@@ -28,6 +28,8 @@ IO 使用 session 的 `init_data_accessor()`。自定义 accessor 不需要内�
 | `test_data_correctness.py` | 独立稠密切片与文件解码，CRC、arange、每元素恰好存一次；五种布局、两种格式、跨 world 加载与四种 reshard 方向；最多 32 rank / 64 tensor |
 | `test_checkpoint_merge_crc.py` | 3 个 checkpoint，3→5→2 / 8→6→4 / 16→12→8 rank，16/24/32 个小张量；混合格式重排、普通/加权平均、多文件拆分与单文件合并；CRC、逐字节、源文件不变及等长 payload 跨文件错位检测 |
 | `test_serial_parallel_crc.py` | 单 rank 写基线，对比 3/8/16 rank 并发写；完整张量和统一布局后的文件逐字节一致；交叉读取、顺序/并发读取一致；交换两个 rank 分片时必须检出拼错 |
+| `test_plan_behavior.py` | 通过公开 IO 的 accessor 回调核对手算区间；6 种搬运方向、乱序 rank、空分片、packed payload 偏移、5 个 tensor 的 replica 去重及缺源时不开 session |
+| `test_parallel_modes.py` | TP / DP / EP / PP、TP+DP、TP+EP、PP+EP、PP+DP+EP+TP；跨拓扑和格式、expert 归属变更、optimizer 分片、串行整文件对照；34 个用例，最多 16 个线程 rank |
 | `test_matrix.py` | world≤8 的 38 种 PP/DP/TP 配置 × 七种布局模式 × 两种格式；自拷贝、启动顺序、空张量 |
 | `test_random.py` | 32 个固定随机种子 × 两种格式，随机形状与 rank 排列 |
 | `test_torch_bridge.py`、`test_lawa.py` | 真实 torch.DTensor；2/4/8/16/32 个进程，最多 64 个 tensor；k=1/2/3/5，朴素与 Welford 平均，原生及逆序 mesh |
@@ -89,6 +91,25 @@ CRC 只计算 payload 字节。独立 oracle 同时逐字节比较，并为每�
 损坏用例先正常保存，再交换两个文件中长度相同、内容不同的 payload 区域。文件名、header 和区域长度保持不变。测试要求独立 CRC 检查失败，再执行 `rank_load`，要求读回值检查也失败。此用例显示 `PASSED` 表示两个检测器都抓到了损坏。当前 IO 按 range 搬运字节，测试中的独立 oracle 执行数据校验。
 
 相关日志统一以 `[CRC+ARANGE]` 开头。`[CASE][START]` 给出模拟 rank 数、tensor 数和权重；`[SAVE_CHECKPOINT]`、`[REPACK_CHECKPOINT]`、`[SAVE_MERGED]`、`[CONSOLIDATE_FILES]` 给出文件数、格式和 payload CRC。`[VERIFY][PASS]` 表示 CRC、精确字节和元素覆盖检查通过；`[LOAD_REPACKED][PASS]` / `[LOAD_CONSOLIDATED][PASS]` 表示各 rank 读回值和源文件不变检查通过。`[TENSOR_MEAN][PASS]` 给出数值合并公式。`[CASE][INPUT]` 打印基础 arange，`[CHECKPOINT_INPUT]` 打印每份输入；`[CASE][PASS]` 打印前 12 个合并期望值和 rank 0 实际读回值。`[CORRUPTION][PASS] crc=detected arange=detected` 表示两个检测器都按预期发现了损坏。每条 `PASS` 都在对应断言通过后输出。
+
+### TP / DP / EP / PP 测试的含义
+
+`test_parallel_modes.py` 把 rank 排列为 `(PP, DP, EP, TP)`。这里的 EP 是测试调用方构造的独立 mesh 维度，不修改核心 API，也不修改 sim 里将 EP 折叠到 DP/TP 的模型约定。dense 权重在 DP、EP 上复制，在 TP 上按行或列切分；expert `e` 只放在 `e % EP` 组内，再按 TP 切分；PP 按 `layer % PP` 放置完整张量；optimizer 的扁平底层张量同时按 DP、TP 切分。
+
+| 模式 | 源 `(PP, DP, EP, TP)` | 目标 `(PP, DP, EP, TP)` |
+|---|---|---|
+| TP | `(1,1,1,3)` | `(1,1,1,2)` |
+| DP | `(1,3,1,1)` | `(1,2,1,1)` |
+| EP | `(1,1,3,1)` | `(1,1,2,1)` |
+| PP | `(3,1,1,1)` | `(2,1,1,1)` |
+| TP+DP | `(1,2,1,3)` | `(1,3,1,2)` |
+| TP+EP | `(1,1,2,3)` | `(1,1,3,2)` |
+| PP+EP | `(2,1,3,1)` | `(3,1,2,1)` |
+| PP+DP+EP+TP | `(2,2,2,2)` | `(2,1,3,2)` |
+
+每个配置包含 11 个 I64 张量，单张量最多 15 个元素，含 5 个 expert、单元素和空张量。值是 `arange + tensor_order * 1000`，用于区分张量。8 个配置 × 2 种格式 × 每 rank 多文件 / 每 stage 文件，共 32 个正常用例。每例执行并发 save、换拓扑 load、compute reshard、跨格式 storage reshard，再统一为单 rank 单文件，与直接串行保存的文件逐字节比较，包含 header 和 metadata。每次落盘还独立检查 CRC、原始字节和每元素恰好存一份，检查读源文件不变。
+
+另有 2 个负例故意交换不同文件中的两个 expert payload。要求 CRC 和读回值检查都检出错误，日志标为 `[EXPECTED_MISMATCH]`。正常日志用 `[CRC+ARANGE][PARALLEL_MODES]`，打印拓扑、expert 的 PP/EP 归属、owner ranks、全局元素下标和本地实际值。这些是 checkpoint 分片与搬运测试，rank 由线程模拟；不执行训练、MoE token routing 或梯度通信。
 
 ## 本地检查
 

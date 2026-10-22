@@ -9,6 +9,9 @@
 | C.2 Python 3.12 Result 别名、Error union、tag、抽象接口 | `__init__.py`、`tag.py`、`session.py`、`access.py` | `test_api.py` |
 | B.1.1 IO 与 session 生命周期 | `internal/api.py` | `test_io_contract.py`；初始化、读写、finish、commit 失败与清理 |
 | B.1.2 区间配对、所有权与偏移 | `internal/plan.py`、`internal/dtensor.py`、`internal/layout.py` | `test_data_correctness.py`、`test_matrix.py`、`test_random.py`；独立切片、CRC、逐字节与覆盖计数 |
+| B.1.2 / B.1.3 内部接口声明 | `internal/plan.py` 的 3 个 plan 和 5 个 check | `test_api_conformance.py` 只解析源码，与设计逐项核对名称、参数和 Result 注解，不导入内部 API |
+| plan 的公开可观测行为 | `rank_save/load/reshard` → accessor | `test_plan_behavior.py`；手算 2×5 I16 区间、乱序 rank、空分片、packed 偏移、replica 去重、表顺序和缺源时不开 session |
+| TP / DP / EP / PP 及混合配置的 checkpoint 搬运 | 测试调用方构造四维 mesh，核心仍只处理设计中的 view | `test_parallel_modes.py`；32 个跨拓扑 / 格式 / 文件布局用例及 2 个交换 expert 负例；每 rank 实际值、CRC、覆盖一次、串行整文件一致；线程模拟，不覆盖训练通信 |
 | 多 checkpoint 组合读写与调用方合并 | `rank_save/load/reshard`；数值合并由测试调用方执行 | `test_checkpoint_merge_crc.py`；多 rank / tensor / 文件、跨格式重排、普通与加权平均、拆分再合并、源文件不变、等长 payload 跨文件交换 |
 | 串行/并行读写一致性与分片重建 | `rank_save/load/reshard`，无数值平均 | `test_serial_parallel_crc.py`；独立重建张量与单 rank 基线对照、统一布局后整文件逐字节对照、交叉读取、顺序/并发读取对照、交换 rank 分片负例 |
 | B.1.4 / 5.6 torch 桥 | `internal/torch_bridge.py`，仅顶层导出 | `test_torch_bridge.py`、`test_lawa.py`；真实原生 mesh、dtype、placements、reset 拒绝不一致输入 |
@@ -29,5 +32,9 @@
 - view map 只包装 `begin_save/load`。rank IO 打开 session 后执行转换，使用返回的替换 session。转换失败立即清理原 session；正常提交或结束由 rank IO 执行。
 
 `test_constraints.py` 验证行数、表顺序和跨张量文件 leader。`test_io_contract.py` 验证延迟转换、替换 session、转换失败和清理失败。sim 与测试均由 AST 检查禁止导入核心内部模块。
+
+内部 check 的源码审查修复：未知 tensor / file、负 offset / size 和越界访问返回 `CheckFailedError`；storage range 按文件的连续 payload 校验，不额外限制它不能跨相邻 slot；空 payload 的 `(0, 0)` range 合法。covering 检查覆盖范围，重复访问由独立的 disjoint 检查判断。删除未列入设计且无调用方的 `check_physical_layout`，保留对象的 `check_constraints`。
+
+这 5 个内部 check 当前没有对外 API 调用路径。按所有测试只用对外 API 的要求，本轮对它们做源码与边界推导审查，并检查声明，不宣称做了直接行为测试。plan 的行为通过公开 IO 测试验证。无效物理 mesh 在公开 `check_constraints` 路径返回 `ConstraintViolationError`，不再向调用方抛出 Python 异常。
 
 形式化制品仅验证抽象模型。本次重构的正确性证据是设计 API 测试、独立数据 oracle、真实 torch 进程和行为变异；不宣称完成了真实 1000 rank 或完整 DeepSeek 模型验证。

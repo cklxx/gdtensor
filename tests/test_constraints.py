@@ -164,3 +164,28 @@ def test_valid_storage_view_and_equal_physical_lists_pass_constraints():
     )
     view.physical_layout.tensor_entries[gb.TensorComponentPos("w", 0)] = copied
     assert type(view.check_constraints()) is gt.Ok
+
+
+@pytest.mark.parametrize("transform", ["reshape", "empty_slice", "zero_step"])
+def test_physical_list_returns_constraint_error_for_invalid_mesh(transform):
+    base = gb.OuterProductMesh(
+        gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(2))
+    )
+    if transform == "reshape":
+        mesh = gb.ReshapedMesh(base, [3])
+    elif transform == "empty_slice":
+        mesh = gb.SlicedMesh(base, [None, gb.Slice(0, 0)])
+    else:
+        mesh = gb.SlicedMesh(base, [None, gb.Slice(step=0)])
+    group = gb.DisjointStorageMeshList([mesh], ["w"])
+    result = group.check_constraints()
+    assert type(result) is gt.Err and type(result.value) is gb.ConstraintViolationError
+    assert result.value.type_name == "DisjointStorageMeshList"
+    assert result.value.constraint_name == "meshes_disjoint" and result.value.msg
+    pos = gb.TensorComponentPos("w", 0)
+    layout = gb.PhysicalLayoutTable("safetensors", {pos: group}, {pos: "memory"})
+    assert layout.check_constraints() == result
+    print(
+        f"[CONSTRAINTS][EXPECTED_ERROR] invalid_mesh={transform} error={result.value}",
+        flush=True,
+    )
