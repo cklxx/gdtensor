@@ -10,7 +10,6 @@ import collections
 import os
 import sys
 
-import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -155,7 +154,6 @@ def test_zero_flat_shard_size(tmp_path):
     p, ct = _qwen3_layer0_table(4)
     # q_norm m state: FP32, 128 elems = 512 B; split over TP=4 -> 128 B each.
     from gdtensor.internal.dtensor import ReshapedDTensor
-    import numpy as np
     flat = GlobalTensorMeta((128,), "F32", 4)
     m = NamedDTensor("q_norm.exp_avg", ReshapedDTensor(
         NaiveDTensor(flat, (Replicate(), Replicate(), Shard(0)), compute_mesh(p, 0)), (128,)))

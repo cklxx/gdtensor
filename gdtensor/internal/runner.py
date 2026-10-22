@@ -7,19 +7,15 @@ pwrite; they support save and load only.
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
-import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Optional
 
 from .api import d_tensors_view_rank_load, d_tensors_view_rank_reshard, d_tensors_view_rank_save
 from .coord import ProcessCoordinator, ThreadCoordinator
 from .dtensor import DTensorTable, tensor_ids_of
 from .formats import make_storage_view
 from .iobackend import FileIO
-from .layout import PhysicalLayoutTable
 from .result import Err, Ok
 from .views import ComputeDataAccessor, ComputeDTensorsView, ComputeFabric
 

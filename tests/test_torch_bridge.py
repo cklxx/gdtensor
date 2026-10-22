@@ -13,7 +13,7 @@ import pytest
 
 torch = pytest.importorskip("torch", minversion="2.0")
 from torch.distributed.tensor import (  # noqa: E402
-    DTensor, Replicate as TRep, Shard as TShard, distribute_tensor, init_device_mesh,
+    Replicate as TRep, Shard as TShard, distribute_tensor, init_device_mesh,
 )
 
 import torch.distributed as dist  # noqa: E402
@@ -27,8 +27,7 @@ from gdtensor.internal.torch_bridge import (  # noqa: E402
     fabric_from_torch, gather_global_bytes, global_bytes_of_dtensor,
     parallel_config_from_mesh, torch_from_fabric, torch_placement_to_gd,
 )
-from gdtensor.builder import InvalidArgumentError  # noqa: E402
-from gdtensor.tag import Ok, Replicate, Shard  # noqa: E402
+from gdtensor.tag import Replicate, Shard  # noqa: E402
 from gdtensor.internal.torch_bridge import gd_for_layout  # noqa: E402
 
 pytestmark = pytest.mark.skipif(

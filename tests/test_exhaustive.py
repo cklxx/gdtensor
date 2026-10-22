@@ -15,14 +15,11 @@ No IO is performed, so thousands of configurations are cheap.
 from __future__ import annotations
 
 import itertools
-import os
 
-import numpy as np
 import pytest
 
 from gdtensor.internal.dtensor import tensor_ids_of as _ids  # noqa: E402
 from gdtensor.internal.formats import make_storage_view
-from gdtensor.internal.layout import build_payload_index
 from gdtensor.internal.models import (
     ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table,
 )

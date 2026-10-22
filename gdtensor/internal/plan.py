@@ -14,14 +14,13 @@ Who writes what:
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 
 from .dtensor import (
     EMPTY,
     DTensorTable,
-    NamedDTensor,
     global_tensor_meta_of,
     iv_intersect,
     iv_normalize,

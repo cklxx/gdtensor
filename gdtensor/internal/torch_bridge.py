@@ -21,15 +21,15 @@ exercised without a multi-process torch job.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 
 from .dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
-    global_tensor_meta_of, named_of, nbytes_of, owned_intervals,
+    global_tensor_meta_of, named_of, nbytes_of,
 )
-from .result import Fail, InvalidArgumentError, catch
+from .result import Fail, InvalidArgumentError
 from ..tag import Ok, Replicate, Shard
 from .views import ComputeFabric
 
@@ -162,7 +162,6 @@ def gd_tensor_reset(gd, d_tensor) -> None:
 
 
 def _make(d_tensor, tensor_id: str, p=None, stage: int = 0, placements=None):
-    import torch
     dt = d_tensor
     if not hasattr(dt, "device_mesh") or not hasattr(dt, "placements"):
         raise Fail(InvalidArgumentError(argument_name="d_tensor", msg="input is not a torch.DTensor"))

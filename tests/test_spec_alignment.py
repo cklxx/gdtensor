@@ -32,7 +32,7 @@ from gdtensor.builder import (
     InvalidArgumentError, NotFoundError,
 )
 from gdtensor.tag import (
-    Box, ConstantOne, Err, Ok, Partial, Replicate, Shard, TensorCount, WorldSize,
+    Box, ConstantOne, Err, Ok, Replicate, Shard, TensorCount, WorldSize,
 )
 from gdtensor.internal.views import ComputeFabric
 

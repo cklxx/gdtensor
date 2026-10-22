@@ -11,8 +11,8 @@ NaiveDTensor has three placements.
 from __future__ import annotations
 
 import zlib
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -30,7 +30,7 @@ from .dtensor import (
 from .dtensor import nbytes_of
 from .layout import ContainerFormat, PhysicalLayoutTable, build_layout
 from .mesh import ArrangedMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh
-from ..tag import ConstantOne, TensorCount, WorldSize
+from ..tag import ConstantOne, WorldSize
 
 R = Replicate()
 
