@@ -16,7 +16,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .dtensor import (
+from gdtensor.internal.dtensor import (
     DTensorTable,
     GlobalTensorMeta,
     NaiveDTensor,
@@ -27,10 +27,10 @@ from .dtensor import (
     global_tensor_meta_of,
     naive_of,
 )
-from .dtensor import nbytes_of
-from .layout import ContainerFormat, PhysicalLayoutTable, build_layout
-from .mesh import ArrangedMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh
-from ..tag import ConstantOne, WorldSize
+from gdtensor.internal.dtensor import nbytes_of
+from gdtensor.internal.layout import ContainerFormat, PhysicalLayoutTable, build_layout
+from gdtensor.internal.mesh import ArrangedMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh
+from gdtensor.tag import ConstantOne, WorldSize
 
 R = Replicate()
 

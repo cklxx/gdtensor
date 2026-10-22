@@ -18,13 +18,13 @@ import os
 
 from conftest import assert_all_ok
 from gdtensor.internal.dtensor import tensor_ids_of as _ids  # noqa: E402
-from gdtensor.internal.coord import ThreadCoordinator
+from gdtensor_sim.coord import ThreadCoordinator
 from gdtensor.internal.formats import make_storage_view
-from gdtensor.internal.models import (
+from gdtensor_sim.models import (
     ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table,
 )
 from gdtensor.internal.plan import d_tensors_view_rank_plan_load, d_tensors_view_rank_plan_save
-from gdtensor.internal.runner import _run_threads, compute_view, run_processes, save_threads
+from gdtensor_sim.runner import _run_threads, compute_view, run_processes, save_threads
 from gdtensor.internal.views import ComputeDataAccessor, ComputeFabric
 
 M = ModelConfig(layers=2, hidden=16, ffn=32, vocab=64)
@@ -120,9 +120,9 @@ def test_plan_and_bytes_are_hash_seed_independent(tmp_path):
         import hashlib, os, sys
         sys.path.insert(0, "tests"); sys.path.insert(0, ".")
         from gdtensor.internal.formats import make_storage_view
-        from gdtensor.internal.models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
+        from gdtensor_sim.models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
         from gdtensor.internal.plan import d_tensors_view_rank_plan_save
-        from gdtensor.internal.runner import compute_view, save_threads
+        from gdtensor_sim.runner import compute_view, save_threads
         from gdtensor.internal.views import ComputeFabric
         m = ModelConfig(layers=2, hidden=16, ffn=32, vocab=64)
         p = ParallelConfig(tp=2, dp=2, pp=1)

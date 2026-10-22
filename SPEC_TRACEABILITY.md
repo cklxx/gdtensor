@@ -35,6 +35,10 @@
 - 无对象存储 multipart / 重试 / 真实分布式 barrier 之外的存储实现。
 - 不内置布局策略：布局由业务层构造。
 
+## 包边界
+
+发布包 `gdtensor/` 只含设计核心（公开五 namespace + `internal/` 实现）。业务模型构造、布局 builder、单进程多 rank runner、线程/进程协调与仿真 CLI 在测试侧 `gdtensor_sim/` 包（设计 4.3），通过 `python -m gdtensor_sim.sim` 运行，不随核心发布；测试经 `sys.path` 引入该包。
+
 ## 形式化验证（抽象层）
 
 | 制品 | 覆盖 |

@@ -11,13 +11,13 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Optional
 
-from .api import d_tensors_view_rank_load, d_tensors_view_rank_reshard, d_tensors_view_rank_save
+from gdtensor.internal.api import d_tensors_view_rank_load, d_tensors_view_rank_reshard, d_tensors_view_rank_save
 from .coord import ProcessCoordinator, ThreadCoordinator
-from .dtensor import DTensorTable, tensor_ids_of
-from .formats import make_storage_view
-from .iobackend import FileIO
-from .result import Err, Ok
-from .views import ComputeDataAccessor, ComputeDTensorsView, ComputeFabric
+from gdtensor.internal.dtensor import DTensorTable, tensor_ids_of
+from gdtensor.internal.formats import make_storage_view
+from gdtensor.internal.iobackend import FileIO
+from gdtensor.internal.result import Err, Ok
+from gdtensor.internal.views import ComputeDataAccessor, ComputeDTensorsView, ComputeFabric
 
 
 def compute_view(table: DTensorTable, fabric: ComputeFabric, rank: int) -> ComputeDTensorsView:

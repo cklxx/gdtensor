@@ -27,8 +27,8 @@ from gdtensor.internal.dtensor import tensor_ids_of as _ids  # noqa: E402
 from gdtensor.builder import get_gd_tensor, get_tensor_ids, reset_d_tensor  # noqa: E402
 from gdtensor.internal.torch_bridge import gd_for_layout  # noqa: E402
 from gdtensor.internal.dtensor import DTensorTable, NamedDTensor  # noqa: E402
-from gdtensor.internal.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
-from gdtensor.internal.runner import compute_view, load_threads, save_threads  # noqa: E402
+from gdtensor_sim.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
+from gdtensor_sim.runner import compute_view, load_threads, save_threads  # noqa: E402
 from gdtensor.tag import Replicate, Shard  # noqa: E402
 from gdtensor.internal.torch_bridge import torch_from_fabric, fabric_from_torch  # noqa: E402
 from gdtensor.internal.views import ComputeFabric  # noqa: E402

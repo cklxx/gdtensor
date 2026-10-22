@@ -22,10 +22,10 @@ from gdtensor.internal.mesh import (
     ArrangedMesh, LiteralMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh,
     resolve_compute_mesh, resolve_storage_mesh, storage_mesh_cells,
 )
-from gdtensor.internal.models import (
+from gdtensor_sim.models import (
     ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table,
 )
-from gdtensor.internal.runner import compute_view
+from gdtensor_sim.runner import compute_view
 from gdtensor.session import StorageLoadSession, StorageSaveSession
 from gdtensor.builder import (
     CheckFailedError, ConstraintViolationError, GDTensorIOError,
@@ -199,8 +199,8 @@ def test_get_and_reset_d_tensor_metadata_only():
 def test_concrete_sessions_are_spec_subclasses(tmp_path):
     import os
     from conftest import assert_all_ok
-    from gdtensor.internal.models import fill_pattern
-    from gdtensor.internal.runner import save_threads
+    from gdtensor_sim.models import fill_pattern
+    from gdtensor_sim.runner import save_threads
     from gdtensor.tag import Ok
     p = ParallelConfig(tp=1, dp=1, pp=1)
     ct = compute_table(M, p)

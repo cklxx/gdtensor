@@ -2,7 +2,7 @@
 
 结论：gdtensor 是通用分布式张量库，严格实现 DTensorsView 设计的抽象。三层为逻辑层（`DTensorTable`、`NamedDTensor`、mesh）、物理层（`PhysicalLayoutTable`、`DisjointStorageMeshList`、`ContainerFormat`）、执行层（`DTensorRange`、`CopyPlan`、plan、session、accessor）。
 
-公开 API 以设计附录 C.3 / C.4 为准，未列出的符号均为内部实现（模块名带 `_` 前缀）。
+公开 API 以设计附录 C.3 / C.4 为准。发布包 `gdtensor/` 只含设计核心，实现细节在 `gdtensor/internal/`，不对外承诺稳定。
 
 ## 公开 API
 
@@ -15,7 +15,7 @@
 | `gdtensor.access` | `DTensorDataAccessor` |
 | `gdtensor.tag` | `Ok` `Err` `Shard` `Replicate` `Partial` `ConstantOne` `TensorCount` `WorldSize` `Box` |
 
-不在公开 API：业务模型构造（`gdtensor._models`）、仿真 CLI（`gdtensor._sim`）、多 rank runner、文件 IO、plan/check、区间与所有权运算、torch 虚拟拓扑辅助 `gd_for_layout`。
+不在发布包：业务模型构造、仿真 CLI、多 rank runner、线程/进程协调在测试侧的 `gdtensor_sim/` 包（设计 4.3：builder 在核心之外）。文件 IO、plan/check、区间与所有权运算、torch 虚拟拓扑辅助 `gd_for_layout` 是 `gdtensor` 的内部实现。
 
 ## 文件格式
 
@@ -26,10 +26,10 @@
 
 save 终态为 commit 或 abort；load 只有 finish。commit 结果未知时保留 payload，abort 不删除最终路径。
 
-## 仿真 CLI（内部工具）
+## 仿真 CLI（测试侧工具，不在发布包内）
 
 ```bash
-python3 -m gdtensor.internal.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer \
+python3 -m gdtensor_sim.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer \
   --layout hf --format safetensors
 ```
 
@@ -51,7 +51,7 @@ python3 -m gdtensor.internal.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer
 | `test_torch_bridge.py` `test_torch_e2e.py` `test_lawa_merge.py` | 真实 torch.DTensor（2.12+）桥与 LAWA，门控 `GDTENSOR_TORCH_TESTS=1` |
 | `tests/mutation_check.py` | 核心区间/plan/layout 变异，13 个有效变异全部被杀 |
 
-形式化验证：`formal/tla/CopyPlan.tcl`（TLC）建模 save/load/reshard 的非交并覆盖与原子发布；`formal/lean/ShardAlgebra.lean` 机器证明分片代数。
+形式化验证：`formal/tla/CopyPlan.tla`（TLC）建模 save/load/reshard 的非交并覆盖与原子发布；`formal/lean/ShardAlgebra.lean` 机器证明分片代数。
 
 ## 边界
 

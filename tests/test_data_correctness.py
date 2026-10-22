@@ -37,14 +37,14 @@ import gdtensor.builder as gb  # noqa: E402
 import gdtensor.tag as gt  # noqa: E402
 
 # ---- test-harness / business layer only (design 4.3: builders live outside the core)
-from gdtensor.internal.coord import ThreadCoordinator  # noqa: E402
+from gdtensor_sim.coord import ThreadCoordinator  # noqa: E402
 from gdtensor.internal.dtensor import owned_intervals, tensor_ids_of  # noqa: E402
 from gdtensor.internal.formats import make_storage_view  # noqa: E402
-from gdtensor.internal.models import (  # noqa: E402
+from gdtensor_sim.models import (  # noqa: E402
     ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder,
     pattern_bytes, storage_table, tensor_seed,
 )
-from gdtensor.internal.runner import compute_view  # noqa: E402
+from gdtensor_sim.runner import compute_view  # noqa: E402
 from gdtensor.internal.views import ComputeFabric  # noqa: E402
 
 M = ModelConfig(layers=2, hidden=64, ffn=128, vocab=256)

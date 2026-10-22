@@ -22,8 +22,8 @@ import safetensors
 from conftest import assert_all_ok  # noqa: E402
 from gdtensor.internal.torch_bridge import gd_for_layout  # noqa: E402
 from gdtensor.internal.dtensor import DTensorTable, NamedDTensor  # noqa: E402
-from gdtensor.internal.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
-from gdtensor.internal.runner import load_threads, save_threads  # noqa: E402
+from gdtensor_sim.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
+from gdtensor_sim.runner import load_threads, save_threads  # noqa: E402
 from gdtensor.tag import Replicate, Shard  # noqa: E402
 from gdtensor.internal.torch_bridge import fabric_from_torch, torch_from_fabric  # noqa: E402
 from gdtensor.internal.views import ComputeFabric  # noqa: E402

@@ -21,8 +21,8 @@ import torch.distributed as dist  # noqa: E402
 from conftest import assert_all_ok  # noqa: E402
 from gdtensor.builder import get_d_tensor, get_gd_tensor  # noqa: E402
 from gdtensor.internal.dtensor import DTensorTable, NamedDTensor  # noqa: E402
-from gdtensor.internal.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
-from gdtensor.internal.runner import save_threads  # noqa: E402
+from gdtensor_sim.models import ParallelConfig, layout_builder, storage_table  # noqa: E402
+from gdtensor_sim.runner import save_threads  # noqa: E402
 from gdtensor.internal.torch_bridge import (  # noqa: E402
     fabric_from_torch, gather_global_bytes, global_bytes_of_dtensor,
     parallel_config_from_mesh, torch_from_fabric, torch_placement_to_gd,
@@ -87,7 +87,7 @@ def test_gd_for_layout_from_torch_dtensor():
 
 def test_roundtrip_through_safetensors(tmp_path):
     """torch DTensor -> gdtensor fabric -> save -> load -> torch tensor."""
-    from gdtensor.internal.runner import load_threads
+    from gdtensor_sim.runner import load_threads
 
     p = ParallelConfig(tp=1, dp=4, pp=1)
     mesh = _mesh((1,), ("dp",))
@@ -143,7 +143,7 @@ def test_get_gd_tensor_roundtrip_id():
     dt = distribute_tensor(g, mesh, [TRep()])
     gd = gd_for_layout(dt, "x", p=p).unwrap()
     table = DTensorTable([NamedDTensor("x", gd)])
-    from gdtensor.internal.runner import compute_view
+    from gdtensor_sim.runner import compute_view
     from gdtensor.internal.views import ComputeFabric
     fab = ComputeFabric(table).allocate()
     view = compute_view(table, fab, 0)

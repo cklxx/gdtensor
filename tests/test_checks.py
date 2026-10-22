@@ -19,7 +19,7 @@ from gdtensor.internal.layout import (
 )
 from gdtensor.internal.mesh import ArrangedMesh
 from gdtensor.tag import ConstantOne, TensorCount, WorldSize
-from gdtensor.internal.models import ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table
+from gdtensor_sim.models import ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table
 
 M = ModelConfig(layers=4, hidden=32, ffn=64, vocab=128)
 MOE = ModelConfig(layers=2, hidden=32, ffn=48, vocab=128, experts=4)
@@ -31,7 +31,7 @@ from gdtensor.internal.plan import (
 )
 from gdtensor.internal.ranges import RangeFromComputeView, RangeFromStorageView
 from gdtensor.internal.formats import make_storage_view
-from gdtensor.internal.runner import compute_view
+from gdtensor_sim.runner import compute_view
 from gdtensor.internal.views import ComputeFabric
 
 

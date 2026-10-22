@@ -14,7 +14,7 @@ from gdtensor.internal.dtensor import DTensorTable, GlobalTensorMeta, NaiveDTens
 from gdtensor.internal.formats import _whole_tensor_files, safetensors_header
 from gdtensor.internal.layout import build_layout, build_payload_index
 from gdtensor.internal.mesh import Slice
-from gdtensor.internal.models import storage_mesh
+from gdtensor_sim.models import storage_mesh
 
 
 def _strided_table(world=2):
