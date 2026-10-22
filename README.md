@@ -27,6 +27,7 @@ IO 使用 session 的 `init_data_accessor()`。自定义 accessor 不需要内�
 | `test_io_contract.py` | 自定义 session/accessor、六种 IO 方向、分块回调、失败清理、提交结果未知、view map |
 | `test_data_correctness.py` | 独立稠密切片与文件解码，CRC、arange、每元素恰好存一次；五种布局、两种格式、跨 world 加载与四种 reshard 方向；最多 32 rank / 64 tensor |
 | `test_checkpoint_merge_crc.py` | 3 个 checkpoint，3→5→2 / 8→6→4 / 16→12→8 rank，16/24/32 个小张量；混合格式重排、普通/加权平均、多文件拆分与单文件合并；CRC、逐字节、源文件不变及等长 payload 跨文件错位检测 |
+| `test_serial_parallel_crc.py` | 单 rank 写基线，对比 3/8/16 rank 并发写；完整张量和统一布局后的文件逐字节一致；交叉读取、顺序/并发读取一致；交换两个 rank 分片时必须检出拼错 |
 | `test_matrix.py` | world≤8 的 38 种 PP/DP/TP 配置 × 七种布局模式 × 两种格式；自拷贝、启动顺序、空张量 |
 | `test_random.py` | 32 个固定随机种子 × 两种格式，随机形状与 rank 排列 |
 | `test_torch_bridge.py`、`test_lawa.py` | 真实 torch.DTensor；2/4/8/16/32 个进程，最多 64 个 tensor；k=1/2/3/5，朴素与 Welford 平均，原生及逆序 mesh |
@@ -35,6 +36,25 @@ IO 使用 session 的 `init_data_accessor()`。自定义 accessor 不需要内�
 | `mutation_check.py` | 在临时副本中执行九个行为变异，检测器只调用设计 API |
 
 CRC 和期望字节由独立的 NumPy 切片与文件解析得到，不调用核心的 ownership、interval 或 payload index。distcp 仿真实现使用 JSON metadata，不是 PyTorch DCP 的 pickle 格式。
+
+### 串行/并行一致性和分片拼接
+
+`tests/test_serial_parallel_crc.py` 直接验证“分片有没有拼错，并行读写是否与串行一致”。这组测试只使用同一批原始 arange 数据，不做平均计算。它有 12 个正常用例和 2 个交换分片的损坏用例，覆盖两种格式、3/8/16 个并发 rank、16/24/32 个小张量，以及共享文件、按张量分组、每 rank 多文件和按 stage 分组的布局。
+
+1. 一个 rank 直接调用 `rank_save` 写出串行基线。多个 rank 通过线程屏障同时开始 `rank_save`，写出另一布局的分片文件。
+2. 独立解析两套文件，按全局元素下标重建完整张量。每个元素必须恰好出现一次；并行结果的 shape、dtype、全部字节和 CRC 必须与串行基线一致。
+3. 执行下表的读取组合。每个 rank 的本地字节必须等于串行基线对应的分片。
+4. 用 `rank_reshard` 把并行文件统一为串行基线的单文件布局，再比较整文件字节，包括 header / metadata。读回、合文件期间，源文件字节必须不变。
+5. 故意交换同一 tensor 的两个 rank 的等长 payload，再由一个 rank 读回。测试要求它与串行基线不一致，并打印拼错前后的值。
+
+| 写入方式 | 读取方式 | 比较内容 |
+|---|---|---|
+| 单 rank 串行写 | 单 rank 读 | 完整张量与原始输入 |
+| 多 rank 并发写 | 单 rank 读 | 拼接后的完整张量与串行基线 |
+| 单 rank 串行写 | 多 rank 顺序读、并发读 | 每 rank 的本地分片 |
+| 多 rank 并发写 | 多 rank 顺序读、并发读 | 每 rank 的本地分片及两种调度的直接对比 |
+
+原分片文件的布局可以不同。完整张量先逐元素、逐字节对比；统一布局后再要求整文件字节相同。日志统一标为 `[CRC+ARANGE][SERIAL_PARALLEL]`，`PARALLEL_ASSEMBLY` 检查拼接，`READ_SCHEDULES` 检查读取调度，最终 `PASS` 汇总完整张量、文件和读取结果。rank 由线程模拟；真实 torch 多进程验证仍由 `test_lawa.py` 执行。
 
 ### CRC/arange checkpoint 合并测试的行为
 
