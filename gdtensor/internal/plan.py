@@ -12,6 +12,7 @@ Who writes what:
                 Sources: storage slots, or compute owners (own rank first,
                 then the lowest other rank; that read stands for comm).
 """
+
 from __future__ import annotations
 
 from typing import Dict, Iterable, List, Tuple
@@ -36,7 +37,12 @@ from .dtensor import (
     participants_of,
 )
 from .layout import (
-    PhysicalLayoutTable, TensorComponentPos, build_payload_index, leader_tensor_component_pos_of, list_cells, pos_key,
+    PhysicalLayoutTable,
+    TensorComponentPos,
+    build_payload_index,
+    leader_tensor_component_pos_of,
+    list_cells,
+    pos_key,
 )
 from .mesh import storage_mesh_cells
 from .ranges import CopyPlan, DTensorRange, RangeFromComputeView, RangeFromStorageView
@@ -51,6 +57,7 @@ def is_compute(r) -> bool:
 def is_storage(r) -> bool:
     return type(r) is RangeFromStorageView
 
+
 # ------------------------------------------------------------------ helpers
 
 
@@ -62,85 +69,143 @@ class _Side:
         self.table: DTensorTable = view.d_tensor_table
         self.is_storage = type(view) is StorageDTensorsView
         if self.is_storage:
-            self.index = view.data_accessor.index
+            self.index = build_payload_index(self.table, view.physical_layout)
 
     def storage_pieces(self, tid: str) -> List[Tuple[np.ndarray, str, int, int]]:
         """Non-empty slots with a physical file: (intervals, path, cpo, itemsize)."""
-        out = []
-        for w in participants_of(named_of(self.table, tid), "storage"):
-            hit = self.index.slots.get(TensorComponentPos(tid, w))
-            if hit is not None:
-                path, s = hit
-                out.append((s.intervals, path, s.contiguous_payload_offset, s.itemsize))
-        return out
+        hits = (
+            self.index.slots.get(TensorComponentPos(tid, rank))
+            for rank in participants_of(named_of(self.table, tid), "storage")
+        )
+        return [_storage_piece(hit) for hit in hits if hit is not None]
 
     def dst_intervals(self, tid: str, rank: int):
         """Destination share of a rank: list of (intervals, address)."""
         nd = named_of(self.table, tid)
-        if self.is_storage:
-            hit = self.index.slots.get(TensorComponentPos(tid, rank))
-            if hit is None:
-                return []
-            path, s = hit
-            return [(s.intervals, ("storage", path, s.contiguous_payload_offset, s.itemsize))]
-        iv = owned_intervals(nd, "compute", rank)
-        return [(iv, ("compute", tid, global_tensor_meta_of(nd).itemsize))] if iv.size else []
+        if not self.is_storage:
+            iv = owned_intervals(nd, "compute", rank)
+            return (
+                [(iv, ("compute", tid, global_tensor_meta_of(nd).itemsize))]
+                if iv.size
+                else []
+            )
+        hit = self.index.slots.get(TensorComponentPos(tid, rank))
+        if hit is None:
+            return []
+        path, slot = hit
+        return [
+            (
+                slot.intervals,
+                ("storage", path, slot.contiguous_payload_offset, slot.itemsize),
+            )
+        ]
 
     def src_candidates(self, tid: str, rank: int):
         """Ordered source owners: list of (intervals, address)."""
         nd = named_of(self.table, tid)
         if self.is_storage:
-            return [(iv, ("storage", p, cpo, isz)) for iv, p, cpo, isz in self.storage_pieces(tid)]
+            return [
+                (iv, ("storage", p, cpo, isz))
+                for iv, p, cpo, isz in self.storage_pieces(tid)
+            ]
         isz = global_tensor_meta_of(nd).itemsize
         ranks = participants_of(nd, "compute")
         ranks = ([rank] if rank in ranks else []) + [r for r in ranks if r != rank]
-        return [(owned_intervals(nd, "compute", r), ("compute", tid, isz)) for r in ranks]
+        return [
+            (owned_intervals(nd, "compute", r), ("compute", tid, isz)) for r in ranks
+        ]
+
+
+def _storage_piece(hit):
+    path, slot = hit
+    return slot.intervals, path, slot.contiguous_payload_offset, slot.itemsize
 
 
 def _make_range(addr, owner_iv: np.ndarray, piece: np.ndarray) -> List[DTensorRange]:
     """Ranges for element pieces inside one owner's intervals."""
     if addr[0] == "compute":
         _, tid, isz = addr
-        return [RangeFromComputeView(tid, int(a) * isz, int(b - a) * isz) for a, b in piece]
+        return [
+            RangeFromComputeView(tid, int(a) * isz, int(b - a) * isz) for a, b in piece
+        ]
     _, path, cpo, isz = addr
     local = iv_prefix(owner_iv, piece[:, 0])
-    return [RangeFromStorageView(path, cpo + int(l) * isz, int(b - a) * isz) for l, (a, b) in zip(local, piece)]
+    return [
+        RangeFromStorageView(path, cpo + int(l) * isz, int(b - a) * isz)
+        for l, (a, b) in zip(local, piece)
+    ]
+
+
+def _pair_destination(dst_iv, dst_addr, src_list):
+    plan = []
+    todo = iv_normalize(dst_iv.copy())
+    for src_iv, src_addr in src_list:
+        if todo.size == 0:
+            break
+        piece = iv_intersect(todo, src_iv)
+        if piece.size == 0:
+            continue
+        srcs = _make_range(src_addr, src_iv, piece)
+        dsts = _make_range(dst_addr, dst_iv, piece)
+        plan.extend(zip(srcs, dsts))
+        todo = iv_subtract(todo, piece)
+    if todo.size:
+        raise invalid(
+            "src_view", f"no source covers {iv_total(todo)} destination elements"
+        )
+    return plan
 
 
 def _pair(dst_list, src_list) -> CopyPlan:
-    plan: CopyPlan = []
+    plan = []
     for dst_iv, dst_addr in dst_list:
-        todo = iv_normalize(dst_iv.copy())
-        for src_iv, src_addr in src_list:
-            if todo.size == 0:
-                break
-            piece = iv_intersect(todo, src_iv)
-            if piece.size == 0:
-                continue
-            srcs = _make_range(src_addr, src_iv, piece)
-            dsts = _make_range(dst_addr, dst_iv, piece)
-            plan.extend(zip(srcs, dsts))
-            todo = iv_subtract(todo, piece)
-        if todo.size:
-            raise invalid("src_view", f"no source covers {iv_total(todo)} destination elements")
+        plan.extend(_pair_destination(dst_iv, dst_addr, src_list))
+    return plan
+
+
+def _save_pieces(tid, intervals, itemsize, storage):
+    plan = []
+    remaining = intervals.copy()
+    for slot_intervals, path, offset, slot_itemsize in storage.storage_pieces(tid):
+        piece = iv_intersect(intervals, slot_intervals)
+        if not piece.size:
+            continue
+        srcs = _make_range(("compute", tid, itemsize), intervals, piece)
+        dsts = _make_range(
+            ("storage", path, offset, slot_itemsize), slot_intervals, piece
+        )
+        plan.extend(zip(srcs, dsts))
+        remaining = iv_subtract(remaining, piece)
+    if remaining.size:
+        raise invalid(
+            "physical_layout",
+            f"{tid}: {iv_total(remaining)} compute elements have no physical storage",
+        )
     return plan
 
 
 def _check_same_tensors(a, b) -> None:
     if list(a.tensor_ids) != list(b.tensor_ids):
-        raise invalid("tensor_ids", f"tensor_ids differ: {a.tensor_ids} vs {b.tensor_ids}")
+        raise invalid(
+            "tensor_ids", f"tensor_ids differ: {a.tensor_ids} vs {b.tensor_ids}"
+        )
     for tid in a.tensor_ids:
         ma = global_tensor_meta_of(named_of(a.d_tensor_table, tid))
         mb = global_tensor_meta_of(named_of(b.d_tensor_table, tid))
         if ma != mb:
-            raise invalid("global_tensor_meta", f"global_tensor_meta differs for {tid}: {ma} vs {mb}")
+            raise invalid(
+                "global_tensor_meta",
+                f"global_tensor_meta differs for {tid}: {ma} vs {mb}",
+            )
 
 
 # ------------------------------------------------------------------ B.1.2
 
 
 @catch
-def d_tensors_view_rank_plan_save(rank: int, compute_view: ComputeDTensorsView, storage_view: StorageDTensorsView) -> CopyPlan:
+def d_tensors_view_rank_plan_save(
+    rank: int, compute_view: ComputeDTensorsView, storage_view: StorageDTensorsView
+) -> CopyPlan:
     _check_same_tensors(compute_view, storage_view)
     c, s = _Side(compute_view), _Side(storage_view)
     plan: CopyPlan = []
@@ -152,17 +217,14 @@ def d_tensors_view_rank_plan_save(rank: int, compute_view: ComputeDTensorsView, 
         if iv.size == 0:
             continue
         isz = global_tensor_meta_of(nd).itemsize
-        for s_iv, path, cpo, s_isz in s.storage_pieces(tid):
-            piece = iv_intersect(iv, s_iv)
-            if piece.size:
-                srcs = _make_range(("compute", tid, isz), iv, piece)
-                dsts = _make_range(("storage", path, cpo, s_isz), s_iv, piece)
-                plan.extend(zip(srcs, dsts))
+        plan.extend(_save_pieces(tid, iv, isz, s))
     return plan
 
 
 @catch
-def d_tensors_view_rank_plan_load(rank: int, compute_view: ComputeDTensorsView, storage_view: StorageDTensorsView) -> CopyPlan:
+def d_tensors_view_rank_plan_load(
+    rank: int, compute_view: ComputeDTensorsView, storage_view: StorageDTensorsView
+) -> CopyPlan:
     _check_same_tensors(compute_view, storage_view)
     c, s = _Side(compute_view), _Side(storage_view)
     plan: CopyPlan = []
@@ -207,7 +269,9 @@ def _assert_disjoint(iv: np.ndarray, what: str, check: str) -> None:
     bad = np.flatnonzero(iv[1:, 0] < iv[:-1, 1])
     if bad.size:
         k = int(bad[0])
-        raise check_failed(check, f"{what}: overlap {iv[k].tolist()} / {iv[k + 1].tolist()}")
+        raise check_failed(
+            check, f"{what}: overlap {iv[k].tolist()} / {iv[k + 1].tolist()}"
+        )
 
 
 def _compute_by_tensor(plan: CopyPlan) -> Dict[str, np.ndarray]:
@@ -225,25 +289,38 @@ def _storage_by_file(plan: CopyPlan) -> Dict[str, np.ndarray]:
 
 
 @catch
-def check_compute_d_tensors_access_disjoint(d_tensor_table: DTensorTable, copy_plan: CopyPlan) -> None:
+def check_compute_d_tensors_access_disjoint(
+    d_tensor_table: DTensorTable, copy_plan: CopyPlan
+) -> None:
     for tid, iv in _compute_by_tensor(copy_plan).items():
         order_of(d_tensor_table, tid)
-        _assert_disjoint(iv, f"compute {tid}", "check_compute_d_tensors_access_disjoint")
+        _assert_disjoint(
+            iv, f"compute {tid}", "check_compute_d_tensors_access_disjoint"
+        )
 
 
 @catch
-def check_compute_d_tensors_access_full_covering(d_tensor_table: DTensorTable, copy_plan: CopyPlan) -> None:
+def check_compute_d_tensors_access_full_covering(
+    d_tensor_table: DTensorTable, copy_plan: CopyPlan
+) -> None:
     by_t = _compute_by_tensor(copy_plan)
     for nd in d_tensor_table.named_d_tensors:
         total = nbytes_of(global_tensor_meta_of(nd))
         iv = iv_normalize(by_t.get(nd.global_tensor_id, EMPTY))
         if not (iv.shape[0] == 1 and iv[0, 0] == 0 and iv[0, 1] == total) and total:
-            raise check_failed("check_compute_d_tensors_access_full_covering",
-                               f"compute {nd.global_tensor_id}: covered {iv_total(iv)} of {total} bytes")
+            raise check_failed(
+                "check_compute_d_tensors_access_full_covering",
+                f"compute {nd.global_tensor_id}: covered {iv_total(iv)} of {total} bytes",
+            )
 
 
-def _storage_common(table: DTensorTable, layout: PhysicalLayoutTable, file_paths: List[str], plan: CopyPlan,
-                    check: str):
+def _storage_common(
+    table: DTensorTable,
+    layout: PhysicalLayoutTable,
+    file_paths: List[str],
+    plan: CopyPlan,
+    check: str,
+):
     index = build_payload_index(table, layout)
     known = set(file_paths)
     by_f = _storage_by_file(plan)
@@ -251,7 +328,9 @@ def _storage_common(table: DTensorTable, layout: PhysicalLayoutTable, file_paths
         if path not in known:
             raise check_failed(check, f"storage range on unknown file {path}")
         # every range must lie inside one slot
-        starts = np.array([s.contiguous_payload_offset for s in index.files[path].slots])
+        starts = np.array(
+            [s.contiguous_payload_offset for s in index.files[path].slots]
+        )
         ends = starts + np.array([s.nbytes for s in index.files[path].slots])
         iv = by_f[path]
         k = np.searchsorted(starts, iv[:, 0], side="right") - 1
@@ -262,33 +341,65 @@ def _storage_common(table: DTensorTable, layout: PhysicalLayoutTable, file_paths
 
 @catch
 def check_storage_d_tensors_access_disjoint(
-    d_tensor_table: DTensorTable, physical_layout: PhysicalLayoutTable, file_paths: List[str], copy_plan: CopyPlan
+    d_tensor_table: DTensorTable,
+    physical_layout: PhysicalLayoutTable,
+    file_paths: List[str],
+    copy_plan: CopyPlan,
 ) -> None:
-    _, by_f = _storage_common(d_tensor_table, physical_layout, file_paths, copy_plan,
-                              "check_storage_d_tensors_access_disjoint")
+    _, by_f = _storage_common(
+        d_tensor_table,
+        physical_layout,
+        file_paths,
+        copy_plan,
+        "check_storage_d_tensors_access_disjoint",
+    )
     for path, iv in by_f.items():
-        _assert_disjoint(iv, f"storage {path}", "check_storage_d_tensors_access_disjoint")
+        _assert_disjoint(
+            iv, f"storage {path}", "check_storage_d_tensors_access_disjoint"
+        )
 
 
 @catch
 def check_storage_d_tensors_access_full_covering(
-    d_tensor_table: DTensorTable, physical_layout: PhysicalLayoutTable, file_paths: List[str], copy_plan: CopyPlan
+    d_tensor_table: DTensorTable,
+    physical_layout: PhysicalLayoutTable,
+    file_paths: List[str],
+    copy_plan: CopyPlan,
 ) -> None:
-    index, by_f = _storage_common(d_tensor_table, physical_layout, file_paths, copy_plan,
-                                  "check_storage_d_tensors_access_full_covering")
+    index, by_f = _storage_common(
+        d_tensor_table,
+        physical_layout,
+        file_paths,
+        copy_plan,
+        "check_storage_d_tensors_access_full_covering",
+    )
     for path in file_paths:
         total = index.files[path].payload_size
         iv = iv_normalize(by_f.get(path, EMPTY))
         if total and not (iv.shape[0] == 1 and iv[0, 0] == 0 and iv[0, 1] == total):
-            raise check_failed("check_storage_d_tensors_access_full_covering",
-                               f"storage {path}: covered {iv_total(iv)} of {total} bytes")
+            raise check_failed(
+                "check_storage_d_tensors_access_full_covering",
+                f"storage {path}: covered {iv_total(iv)} of {total} bytes",
+            )
 
 
 @catch
 def check_storage_mesh_disjoint(lhs, rhs) -> None:
     both = storage_mesh_cells(lhs) & storage_mesh_cells(rhs)
     if both:
-        raise check_failed("check_storage_mesh_disjoint", f"storage meshes overlap at {sorted(both)[:4]}")
+        raise check_failed(
+            "check_storage_mesh_disjoint",
+            f"storage meshes overlap at {sorted(both)[:4]}",
+        )
+
+
+def _record_list_cells(seen, leader, meshes):
+    for cell in list_cells(meshes):
+        if cell in seen:
+            raise check_failed(
+                "check_physical_layout", f"slot {cell} is covered by two files"
+            )
+        seen[cell] = leader
 
 
 @catch
@@ -299,7 +410,9 @@ def check_physical_layout(table: DTensorTable, layout: PhysicalLayoutTable) -> N
     lists = {}
     for pos, lst in layout.tensor_entries.items():
         if lst.tensor_ids != ids:
-            raise check_failed(name, "DisjointStorageMeshList rows differ from DTensorTable order")
+            raise check_failed(
+                name, "DisjointStorageMeshList rows differ from DTensorTable order"
+            )
         leader = leader_tensor_component_pos_of(lst)
         if leader not in layout.file_paths:
             raise check_failed(name, f"leader {pos_key(leader)} has no file path")
@@ -313,18 +426,20 @@ def check_physical_layout(table: DTensorTable, layout: PhysicalLayoutTable) -> N
         raise check_failed(name, "two lists share one file path")
     seen: Dict[Tuple[int, int], TensorComponentPos] = {}
     for leader, lst in lists.items():
-        for cell in list_cells(lst):
-            if cell in seen:
-                raise check_failed(name, f"slot {cell} is covered by two files")
-            seen[cell] = leader
+        _record_list_cells(seen, leader, lst)
     index = build_payload_index(table, layout)
     for t, nd in enumerate(table.named_d_tensors):
         # single-tensor mesh == row slice of the multi-tensor meshes
         row = {w for (tt, w) in seen if tt == t}
         nonempty = {s.pos.rank for _, s in index.slots.values() if s.tensor_order == t}
         if not nonempty <= row:
-            raise check_failed(name, f"{nd.global_tensor_id}: non-empty slot without physical file")
+            raise check_failed(
+                name, f"{nd.global_tensor_id}: non-empty slot without physical file"
+            )
         cols = set(participants_of(nd, "storage"))
-        for w in row:
-            if w not in cols:
-                raise check_failed(name, f"{nd.global_tensor_id}: list covers column {w} outside its storage mesh")
+        outside = row - cols
+        if outside:
+            raise check_failed(
+                name,
+                f"{nd.global_tensor_id}: list covers column {min(outside)} outside its storage mesh",
+            )

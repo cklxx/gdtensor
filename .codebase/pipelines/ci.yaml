@@ -12,21 +12,24 @@ jobs:
     steps:
       - name: Install dependencies
         commands:
-          - python3 -m pip install --upgrade pip
-          - python3 -m pip install -i https://bytedpypi.byted.org/simple numpy safetensors pytest ruff
+          - python3 -m pip install -i https://bytedpypi.byted.org/simple uv
+          - uv sync --locked
       - name: Show tool versions
         commands:
-          - python3 --version
-          - ruff --version
-      - name: Lint unused imports (ruff F401)
+          - uv run --locked python --version
+          - uv run --locked ruff --version
+      - name: Format check
         commands:
-          - ruff check --select F401 gdtensor gdtensor_sim tests
+          - uv run --locked ruff format --check gdtensor gdtensor_sim tests
+      - name: Lint imports and undefined names (ruff F)
+        commands:
+          - uv run --locked ruff check gdtensor gdtensor_sim tests
       - name: Byte-compile
         commands:
-          - python3 -m compileall -q gdtensor gdtensor_sim tests
+          - uv run --locked python -m compileall -q gdtensor gdtensor_sim tests
       - name: Public package import smoke
         commands:
-          - python3 -c "import gdtensor, gdtensor.io, gdtensor.builder, gdtensor.session, gdtensor.access, gdtensor.tag, gdtensor.internal.api, gdtensor_sim.models"
+          - uv run --locked python -c "import gdtensor, gdtensor.io, gdtensor.builder, gdtensor.session, gdtensor.access, gdtensor.tag, gdtensor_sim.models"
       - name: Pytest (torch tests skip without torch)
         commands:
-          - python3 -m pytest -q -p no:cacheprovider
+          - uv run --locked pytest -v -p no:cacheprovider

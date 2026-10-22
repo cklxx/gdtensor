@@ -7,53 +7,98 @@ Internal plumbing (not public API): implementation code raises ``Fail(err)``
 and ``@catch`` turns it into ``tag.Err(err)``. ``must_ok`` returns the Ok
 payload or raises ``Fail``. Callers of the public API only see Results.
 """
+
 from __future__ import annotations
 
-import dataclasses
 import functools
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from ..tag import Err, Ok
+from .builder_mixin import field_hash, make_builder_mixin
+
+
+ConstraintViolationErrorBuilderMixin = make_builder_mixin(
+    "ConstraintViolationError",
+    [("type_name", "scalar"), ("constraint_name", "scalar"), ("msg", "scalar")],
+)
+CheckFailedErrorBuilderMixin = make_builder_mixin(
+    "CheckFailedError", [("check_name", "scalar"), ("msg", "scalar")]
+)
+NotFoundErrorBuilderMixin = make_builder_mixin(
+    "NotFoundError", [("key_name", "scalar"), ("key", "scalar"), ("msg", "scalar")]
+)
+InvalidArgumentErrorBuilderMixin = make_builder_mixin(
+    "InvalidArgumentError", [("argument_name", "scalar"), ("msg", "scalar")]
+)
+GDTensorIOErrorBuilderMixin = make_builder_mixin(
+    "GDTensorIOError",
+    [("file_path", "nullable"), ("operation", "scalar"), ("msg", "scalar")],
+)
 
 
 @dataclass(eq=True, frozen=False)
-class ConstraintViolationError:
+class ConstraintViolationError(ConstraintViolationErrorBuilderMixin):
     type_name: str = ""
     constraint_name: str = ""
     msg: str = ""
+    __hash__ = field_hash
 
 
 @dataclass(eq=True, frozen=False)
-class CheckFailedError:
+class CheckFailedError(CheckFailedErrorBuilderMixin):
     check_name: str = ""
     msg: str = ""
+    __hash__ = field_hash
 
 
 @dataclass(eq=True, frozen=False)
-class NotFoundError:
+class NotFoundError(NotFoundErrorBuilderMixin):
     key_name: str = ""
     key: str = ""
     msg: str = ""
+    __hash__ = field_hash
 
 
 @dataclass(eq=True, frozen=False)
-class InvalidArgumentError:
+class InvalidArgumentError(InvalidArgumentErrorBuilderMixin):
     argument_name: str = ""
     msg: str = ""
+    __hash__ = field_hash
 
 
 @dataclass(eq=True, frozen=False)
-class GDTensorIOError:
+class GDTensorIOError(GDTensorIOErrorBuilderMixin):
     file_path: Optional[str] = None
     operation: str = ""
     msg: str = ""
+    __hash__ = field_hash
 
 
-ERROR_TYPES = (ConstraintViolationError, CheckFailedError, NotFoundError, InvalidArgumentError, GDTensorIOError)
+Error = (
+    ConstraintViolationError
+    | CheckFailedError
+    | NotFoundError
+    | InvalidArgumentError
+    | GDTensorIOError
+)
+ERROR_TYPES = (
+    ConstraintViolationError,
+    CheckFailedError,
+    NotFoundError,
+    InvalidArgumentError,
+    GDTensorIOError,
+)
+
+
+def _check_constraints(self):
+    from .constraints import check_constraints
+
+    return check_constraints(self)
+
 
 for _cls in ERROR_TYPES:
-    _cls.__hash__ = lambda self: hash((type(self),) + dataclasses.astuple(self))
+    _cls.check_constraints = _check_constraints
 
 
 class Fail(Exception):
@@ -84,7 +129,11 @@ def io_error(operation: str, msg: str, file_path: Optional[str] = None) -> Fail:
 
 
 def violation(type_name: str, constraint_name: str, msg: str) -> Fail:
-    return Fail(ConstraintViolationError(type_name=type_name, constraint_name=constraint_name, msg=msg))
+    return Fail(
+        ConstraintViolationError(
+            type_name=type_name, constraint_name=constraint_name, msg=msg
+        )
+    )
 
 
 # ------------------------------------------------------------------ Result plumbing
@@ -100,7 +149,9 @@ def must_ok(result):
         return result.value
     if type(result) is Err:
         raise Fail(result.value)
-    raise Fail(InvalidArgumentError(argument_name="result", msg=f"not a Result: {result!r}"))
+    raise Fail(
+        InvalidArgumentError(argument_name="result", msg=f"not a Result: {result!r}")
+    )
 
 
 def catch(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -113,10 +164,21 @@ def catch(fn: Callable[..., Any]) -> Callable[..., Any]:
         except Fail as exc:
             return Err(exc.error)
         except OSError as exc:
-            return Err(GDTensorIOError(file_path=getattr(exc, "filename", None), operation="io",
-                                       msg=f"{type(exc).__name__}: {exc}"))
+            return Err(
+                GDTensorIOError(
+                    file_path=getattr(exc, "filename", None),
+                    operation="io",
+                    msg=f"{type(exc).__name__}: {exc}",
+                )
+            )
         except Exception as exc:  # noqa: BLE001
-            return Err(GDTensorIOError(file_path=None, operation="internal", msg=f"{type(exc).__name__}: {exc}"))
+            return Err(
+                GDTensorIOError(
+                    file_path=None,
+                    operation="internal",
+                    msg=f"{type(exc).__name__}: {exc}",
+                )
+            )
         if type(out) in (Ok, Err):
             return out
         return Ok(out)

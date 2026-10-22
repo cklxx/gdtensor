@@ -209,11 +209,11 @@ check 函数也收 `CopyPlan`，按 range 类型过滤出 compute 或 storage ra
 
 执行顺序：
 
-1. `origin` 是 `ComputeDTensorsView`：对 `DTensorTable[ComputeMesh]` 的每个 `NamedDTensor[ComputeMesh]` 调 `convert_each_compute_view`；该字段为 nil 时 tensor 原样保留；没有 session。
-2. `origin` 是 `StorageDTensorsView`：对 `DTensorTable[SingleTensorStorageMesh]` 的每个 `NamedDTensor[SingleTensorStorageMesh]` 调 `convert_each_storage_view`；该字段为 nil 时 tensor 原样保留。再处理 load / save session：字段非 nil 时打开对应 session 并调用，字段为 nil 时跳过该 session。session 的打开、提交、中止由 `d_tensors_view_map` 管；转换函数只替换 session。
+1. `origin` 是 `ComputeDTensorsView`：对 `DTensorTable[ComputeMesh]` 的每个 `NamedDTensor[ComputeMesh].d_tensor` 调 `convert_each_compute_view`；该字段为 nil 时 tensor 原样保留；没有 session。
+2. `origin` 是 `StorageDTensorsView`：对 `DTensorTable[SingleTensorStorageMesh]` 的每个 `NamedDTensor[SingleTensorStorageMesh].d_tensor` 调 `convert_each_storage_view`；该字段为 nil 时 tensor 原样保留。再包装 load / save session 工厂：字段非 nil 时包装返回 view 的对应 `begin_load` / `begin_save`，字段为 nil 时保留原工厂。map 本身不打开或结束 session，不做文件 I/O。后续 rank IO 调用包装后的 `begin_*(view, rank)`：先打开原 session，再调用转换回调并把替换 session 交给 IO。转换返回 `$err` 时，包装逻辑立即 `abort`（save）或 `finish`（load）刚打开的原 session，并原样返回该错误。正常的 `commit` / `abort` / `finish` 由外层 rank IO 管理。
 3. 返回的 view 与 `origin` 同种类；`tensor_ids` 不变，`global_tensor_meta` 由转换函数决定。
 
-任一回调返回 `$err` 时，`d_tensors_view_map` 原样返回那个 `Error`，不再调用后面的回调。
+张量转换回调返回 `$err` 时，`d_tensors_view_map` 原样返回那个 `Error`，不再调用后面的张量转换回调。session 转换回调在后续 rank IO 打开 session 时执行，其错误由包装后的 `begin_*` 原样返回。
 
 `d_tensors_view_map` 不承担归约、平均这类计算。需要计算时走 5.6：先把 `GenericDTensor[StorageMesh]` 变成 `GenericDTensor[ComputeMesh]`，再取 `torch.DTensor`。
 
@@ -719,7 +719,8 @@ PhysicalLayoutTable =
   }]
 
 # Canonical TensorComponentPos of a DisjointStorageMeshList; used as its
-# dict key.
+# dict key. Pick the smallest (row, column) cell; its tensor_id is
+# disjoint_storage_meshes.tensor_ids[row].
 leader_tensor_component_pos_of =
     TensorComponentPos
   <- $disjoint_storage_meshes DisjointStorageMeshList
@@ -740,6 +741,13 @@ DisjointStorageMeshList =
     # One logical list per physical file. The meshes inside this list are
     # disjoint, and meshes from different files are disjoint too.
   * $disjoint_storage_mesh_list list[MultiTensorsStorageMesh]
+    # Row labels, in DTensorTable.named_d_tensors order. Filled by the
+    # business layout constructor; shared by all meshes in this list.
+  * $tensor_ids list[str]
+  * Assert[{
+      forall mesh in disjoint_storage_mesh_list:
+        check len(tensor_ids) equals the underlying OuterProductMesh.tensor_slots.size value
+  }]
   * Hint[{
     不同物理文件的 mesh 也互不重叠：每个 slot 最多被一个 mesh 覆盖。
     每个空 content slot 占用 0 字节；空槽不参与 offset 累加，所以 list 里有很多空槽也不会让后续张量的 offset 错位。
@@ -1038,13 +1046,13 @@ check_constraints = Result[void] <- $self T
 | 类型 | 额外检查（递归之外） |
 |---|---|
 | `ComputeDTensorsView` | `tensor_ids` 与 `d_tensor_table` 的顺序一致；`data_accessor` 非空 |
-| `StorageDTensorsView` | `tensor_ids` 与 `d_tensor_table` 的顺序一致；`physical_layout` 的 entry 的 `tensor_id` 在 table 里；`data_accessor` / `begin_save` / `begin_load` 非空 |
+| `StorageDTensorsView` | `tensor_ids` 与 `d_tensor_table` 的顺序一致；`physical_layout` 的 entry 的 `tensor_id` 在 table 里；每个物理 list 的 `tensor_ids` 等于 table 的张量顺序；`data_accessor` / `begin_save` / `begin_load` 非空 |
 | `DTensorTable` | `global_tensor_id` 不重复 |
 | `NamedDTensor` | `global_tensor_id` 非空 |
 | `NaiveDTensor` | `global_tensor_meta` / `placements` / `mesh` 一致；`torch_d_tensor` 可空 |
 | `GlobalTensorMeta` | `global_shape` 非空；`itemsize > 0`；`dtype` 非空 |
 | `PhysicalLayoutTable` | `container_format` 唯一；`file_paths` 的键是 leader pos；entry 的 leader 在 `file_paths` 里；mesh 两两不重叠 |
-| `DisjointStorageMeshList` | list 非空；mesh 两两不重叠 |
+| `DisjointStorageMeshList` | list 非空；mesh 两两不重叠；`len(tensor_ids)` 等于每个 mesh 的 tensor_count |
 | `StorageMesh` | `content_slots` 的 `ArrangedMesh` 的 size > 0 |
 | `ComputeMesh` | `ArrangedMesh` 的 size > 0 |
 | `LiteralMesh` | `ranks` 非空；每个 rank 满足 `0 <= rank < max`；`ranks` 无重复 |

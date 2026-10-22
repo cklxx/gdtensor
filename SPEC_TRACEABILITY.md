@@ -1,59 +1,32 @@
 # 规格追溯
 
-设计文档：`跨计算和存储的 DTensorsView 设计`（1513 行，2026-10-21 版）。本表列出设计要点、实现位置与验证方式。
+唯一设计依据：[docs/DTensorsView-design.md](docs/DTensorsView-design.md)，随 main 的 `12ceb37` 合入。
 
-## 核心类型与 API
-
-| 设计条目 | 实现 | 验证 |
+| 设计条目 | 实现 | 通过设计 API 验证 |
 |---|---|---|
-| B.1.1 三个 IO API（薄执行器） | `internal/api.py`，`io.py` 仅导出 rank_load/rank_save/rank_reshard | test_matrix、test_adversarial、test_consistency |
-| B.1.2 plan API（纯函数，不打开 session） | `internal/plan.py` | test_checks、test_exhaustive（286 配置） |
-| B.1.3 五个 check API | `internal/plan.py` | test_checks |
-| B.1.4 compute/torch 桥五个 API | `builder.py` 顶层短名，`internal/torch_bridge.py` 实现 | test_torch_bridge、test_torch_e2e、test_lawa_merge、test_public_api（reset 校验 meta/placements/mesh 一致） |
-| B.1.5 d_tensors_view_map(origin, map_core) | `builder.py` | test_spec_alignment |
-| 五个 namespace 的全部公开符号（`__all__` 共 66 个） | 公开命名空间 | test_public_api（逐符号，含三个 io API 端到端、reset 回写与 meta 一致性校验） |
-| B.2 / C.3 产品类型与五个 namespace | `builder.py`、`session.py`、`access.py`、`tag.py` | test_api_conformance（机械审计）、test_spec_alignment |
-| C.1 `<ClassName>BuilderMixin` + new/get/set/add/mutable/clear | `internal/builder_mixin.py` 按字段生成 | test_builder_api |
-| C.2 标签 Box 与 Result；`type(x) is` 判别 | `tag.py` 纯标签；Error 产品类在 `internal/result.py` | test_spec_alignment |
-| B.2.4 check_constraints 递归与额外检查 | `internal/constraints.py` | test_spec_alignment |
-| B.2.2.5/B.2.2.6 session 生命周期与 init_data_accessor | `internal/formats.py` 继承 ABC | test_matrix、test_spec_alignment |
-| B.2.3.2 buffer 回调 `(buffer_ptr, buffer_len)` | `internal/views.py` 用 buffer 地址回调 | 全量端到端 |
-| 5.3 contiguous_payload_offset 与空槽 0 字节 | `internal/layout.py` PayloadIndex | test_matrix::test_empty_slot_offsets |
-| 5.4 commit 顺序 / abort / 未知结果保留 payload | `internal/formats.py` | test_matrix、test_adversarial::abort 后重写 |
+| C.3 / C.4 namespace、导出与签名 | 顶层及 io / builder / session / access / tag | `test_api_conformance.py` |
+| C.1 产品类、BuilderMixin、new/get/set/add/mutable/clear | `internal/builder_mixin.py` 及产品定义 | `test_api.py`、`test_api_conformance.py` |
+| C.2 Python 3.12 Result 别名、Error union、tag、抽象接口 | `__init__.py`、`tag.py`、`session.py`、`access.py` | `test_api.py` |
+| B.1.1 IO 与 session 生命周期 | `internal/api.py` | `test_io_contract.py`；初始化、读写、finish、commit 失败与清理 |
+| B.1.2 区间配对、所有权与偏移 | `internal/plan.py`、`internal/dtensor.py`、`internal/layout.py` | `test_data_correctness.py`、`test_matrix.py`、`test_random.py`；独立切片、CRC、逐字节与覆盖计数 |
+| 多 checkpoint 组合读写与调用方合并 | `rank_save/load/reshard`；数值合并由测试调用方执行 | `test_checkpoint_merge_crc.py`；多 rank / tensor / 文件、跨格式重排、普通与加权平均、拆分再合并、源文件不变、等长 payload 跨文件交换 |
+| B.1.4 / 5.6 torch 桥 | `internal/torch_bridge.py`，仅顶层导出 | `test_torch_bridge.py`、`test_lawa.py`；真实原生 mesh、dtype、placements、reset 拒绝不一致输入 |
+| B.2.3.2 分块 buffer 回调 | `access.py`、`internal/api.py` | `test_io_contract.py`；读写分块边界不同、空分块、长度不足、越界、负长度 |
+| B.2.4 递归约束与同一错误对象返回 | `internal/constraints.py` | `test_constraints.py` |
+| 第 7 节文件布局场景 | 业务或测试构造 PhysicalLayoutTable | `test_data_correctness.py`、`test_matrix.py`；每 rank 文件、共享文件、多文件、按 stage、跨 world |
+| 第 10 节 LAWA | 测试调用方在 torch.DTensor 上计算 | `test_lawa.py`；朴素 / Welford、k=1/2/3/5、2–32 个真实进程 |
+| 格式生命周期及 metadata 发布 | `gdtensor_sim/formats.py` | `test_sim_formats.py`；元数据错误、metadata 延迟、leader 发布失败 |
+| 删除领域越界 | 模型、布局策略、文件格式、模拟内存与协调放入 `gdtensor_sim/` | `test_api_conformance.py` 的定义及依赖检查 |
 
-## 格式（仅两种）
+`test_api_conformance.py` 还检查 core / sim / tests 的代码块缩进不超过三层。`scripts/review.sh` 使用小数据并打印中间执行结果。环境、依赖和格式化统一由 uv 管理。
 
-| 设计条目 | 实现 | 验证 |
-|---|---|---|
-| 4.2 safetensors header 先写 + fsync/rename | `internal/formats.py` SafeTensorsSaveSession | test_matrix、test_data_correctness |
-| 4.2 distcp `.metadata` 完成标记 | `internal/formats.py` DcpSaveSession | test_matrix |
-| 第 7 节用例矩阵 | `internal/models.py` 业务布局构造器 | test_matrix 全格点 |
+核心测试的 session、文件 fixture 和内存 fixture 只依赖设计 API。格式实现测试调用 `gdtensor_sim` 中的具体实现；独立数据 oracle 不调用这些实现的区间或布局算法。
 
-## 非目标（设计第 9 节）
+设计方已明确两条规则，并已同步到唯一设计文档：
 
-- 核心无 reduce / LAWA API：归约只在 `torch.DTensor` 上做（test_lawa_merge 朴素/Welford 一致）。
-- 无对象存储 multipart / 重试 / 真实分布式 barrier 之外的存储实现。
-- 不内置布局策略：布局由业务层构造。
+- `DisjointStorageMeshList.tensor_ids` 是表顺序的行标签。布局构造器填充，list 校验长度，storage view 校验与表的顺序一致。leader 通过 `tensor_ids[row]` 取得 ID。
+- view map 只包装 `begin_save/load`。rank IO 打开 session 后执行转换，使用返回的替换 session。转换失败立即清理原 session；正常提交或结束由 rank IO 执行。
 
-## 包边界
+`test_constraints.py` 验证行数、表顺序和跨张量文件 leader。`test_io_contract.py` 验证延迟转换、替换 session、转换失败和清理失败。sim 与测试均由 AST 检查禁止导入核心内部模块。
 
-发布包 `gdtensor/` 只含设计核心（公开五 namespace + `internal/` 实现）。业务模型构造、布局 builder、单进程多 rank runner、线程/进程协调与仿真 CLI 在测试侧 `gdtensor_sim/` 包（设计 4.3），通过 `python -m gdtensor_sim.sim` 运行，不随核心发布；测试经 `sys.path` 引入该包。
-
-## 形式化验证（抽象层）
-
-| 制品 | 覆盖 |
-|---|---|
-| `formal/tla/CopyPlan.tcl` + `AtomicPublish.tla` | TLC 全网格：CopyPlan 非交并覆盖（save/load/reshard）、发布状态机 writing→done |
-| `formal/lean/ShardAlgebra.lean` | 分片相邻、单调、满射、唯一、非交并覆盖（clean build，无 sorry/axiom） |
-
-数据正确性（CRC 与 arrange 张量）：test_data_correctness 只用公开 io API（rank_save/rank_load/rank_reshard）驱动存取，CRC 期望自行解析 safetensors 头并按公开分片归属计算，覆盖 4 种布局、字节翻转检出、跨并行 save/load、compute↔compute 与 storage→storage reshard。
-
-诚实边界：形式化证明只针对抽象模型与分片代数，不针对 Python 字节码。Python 侧以穷举（world≤8）、独立 plan oracle、属性对拍、变异测试（13/13 有效变异被杀）补足。
-
-## 多机一致性
-
-plan 与发布字节是 (rank, tables, layout) 的纯函数；选路无 `hash()`/进程随机盐。`test_plan_and_bytes_are_hash_seed_independent` 用三个 `PYTHONHASHSEED` 子进程固定 plan repr 与文件字节一致；线程与 fork 进程产出字节相同。
-
-## 已删除的偏离
-
-本次重构按设计删除：非设计的 manifest/chunk/KV/沉降存储后端与节点读缓存、`rank_reshard` 的额外合并参数与批量 IO、`begin_load` 的额外文件参数、Error 异常基类与 `unwrap()` 等 Result 方法（仅测试 shim 保留）、构造期重复 id 抛错、旧 `max_`/字符串 tag 形式、内部模块公开导入。
+形式化制品仅验证抽象模型。本次重构的正确性证据是设计 API 测试、独立数据 oracle、真实 torch 进程和行为变异；不宣称完成了真实 1000 rank 或完整 DeepSeek 模型验证。

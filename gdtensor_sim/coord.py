@@ -5,6 +5,7 @@ votes once at commit / abort time; if any rank votes "fail", every rank
 discards. This is the "barrier" item that the spec leaves to the session
 implementation layer.
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -23,16 +24,18 @@ class ThreadCoordinator:
 
     def vote(self, ok: bool) -> bool:
         with self._lock:
-            if not ok:
-                self._fail += 1
+            self._fail += int(not ok)
         idx = self._barrier.wait(self.timeout)
         all_ok = self._fail == 0
         self._barrier.wait(self.timeout)  # everyone read the result
         if idx == 0:
-            with self._lock:
-                self._fail = 0
+            self._reset_failures()
         self._barrier.wait(self.timeout)
         return all_ok
+
+    def _reset_failures(self):
+        with self._lock:
+            self._fail = 0
 
     def wait(self) -> None:
         self._barrier.wait(self.timeout)
@@ -49,20 +52,24 @@ class ProcessCoordinator:
         self._fail = ctx.Value("i", 0)
 
     def vote(self, ok: bool) -> bool:
-        if not ok:
-            with self._fail.get_lock():
-                self._fail.value += 1
+        with self._fail.get_lock():
+            self._fail.value += int(not ok)
         idx = self._barrier.wait(self.timeout)
         all_ok = self._fail.value == 0
         self._barrier.wait(self.timeout)
         if idx == 0:
-            with self._fail.get_lock():
-                self._fail.value = 0
+            self._reset_failures()
         self._barrier.wait(self.timeout)
         return all_ok
+
+    def _reset_failures(self):
+        with self._fail.get_lock():
+            self._fail.value = 0
 
     def wait(self) -> None:
         self._barrier.wait(self.timeout)
 
 
-Coordinator = Optional[object]  # ThreadCoordinator | ProcessCoordinator | None (single rank)
+Coordinator = Optional[
+    object
+]  # ThreadCoordinator | ProcessCoordinator | None (single rank)

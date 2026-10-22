@@ -1,4 +1,5 @@
 """gdtensor.io: thin IO executors (spec B.1.1, namespace C.3)."""
+
 from __future__ import annotations
 
 from .internal.api import (

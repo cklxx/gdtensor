@@ -3,12 +3,21 @@
 Each tag is a Box subclass made by make_box_subclass, one line per tag. The
 payload is ``value``. Discriminate with ``type(x) is tag.Shard``.
 """
-import types
+
+import types as _types
+from typing import Any as _Any
 
 __all__ = [
-    "Box", "make_box_subclass",
-    "Ok", "Err", "Shard", "Replicate", "Partial",
-    "ConstantOne", "TensorCount", "WorldSize",
+    "Box",
+    "make_box_subclass",
+    "Ok",
+    "Err",
+    "Shard",
+    "Replicate",
+    "Partial",
+    "ConstantOne",
+    "TensorCount",
+    "WorldSize",
 ]
 
 
@@ -22,7 +31,7 @@ class Box:
 
     def __class_getitem__(cls, item):
         args = item if isinstance(item, tuple) else (item,)
-        return types.GenericAlias(cls, args)
+        return _types.GenericAlias(cls, args)
 
     # Product types compare and hash by field (C.2), and a field may hold a
     # tag, so a tag compares and hashes by (class, value).
@@ -36,7 +45,7 @@ class Box:
         return f"{type(self).__name__}({self.value!r})"
 
 
-def make_box_subclass(name):
+def make_box_subclass(name) -> _Any:
     return type(name, (Box,), {"__module__": __name__, "__slots__": ()})
 
 

@@ -1,0 +1,35 @@
+[project]
+name = "gdtensor"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+torch = [
+    "torch>=2.12",
+]
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.4.0",
+    "pytest>=8.0",
+    "ruff>=0.17.1",
+    "ty==0.0.14",
+]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["F"]
+
+[tool.ty.environment]
+python = ".venv"
+extra-paths = ["tests"]
+
+[tool.pyrefly]
+python-interpreter-path = ".venv/bin/python"
+search-path = [".", "tests"]

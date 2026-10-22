@@ -1,132 +1,288 @@
-"""API conformity audit: gdtensor public surface vs the design doc.
+"""Check every public namespace against the checked-in design specification."""
 
-This is a mechanical guard against free-styling. It enumerates every public
-symbol the spec C.3 table requires (namespaces + short names + the 5 typed
-errors + sessions/access ABCs + plan/check internal helpers) and asserts it
-exists with the spec-defined call shape. Anything extra exported at top level
-or under gdtensor.io that is not on the spec list fails the audit.
-
-Scope note: models.py / runner.py / iobackend.py / sim.py are the
-business/simulation layer (design 4.3: builders live outside the core) and are
-intentionally not part of the spec'd public API.
-"""
-from __future__ import annotations
-
+import ast
+import dataclasses
+import importlib
 import inspect
+from pathlib import Path
+import re
+import types
 
 import pytest
 
 import gdtensor
 import gdtensor.builder as builder
-import gdtensor.io as gio
-import gdtensor.access as access
-import gdtensor.session as session
 import gdtensor.tag as tag
 
-
-# C.3 top-level short names
-TOP_LEVEL = [
-    "get_tensor_ids", "get_gd_tensor", "make_gd_tensor",
-    "get_d_tensor", "reset_d_tensor", "Result", "Error", "Ok", "Err",
-]
-
-# C.3 io namespace
-IO_FNS = ["rank_load", "rank_save", "rank_reshard"]
-
-# C.3 builder product types and tags
-BUILDER_TYPES = [
-    "DTensorsView", "ComputeDTensorsView", "StorageDTensorsView",
-    "DTensorsViewMapCore", "DTensorTable", "NamedDTensor", "GenericDTensor",
-    "NaiveDTensor", "ReshapedDTensor", "GlobalTensorMeta", "Placement",
-    "ComputeMesh", "StorageMesh", "OuterProductMesh", "ContentSlotsMesh",
-    "LiteralMesh", "ArrangedMesh", "ReshapedMesh", "PermutedMesh", "SlicedMesh",
-    "Slice", "PhysicalLayoutTable", "DisjointStorageMeshList",
-    "ContainerFormat", "TensorComponentPos",
-    "ConstraintViolationError", "CheckFailedError", "NotFoundError",
-    "InvalidArgumentError", "GDTensorIOError",
-    "d_tensors_view_map",
-]
-
-BUILDER_HELPERS = [
-    "global_tensor_meta_of", "tensor_order_value_of", "file_path_of",
-    "leader_tensor_component_pos_of",
-]
-
-SESSION_TYPES = ["StorageSaveSession", "StorageLoadSession"]
-ACCESS_TYPES = ["DTensorDataAccessor"]
-
-TAG_TYPES = ["Ok", "Err", "Shard", "Replicate", "Partial",
-             "ConstantOne", "TensorCount", "WorldSize"]
-
-
-@pytest.mark.parametrize("name", TOP_LEVEL)
-def test_top_level_names(name):
-    assert hasattr(gdtensor, name), name
-
-
-@pytest.mark.parametrize("name", IO_FNS)
-def test_io_namespace(name):
-    fn = getattr(gio, name)
-    assert callable(fn)
+ROOT = Path(__file__).resolve().parents[1]
+PRODUCT_FIELDS = {
+    "ComputeDTensorsView": ("tensor_ids", "d_tensor_table", "data_accessor"),
+    "StorageDTensorsView": (
+        "tensor_ids",
+        "d_tensor_table",
+        "data_accessor",
+        "physical_layout",
+        "begin_save",
+        "begin_load",
+    ),
+    "DTensorsViewMapCore": (
+        "convert_each_compute_view",
+        "convert_each_storage_view",
+        "convert_each_storage_load_session",
+        "convert_each_storage_save_session",
+    ),
+    "DTensorTable": ("named_d_tensors",),
+    "NamedDTensor": ("global_tensor_id", "d_tensor", "alias"),
+    "NaiveDTensor": ("global_tensor_meta", "placements", "mesh", "torch_d_tensor"),
+    "ReshapedDTensor": ("underlying_d_tensor", "shape"),
+    "GlobalTensorMeta": ("global_shape", "dtype", "itemsize"),
+    "OuterProductMesh": ("tensor_slots", "content_slots"),
+    "LiteralMesh": ("ranks", "max"),
+    "ArrangedMesh": ("size",),
+    "ReshapedMesh": ("underlying_mesh", "shape"),
+    "PermutedMesh": ("underlying_mesh", "permutation"),
+    "SlicedMesh": ("underlying_mesh", "slices"),
+    "Slice": ("start", "stop", "step"),
+    "PhysicalLayoutTable": ("container_format", "tensor_entries", "file_paths"),
+    "DisjointStorageMeshList": ("disjoint_storage_mesh_list", "tensor_ids"),
+    "TensorComponentPos": ("tensor_id", "rank"),
+    "ConstraintViolationError": ("type_name", "constraint_name", "msg"),
+    "CheckFailedError": ("check_name", "msg"),
+    "NotFoundError": ("key_name", "key", "msg"),
+    "InvalidArgumentError": ("argument_name", "msg"),
+    "GDTensorIOError": ("file_path", "operation", "msg"),
+}
 
 
-@pytest.mark.parametrize("name", BUILDER_TYPES)
-def test_builder_types(name):
-    assert hasattr(builder, name), name
+def _snake(name):
+    name = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name).lower()
 
 
-@pytest.mark.parametrize("name", BUILDER_HELPERS)
-def test_builder_helpers(name):
-    assert callable(getattr(builder, name)), name
+def _declared_exports():
+    design = (ROOT / "docs" / "DTensorsView-design.md").read_text()
+    section = design[design.index("### C.3 用户主要 API 清单") :]
+    paths = re.findall(r"^\|[^\n]*?`(gdtensor(?:\.\w+)+)`", section, re.MULTILINE)
+    namespaces = {
+        n: set()
+        for n in (
+            "gdtensor",
+            "gdtensor.io",
+            "gdtensor.builder",
+            "gdtensor.session",
+            "gdtensor.access",
+            "gdtensor.tag",
+        )
+    }
+    for path in paths:
+        module, name = path.rsplit(".", 1)
+        namespaces[module].add(name)
+    for name in PRODUCT_FIELDS:
+        namespaces["gdtensor.builder"].update(
+            (name + "BuilderMixin", "new_" + _snake(name))
+        )
+    # C.2 explicitly defines these two tag construction primitives.
+    namespaces["gdtensor.tag"].update(("Box", "make_box_subclass"))
+    return namespaces
 
 
-@pytest.mark.parametrize("name", SESSION_TYPES)
-def test_session_types(name):
-    assert hasattr(session, name), name
+@pytest.mark.parametrize("namespace", list(_declared_exports()))
+def test_exports_are_exactly_the_design(namespace):
+    module = importlib.import_module(namespace)
+    expected = _declared_exports()[namespace]
+    assert len(module.__all__) == len(set(module.__all__))
+    assert set(module.__all__) == expected
+    visible = {
+        name
+        for name, value in vars(module).items()
+        if not name.startswith("_")
+        and name != "annotations"
+        and not inspect.ismodule(value)
+    }
+    assert visible == expected
 
 
-@pytest.mark.parametrize("name", ACCESS_TYPES)
-def test_access_types(name):
-    assert hasattr(access, name), name
+@pytest.mark.parametrize("name,fields", list(PRODUCT_FIELDS.items()))
+def test_products_mixins_and_factories(name, fields):
+    design = (ROOT / "docs" / "DTensorsView-design.md").read_text()
+    if name == "TensorComponentPos":
+        match = re.search(r"^TensorComponentPos = (.*)$", design, re.MULTILINE)
+        assert match is not None
+        declaration = match.group(1)
+        declared_fields = tuple(re.findall(r"\$(\w+)", declaration))
+    else:
+        match = re.search(
+            rf"^{name}(?:\[[^\n]*\])? =\n    Object\n(.*?)(?=^\S)",
+            design,
+            re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None
+        declaration = match.group(1)
+        declared_fields = tuple(re.findall(r"^  \* \$(\w+)", declaration, re.MULTILINE))
+    assert fields == declared_fields
+    cls = getattr(builder, name)
+    assert dataclasses.is_dataclass(cls)
+    assert tuple(f.name for f in dataclasses.fields(cls)) == fields
+    mixin = getattr(builder, name + "BuilderMixin")
+    assert mixin in cls.__bases__
+    assert (
+        "check_constraints" in cls.__dict__
+        and "check_constraints" not in mixin.__dict__
+    )
+    factory = getattr(builder, "new_" + _snake(name))
+    assert list(inspect.signature(factory).parameters) == []
+    assert type(factory()) is cls
+    for field in fields:
+        assert hasattr(mixin, "get_" + field) and hasattr(mixin, "set_" + field)
+    for method, fn in vars(mixin).items():
+        if method.startswith(("get_", "set_", "add_", "mutable_", "clear_")):
+            expected = (
+                ["self", "value"] if method.startswith(("set_", "add_")) else ["self"]
+            )
+            assert list(inspect.signature(fn).parameters) == expected
+    assert not any(n.startswith(("has_", "which_")) for n in dir(mixin))
 
 
-@pytest.mark.parametrize("name", TAG_TYPES)
-def test_tag_types(name):
-    assert hasattr(tag, name), name
+@pytest.mark.parametrize(
+    "path,parameters",
+    [
+        ("gdtensor.get_tensor_ids", ["view"]),
+        ("gdtensor.get_gd_tensor", ["view", "tensor_id"]),
+        ("gdtensor.make_gd_tensor", ["d_tensor"]),
+        ("gdtensor.get_d_tensor", ["gd_tensor"]),
+        ("gdtensor.reset_d_tensor", ["gd_tensor", "d_tensor"]),
+        ("gdtensor.io.rank_save", ["rank", "compute_view", "storage_view"]),
+        ("gdtensor.io.rank_load", ["rank", "compute_view", "storage_view"]),
+        ("gdtensor.io.rank_reshard", ["rank", "src_view", "dst_view"]),
+        ("gdtensor.builder.d_tensors_view_map", ["origin", "map_core"]),
+        ("gdtensor.builder.global_tensor_meta_of", ["named_d_tensor"]),
+        ("gdtensor.builder.tensor_order_value_of", ["d_tensor_table", "tensor_id"]),
+        ("gdtensor.builder.file_path_of", ["physical_layout", "pos"]),
+        (
+            "gdtensor.builder.leader_tensor_component_pos_of",
+            ["disjoint_storage_meshes"],
+        ),
+    ],
+)
+def test_function_signatures(path, parameters):
+    namespace, name = path.rsplit(".", 1)
+    fn = getattr(importlib.import_module(namespace), name)
+    assert list(inspect.signature(fn).parameters) == parameters
 
 
-def test_top_level_has_no_unspecd_api():
-    """Top-level short names must be exactly the spec bridge + Result/Error."""
-    allowed = set(TOP_LEVEL) | {"annotations", "__doc__", "__name__", "__package__",
-                                "__loader__", "__spec__", "__path__", "__file__",
-                                "__cached__", "__builtins__"}
-    extra = {n for n in dir(gdtensor) if not n.startswith("_")} - allowed
-    # internal submodules imported for namespacing are allowed; bare functions
-    # that are not spec bridge names are not.
-    extra_fns = {n for n in extra if callable(getattr(gdtensor, n))
-                 and not inspect.ismodule(getattr(gdtensor, n))}
-    assert extra_fns == set(), f"unspecd top-level callables: {extra_fns}"
+def test_type_aliases_and_namespace_separation():
+    for name in (
+        "DTensorsView",
+        "GenericDTensor",
+        "Placement",
+        "ComputeMesh",
+        "StorageMesh",
+        "ContentSlotsMesh",
+    ):
+        assert isinstance(getattr(builder, name), types.UnionType)
+        assert not hasattr(builder, name + "BuilderMixin")
+    assert isinstance(gdtensor.Error, types.UnionType)
+    assert not hasattr(builder, "Error")
+    for name in ("Ok", "Err"):
+        assert hasattr(tag, name) and not hasattr(gdtensor, name)
+    for name in (
+        "get_tensor_ids",
+        "get_gd_tensor",
+        "make_gd_tensor",
+        "get_d_tensor",
+        "reset_d_tensor",
+    ):
+        assert hasattr(gdtensor, name) and not hasattr(builder, name)
+    for name in ("StorageSaveSession", "StorageLoadSession", "DTensorDataAccessor"):
+        assert not hasattr(builder, name)
 
 
-def test_io_exposes_only_three_verbs():
-    public = {n for n in dir(gio) if not n.startswith("_") and
-              callable(getattr(gio, n)) and not inspect.ismodule(getattr(gio, n))}
-    assert public == set(IO_FNS), public
+@pytest.mark.parametrize(
+    "file",
+    sorted((ROOT / "tests").glob("*.py"))
+    + sorted((ROOT / "gdtensor_sim").glob("*.py")),
+    ids=lambda p: str(p.relative_to(ROOT)),
+)
+def test_tests_and_sim_use_no_core_internal_api(file):
+    tree = ast.parse(file.read_text())
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.Import):
+            names = [item.name for item in node.names]
+        else:
+            names = [node.module or ""]
+        assert all(not name.startswith("gdtensor.internal") for name in names), (
+            file.name,
+            node.lineno,
+        )
+    # Dynamic imports must not bypass the namespace checks.
+    assert not re.search(
+        r"(?:import_module|__import__)\([\"']gdtensor\.internal", file.read_text()
+    )
 
 
-def test_bridge_function_arities():
-    """Spec B.1.4 argument names."""
-    sig = inspect.signature(gdtensor.make_gd_tensor)
-    assert "d_tensor" in sig.parameters
-    sig = inspect.signature(gdtensor.reset_d_tensor)
-    assert list(sig.parameters)[:2] == ["gd_tensor", "d_tensor"]
-    sig = inspect.signature(gdtensor.get_gd_tensor)
-    assert list(sig.parameters) == ["view", "tensor_id"]
+def test_core_contains_no_simulation_or_business_runtime():
+    forbidden = {
+        "ComputeFabric",
+        "ComputeDataAccessor",
+        "ModelConfig",
+        "ParallelConfig",
+        "gd_for_layout",
+        "fabric_from_torch",
+        "torch_from_fabric",
+        "make_storage_view",
+        "FileIO",
+        "build_layout",
+    }
+    for file in sorted((ROOT / "gdtensor").rglob("*.py")):
+        tree = ast.parse(file.read_text())
+        for node in ast.walk(tree):
+            _check_core_node(node, file, forbidden)
 
 
-def test_no_reduce_api_anywhere_core():
-    """Design 9 / 10.3: core provides no reduce/merge/mean."""
-    for mod in (gdtensor, gio, builder):
-        for forbidden in ("rank_reduce", "rank_mean", "rank_average",
-                          "lawa", "merge_checkpoints", "welford"):
-            assert not hasattr(mod, forbidden), (mod.__name__, forbidden)
+def _check_core_node(node, file, forbidden):
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        assert node.name not in forbidden, (file, node.name)
+    if isinstance(node, ast.ImportFrom):
+        assert not (node.module or "").startswith("gdtensor_sim"), file
+
+
+def test_no_reduction_api():
+    for namespace in _declared_exports():
+        module = importlib.import_module(namespace)
+        for name in (
+            "rank_reduce",
+            "rank_mean",
+            "average",
+            "lawa",
+            "merge_checkpoints",
+            "welford",
+        ):
+            assert not hasattr(module, name)
+
+
+@pytest.mark.parametrize(
+    "file",
+    sorted(
+        path
+        for directory in ("gdtensor", "gdtensor_sim", "tests")
+        for path in (ROOT / directory).rglob("*.py")
+    ),
+    ids=lambda path: str(path.relative_to(ROOT)),
+)
+def test_code_blocks_use_at_most_three_indent_levels(file):
+    source = file.read_text()
+    indentation = {
+        number: len(line) - len(line.lstrip())
+        for number, line in enumerate(source.splitlines(), 1)
+    }
+    nodes = ast.walk(ast.parse(source))
+    violations = [
+        (node.lineno, indentation[node.lineno] // 4)
+        for node in nodes
+        if isinstance(node, ast.stmt) and indentation[node.lineno] > 12
+    ]
+    assert not violations, (
+        f"{file.relative_to(ROOT)}: (line, indent level)={violations}"
+    )

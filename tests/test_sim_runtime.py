@@ -1,0 +1,105 @@
+"""Check sim adapters against explicit dense ownership through public IO."""
+
+import multiprocessing as mp
+
+import numpy as np
+import pytest
+
+import gdtensor.tag as gt
+from gdtensor.builder import global_tensor_meta_of
+from gdtensor_sim.fabric import ComputeFabric
+from gdtensor_sim.models import (
+    ParallelConfig,
+    fill_pattern,
+    layout_builder,
+    pattern_bytes,
+    storage_table,
+)
+from gdtensor_sim.runner import load_threads, run_processes, save_threads
+from tensor_oracle import ArrayFabric
+from test_data_correctness import DST, LAYOUTS, SRC, _schema
+
+
+def _fill_values(values, nd, intervals):
+    indices = np.concatenate([np.arange(start, stop) for start, stop in intervals])
+    return (
+        values[nd.global_tensor_id].reshape(-1)[indices].copy().view(np.uint8).ravel()
+    )
+
+
+def _assert_fabric(fabric, oracle):
+    for rank, tensors in oracle.buffers.items():
+        for tid, expected in tensors.items():
+            actual = fabric.buffers.get(rank, {}).get(tid, np.empty(0, dtype=np.uint8))
+            np.testing.assert_array_equal(
+                actual, expected, err_msg=f"rank={rank} tensor={tid}"
+            )
+
+
+@pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
+@pytest.mark.parametrize("layout,mode", LAYOUTS)
+def test_sim_elastic_io_matches_independent_dense_oracle(tmp_path, fmt, layout, mode):
+    ct, points, values = _schema(SRC, column=True)
+    source = ComputeFabric(ct).allocate(
+        fill=lambda nd, iv: _fill_values(values, nd, iv)
+    )
+    _assert_fabric(source, ArrayFabric(ct, points, values))
+    p = ParallelConfig(pp=SRC[0], dp=SRC[1], tp=SRC[2])
+    st = storage_table(ct, p, mode)
+    physical = layout_builder(layout, st, p, fmt, 3)
+    results, _ = save_threads(ct, st, physical, str(tmp_path), source, p.world)
+    assert all(type(result) is gt.Ok for result in results.values()), results
+    loaded_ct, loaded_points, _ = _schema(DST, column=True)
+    loaded = ComputeFabric(loaded_ct).allocate()
+    results, _ = load_threads(
+        loaded_ct, st, physical, str(tmp_path), loaded, int(np.prod(DST))
+    )
+    assert all(type(result) is gt.Ok for result in results.values()), results
+    _assert_fabric(loaded, ArrayFabric(loaded_ct, loaded_points, values))
+
+
+@pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
+def test_sim_process_runner_finishes_and_loads_exact_bytes(tmp_path, fmt):
+    p = ParallelConfig(tp=2)
+    ct, points, _ = _schema((1, 1, 2))
+    st = storage_table(ct, p, "hf")
+    physical = layout_builder("single", st, p, fmt)
+    before = {process.pid for process in mp.active_children()}
+    saved, _, _ = run_processes(
+        "save", ct, st, physical, str(tmp_path), p.world, fill_pattern
+    )
+    loaded, _, buffers = run_processes("load", ct, st, physical, str(tmp_path), p.world)
+    assert all(type(result) is gt.Ok for result in [*saved.values(), *loaded.values()])
+    assert {process.pid for process in mp.active_children()} == before
+    _assert_process_buffers(ct, points, buffers)
+
+
+def _assert_process_buffers(table, points, buffers):
+    for rank, tensors in points.items():
+        for nd in table.named_d_tensors:
+            tid = nd.global_tensor_id
+            actual = buffers.get(rank, {}).get(tid, np.empty(0, dtype=np.uint8))
+            expected = pattern_bytes(
+                tid, global_tensor_meta_of(nd).itemsize, tensors[tid]
+            )
+            np.testing.assert_array_equal(actual, expected)
+
+
+def _fail_fill(nd, intervals):
+    raise ValueError("injected worker failure")
+
+
+def test_sim_process_runner_reaps_failed_workers(tmp_path):
+    p = ParallelConfig(tp=2)
+    ct, _, _ = _schema((1, 1, 2))
+    st = storage_table(ct, p, "hf")
+    physical = layout_builder("single", st, p, "safetensors")
+    before = {process.pid for process in mp.active_children()}
+    results, _, _ = run_processes(
+        "save", ct, st, physical, str(tmp_path), p.world, _fail_fill
+    )
+    assert all(type(result) is gt.Err for result in results.values())
+    assert all(
+        "injected worker failure" in result.value.msg for result in results.values()
+    )
+    assert {process.pid for process in mp.active_children()} == before

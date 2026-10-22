@@ -1,152 +1,154 @@
-"""Targeted mutation harness.
+"""Run behavioral mutations in a temporary checkout, using API tests as detectors.
 
-mutmut 3.8 is unstable in this runtime (stats collector and fork server
-hangs), so this script applies the same principle with a curated, high-value
-mutation set on the core functions. Each mutation flips one operator or
-boundary constant; a mutation is KILLED when the detector tests fail and
-SURVIVES when they still pass. Survivors point at missing test assertions.
-
-Usage: python tests/mutation_check.py
-Exit code: 0 when every mutation is killed, 1 otherwise.
+Usage: python3.12 tests/mutation_check.py
+Exit 0 means every mutation caused an assertion failure. Timeouts and collection
+errors are reported as harness errors. Each run has a 60-second limit and an
+8 MiB output cap. The working checkout is never modified.
 """
-from __future__ import annotations
 
+from pathlib import Path
+import os
+import resource
+import shutil
+import signal
 import subprocess
 import sys
-import time
-from dataclasses import dataclass
+import tempfile
 
-DETECTORS = [
-    "tests/test_interval_math.py",
-    "tests/test_interval_properties.py",
-    "tests/test_whole_tensor.py",
-    "tests/test_exhaustive.py",
-    "tests/test_checks.py",
-    "tests/test_matrix.py",
-    "tests/test_adversarial.py",
-    "tests/test_consistency.py",
-]
-
-# Equivalent / non-behavioral mutations are excluded with a reason:
-# - pair subtraction/early-exit: subtracting src_iv is clamped by the later
-#   full-coverage check; the early exit is an optimization (todo.size is
-#   rechecked on the next src iteration). Plan equality is covered directly
-#   by tests/oracle.py check_pair_identity over 286 configurations.
-# - intersect side flips only change zero-width rows dropped by keep = e > s;
-#   subtract advance variants are swept by 60-seed property trials.
-EQUIVALENT = {
-    # plan: covered by the later full-coverage raise / next-iteration guard;
-    # pair element identity is pinned directly by tests/oracle.py.
-    "pair subtraction scope",
-    "pair early-exit guard",
-    # intersect searchsorted side flips only change which zero-width rows are
-    # emitted; the final `keep = e > s` drops them. Canonical output form is
-    # asserted by test_interval_properties (positive width, sorted, disjoint).
-    "intersect lo boundary",
-    "intersect hi boundary",
-    "intersect touching intervals",
-    # subtract advance conditions: j/k may point one row further, but skipped
-    # rows are rechecked against the next current point; brute-force property
-    # trials (60 seeds x partitions) confirm identical output sets.
-    "subtract advance condition",
-    "subtract inner condition",
-    # layout gap check: a missing middle KV is rejected by read_chunk's
-    # "no KV covers offset" path; test_gap_in_layout_journal_is_detected_on_read
-    # pins the end-to-end behavior across every blob and chunk.
-    "KV gap check",
-}
-
-# (file, find, replace, description). find must be unique in the file.
+ROOT = Path(__file__).resolve().parents[1]
+# file, original, replacement, detector
 MUTATIONS = [
-    # ---- iv_normalize
-    ("gdtensor/internal/dtensor.py", "iv[:, 1] > iv[:, 0]", "iv[:, 1] >= iv[:, 0]", "normalize keeps empty intervals"),
-    ("gdtensor/internal/dtensor.py", "new[1:] = starts[1:] > ends[:-1]", "new[1:] = starts[1:] >= ends[:-1]", "normalize merge boundary"),
-    # ---- iv_intersect
-    ("gdtensor/internal/dtensor.py", 'np.searchsorted(b[:, 1], a[:, 0], side="right")',
-     'np.searchsorted(b[:, 1], a[:, 0], side="left")', "intersect lo boundary"),
-    ("gdtensor/internal/dtensor.py", 'np.searchsorted(b[:, 0], a[:, 1], side="left")',
-     'np.searchsorted(b[:, 0], a[:, 1], side="right")', "intersect hi boundary"),
-    ("gdtensor/internal/dtensor.py", "keep = e > s", "keep = e >= s", "intersect touching intervals"),
-    # ---- iv_subtract
-    ("gdtensor/internal/dtensor.py", "while j < len(b) and b[j, 1] <= cur:", "while j < len(b) and b[j, 1] < cur:", "subtract advance condition"),
-    ("gdtensor/internal/dtensor.py", "while k < len(b) and b[k, 0] < e:", "while k < len(b) and b[k, 0] <= e:", "subtract inner condition"),
-    ("gdtensor/internal/dtensor.py", "if bs > cur:", "if bs >= cur:", "subtract output boundary"),
-    ("gdtensor/internal/dtensor.py", "cur = max(cur, be)", "cur = cur + be", "subtract progress arithmetic"),
-    # ---- iv_prefix
-    ("gdtensor/internal/dtensor.py", "np.searchsorted(iv[:, 0], points, side=\"right\") - 1",
-     "np.searchsorted(iv[:, 0], points, side=\"left\") - 1", "prefix search side"),
-    ("gdtensor/internal/dtensor.py", "np.any(points >= iv[np.maximum(k, 0), 1])",
-     "np.any(points > iv[np.maximum(k, 0), 1])", "prefix range end check"),
-    # ---- box_to_intervals
-    ("gdtensor/internal/dtensor.py", "while k > 0 and lo[k] == 0 and hi[k] == shape[k]:",
-     "while k > 0 and lo[k] == 0:", "box interval trailing-axis rule"),
-    ("gdtensor/internal/dtensor.py", "c = -(-n // parts) if n else 0", "c = n // parts if n else 0", "torch.chunk ceil rule"),
-    ("gdtensor/internal/dtensor.py", "return s, min(s + c, n)", "return s, s + c", "chunk no clamp at end"),
-    # ---- plan _pair
-    ("gdtensor/internal/plan.py", "todo = iv_subtract(todo, piece)",
-     "todo = iv_subtract(todo, src_iv)", "pair subtraction scope"),
-    ("gdtensor/internal/plan.py", 'raise invalid("src_view", f"no source covers {iv_total(todo)} destination elements")',
-     'pass  # mutation: coverage check removed', "pair full-coverage enforcement"),
-    ("gdtensor/internal/plan.py", "if todo.size == 0:\n                break",
-     "if False:  # mutation\n                break", "pair early-exit guard"),
-    # ---- layout slot ordering
-    ("gdtensor/internal/layout.py", "for t, w in list_cells(lst):  # row-major: header order, then column order",
-     "for t, w in sorted(list_cells(lst), key=lambda c: (c[1], c[0])):  # mutation: column-major",
-     "payload slot order"),
-    ("gdtensor/internal/layout.py", "if path in files:\n            raise invalid(\"file_paths\", f\"two lists map to one path {path}\")",
-     "if False:\n            raise invalid(\"file_paths\", f\"two lists map to one path {path}\")", "duplicate path guard"),
-    # ---- formats whole-tensor detection
-    ("gdtensor/internal/formats.py", "ok = iv[0, 0] == 0 and iv[-1, 1] == numel and bool(np.all(iv[1:, 0] == iv[:-1, 1]))",
-     "ok = iv[0, 0] == 0 and iv[-1, 1] == numel", "whole-tensor contiguity check"),
+    (
+        "gdtensor/internal/api.py",
+        "return replace(view, data_accessor=must_ok(session.init_data_accessor()))",
+        "return view",
+        "tests/test_io_contract.py::test_custom_sessions_and_accessors",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        'except BaseException:\n        _cleanup(session, "finish")\n        raise',
+        "except BaseException:\n        raise",
+        "tests/test_io_contract.py::test_io_failure_closes_sessions",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "if read_size != src.size:",
+        "if True:",
+        "tests/test_io_contract.py::test_chunked_callbacks_use_independent_read_and_write_boundaries",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "if written != dst.size:",
+        "if False:",
+        "tests/test_io_contract.py::test_io_rejects_accessor_that_skips_callback",
+    ),
+    (
+        "gdtensor/internal/torch_bridge.py",
+        "return list(view.tensor_ids)",
+        "return view.tensor_ids",
+        "tests/test_api.py::test_bridge_plain_values_and_result_lookup",
+    ),
+    (
+        "gdtensor/internal/plan.py",
+        "RangeFromComputeView(tid, int(a) * isz, int(b - a) * isz)",
+        "RangeFromComputeView(tid, (int(a) + 256) * isz, int(b - a) * isz)",
+        "tests/test_walkthrough.py::test_small_arange_crc_and_elastic_load",
+    ),
+    (
+        "gdtensor/internal/dtensor.py",
+        "c = -(-n // parts) if n else 0",
+        "c = n // parts if n else 0",
+        "tests/test_walkthrough.py::test_small_arange_crc_and_elastic_load",
+    ),
+    (
+        "gdtensor/builder.py",
+        'return Err(\n        InvalidArgumentError(\n            argument_name="callback", msg="callback must return a Result"\n        )\n    )',
+        "return Ok(value)",
+        "tests/test_api.py::test_view_map_requires_result_callbacks",
+    ),
+    (
+        "gdtensor/builder.py",
+        "    ConstraintViolationError,\n",
+        "    Error, ConstraintViolationError,\n",
+        "tests/test_api_conformance.py::test_exports_are_exactly_the_design",
+    ),
 ]
 
 
-@dataclass
-class Verdict:
-    desc: str
-    killed: bool
-    note: str = ""
+def _limit_output():
+    resource.setrlimit(resource.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024))
 
 
-def apply(path: str, find: str, replace: str, do: bool) -> None:
-    text = open(path).read()
-    if do:
-        assert text.count(find) == 1, f"{path}: pattern not unique ({text.count(find)}): {find[:60]}"
-        open(path, "w").write(text.replace(find, replace))
-    else:
-        assert text.count(replace) == 1, f"{path}: restore target not found: {replace[:60]}"
-        open(path, "w").write(text.replace(replace, find))
+def _run(snapshot, detector, log):
+    env = dict(
+        os.environ, PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"
+    )
+    with log.open("wb") as output:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-xq", "-p", "no:cacheprovider", detector],
+            cwd=snapshot,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            preexec_fn=_limit_output,
+        )
+        try:
+            return process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            return -1
 
 
-def run_detectors() -> bool:
-    cmd = [sys.executable, "-m", "pytest", "-x", "-q"] + DETECTORS
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode == 0
+def _copy_checkout(snapshot):
+    for name in ("gdtensor", "gdtensor_sim", "tests", "docs"):
+        shutil.copytree(
+            ROOT / name,
+            snapshot / name,
+            ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"),
+        )
 
 
-def main() -> int:
-    verdicts = []
-    for path, find, replace, desc in MUTATIONS:
-        apply(path, find, replace, True)
-        t0 = time.time()
-        killed = not run_detectors()
-        dt = time.time() - t0
-        apply(path, find, replace, False)  # restore original exactly
-        verdicts.append(Verdict(desc, killed, f"{dt:.1f}s"))
-        print(f"{'KILLED' if killed else 'SURVIVED':9} {desc} ({dt:.1f}s)")
-    real = [v for v in verdicts if v.desc not in EQUIVALENT]
-    n_kill = sum(v.killed for v in real)
-    print(f"\n{n_kill}/{len(real)} effective mutations killed")
-    survived = [v for v in real if not v.killed]
-    equiv = [v for v in verdicts if v.desc in EQUIVALENT]
-    for v in equiv:
-        print(f"EQUIV    {v.desc}")
-    if survived:
-        print("SURVIVORS (test gaps):")
-        for v in survived:
-            print(f"  - {v.desc}")
-        return 1
-    return 0
+def _check_baseline(snapshot, detector):
+    log = snapshot / "baseline.log"
+    print(f"BASELINE: {detector}", flush=True)
+    if _run(snapshot, detector, log) != 0:
+        print(log.read_text()[-6000:])
+        raise SystemExit(f"baseline failed: {detector}")
+
+
+def _apply_mutation(snapshot, index, mutation):
+    file, original, replacement, detector = mutation
+    path = snapshot / file
+    source = path.read_text()
+    assert source.count(original) == 1, (file, original)
+    path.write_text(source.replace(original, replacement))
+    log = snapshot / f"mutation-{index}.log"
+    print(f"RUN: {file}: {original.splitlines()[0]} -> {detector}", flush=True)
+    try:
+        status = _run(snapshot, detector, log)
+    finally:
+        path.write_text(source)
+    verdict = "KILLED" if status == 1 else "SURVIVED" if status == 0 else "ERROR"
+    print(f"{verdict}: {file}: {original.splitlines()[0]}", flush=True)
+    if status not in (0, 1):
+        print(log.read_text()[-6000:])
+    return status == 1
+
+
+def main():
+    with tempfile.TemporaryDirectory(prefix="gdtensor-mutations-") as directory:
+        snapshot = Path(directory)
+        _copy_checkout(snapshot)
+        for detector in sorted({mutation[3] for mutation in MUTATIONS}):
+            _check_baseline(snapshot, detector)
+        killed = sum(
+            _apply_mutation(snapshot, index, mutation)
+            for index, mutation in enumerate(MUTATIONS)
+        )
+        print(f"{killed}/{len(MUTATIONS)} mutations killed", flush=True)
+        return int(killed != len(MUTATIONS))
 
 
 if __name__ == "__main__":

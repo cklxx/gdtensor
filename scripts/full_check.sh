@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
-# Full local gate: every pytest including gated torch bridge tests.
-# Requires torch and a single-process gloo group; sets env itself.
 set -euo pipefail
-
 cd "$(git rev-parse --show-toplevel)"
 
-PY="${PYTHON:-python3}"
-if command -v ruff >/dev/null 2>&1; then RUFF="ruff"; else RUFF="$PY -m ruff"; fi
+echo "[full-check] 1/5 fmt check"
+uv run --locked ruff format --check gdtensor gdtensor_sim tests
 
-$RUFF check --select F401 --no-cache gdtensor gdtensor_sim tests
-$PY -m compileall -q gdtensor gdtensor_sim tests
+echo "[full-check] 2/5 lint"
+uv run --locked ruff check --no-cache gdtensor gdtensor_sim tests
 
-export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-export MASTER_PORT="${MASTER_PORT:-29500}"
-export RANK=0
-export WORLD_SIZE=1
-export GDTENSOR_TORCH_TESTS=1
+echo "[full-check] 3/5 type check"
+uv run --locked --extra torch ty check --error-on-warning
+uv run --locked --extra torch pyrefly check --min-severity=warn
 
-$PY -m pytest -q -p no:cacheprovider
+echo "[full-check] 4/5 byte-compile"
+uv run --locked python -m compileall -q gdtensor gdtensor_sim tests
 
-echo "[full-check] OK"
+echo "[full-check] 5/5 all pytest files; real torch rank tests enabled"
+GDTENSOR_TORCH_TESTS=1 uv run --locked --extra torch pytest \
+  -v --capture=tee-sys --log-cli-level=INFO -p no:cacheprovider
