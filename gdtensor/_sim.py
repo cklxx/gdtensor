@@ -23,6 +23,7 @@ import numpy as np
 from ._iobackend import FileIO, IoTracer, MiB
 from ._layout import build_payload_index
 from ._dtensor import tensor_ids_of
+from ._dtensor import named_of
 from ._models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
 from ._plan import check_physical_layout
 from ._runner import load_threads, run_processes, save_threads
@@ -121,7 +122,9 @@ def main(argv=None) -> dict:
     mode = "hf" if a.layout in ("hf", "single", "per_stage") else "mirror"
     st = storage_table(ct, p, mode, aggregate_tp=a.aggregate_tp)
     lay = layout_builder(a.layout, st, p, a.format, a.hf_shards)
-    check_physical_layout(st, lay).unwrap()
+    layout_result = check_physical_layout(st, lay)
+    if type(layout_result).__name__ != "Ok":
+        raise SystemExit(f"bad layout: {layout_result.value}")
     index = build_payload_index(st, lay)
     t_plan = time.perf_counter() - t
 
@@ -134,7 +137,7 @@ def main(argv=None) -> dict:
         res, wio = save_threads(ct, st, lay, a.root, fab, p.world)
         wrecs = wio.tracer.records
     t_save = time.perf_counter() - t0
-    bad = {r: x.value for r, x in res.items() if not x.ok}
+    bad = {r: x.value for r, x in res.items() if type(x).__name__ != "Ok"}
     if bad:
         raise SystemExit(f"save failed: {bad}")
 
@@ -146,10 +149,10 @@ def main(argv=None) -> dict:
     rio = FileIO(IoTracer())
     res2, _ = load_threads(ct2, st, lay, a.root, fab2, lp.world, rio)
     t_load = time.perf_counter() - t1
-    bad = {r: x.value for r, x in res2.items() if not x.ok}
+    bad = {r: x.value for r, x in res2.items() if type(x).__name__ != "Ok"}
     if bad:
         raise SystemExit(f"load failed: {bad}")
-    ok = all(np.array_equal(buf, fill_pattern(ct2.named_d_tensors[ct2._order[tid]], fab2.intervals(r, tid)))
+    ok = all(np.array_equal(buf, fill_pattern(named_of(ct2, tid), fab2.intervals(r, tid)))
              for r, bufs in fab2.buffers.items() for tid, buf in bufs.items())
 
     report = {
