@@ -29,7 +29,7 @@ save 终态为 commit 或 abort；load 只有 finish。commit 结果未知时保
 ## 仿真 CLI（内部工具）
 
 ```bash
-python3 -m gdtensor._sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer \
+python3 -m gdtensor.internal.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer \
   --layout hf --format safetensors
 ```
 

@@ -5,10 +5,10 @@ get_/set_/add_/mutable_/clear_ methods.
 """
 from __future__ import annotations
 
-from gdtensor._dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor
-from gdtensor._layout import PhysicalLayoutTable
-from gdtensor._mesh import ArrangedMesh
-from gdtensor._ranges import RangeFromComputeView
+from gdtensor.internal.dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor
+from gdtensor.internal.layout import PhysicalLayoutTable
+from gdtensor.internal.mesh import ArrangedMesh
+from gdtensor.internal.ranges import RangeFromComputeView
 from gdtensor.tag import Replicate, WorldSize
 
 

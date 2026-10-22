@@ -15,28 +15,28 @@ import numpy as np
 import pytest
 
 from conftest import assert_all_ok
-from gdtensor._api import d_tensors_view_rank_plan_reshard
-from gdtensor._dtensor import tensor_ids_of as _ids
-from gdtensor._layout import (
+from gdtensor.internal.api import d_tensors_view_rank_plan_reshard
+from gdtensor.internal.dtensor import tensor_ids_of as _ids
+from gdtensor.internal.layout import (
     DisjointStorageMeshList, PhysicalLayoutTable, TensorComponentPos, build_payload_index,
     leader_tensor_component_pos_of,
 )
-from gdtensor._mesh import ArrangedMesh, storage_mesh_cells
+from gdtensor.internal.mesh import ArrangedMesh, storage_mesh_cells
 from gdtensor.tag import ConstantOne, TensorCount, WorldSize
-from gdtensor._models import ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table
+from gdtensor.internal.models import ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table
 
 M = ModelConfig(layers=4, hidden=32, ffn=64, vocab=128)
 MOE = ModelConfig(layers=2, hidden=32, ffn=48, vocab=128, experts=4)
 P = ParallelConfig(tp=2, dp=2, pp=2)
-from gdtensor._plan import (
+from gdtensor.internal.plan import (
     check_compute_d_tensors_access_disjoint, check_compute_d_tensors_access_full_covering,
     check_physical_layout, check_storage_d_tensors_access_disjoint, check_storage_d_tensors_access_full_covering,
     check_storage_mesh_disjoint, d_tensors_view_rank_plan_load, d_tensors_view_rank_plan_save,
 )
-from gdtensor._ranges import RangeFromComputeView, RangeFromStorageView
-from gdtensor._formats import make_storage_view
-from gdtensor._runner import compute_view
-from gdtensor._views import ComputeFabric
+from gdtensor.internal.ranges import RangeFromComputeView, RangeFromStorageView
+from gdtensor.internal.formats import make_storage_view
+from gdtensor.internal.runner import compute_view
+from gdtensor.internal.views import ComputeFabric
 
 
 def _fixture(m=M, p=P, kind="hf", mode="hf"):
@@ -52,7 +52,7 @@ def _rank_plans(ct, sv, world):
     ps, pl = {}, {}
     for r in range(world):
         cv = compute_view(ct, None, r)
-        from gdtensor._views import ComputeDataAccessor
+        from gdtensor.internal.views import ComputeDataAccessor
         cv.data_accessor = ComputeDataAccessor(r, None)
         ps[r] = d_tensors_view_rank_plan_save(r, cv, sv).unwrap()
         pl[r] = d_tensors_view_rank_plan_load(r, cv, sv).unwrap()
@@ -140,7 +140,7 @@ def test_layout_rejects_row_label_mismatch():
 
 
 def test_storage_mesh_disjoint_rejects_overlap():
-    from gdtensor._mesh import OuterProductMesh, Slice, SlicedMesh
+    from gdtensor.internal.mesh import OuterProductMesh, Slice, SlicedMesh
     base = OuterProductMesh(ArrangedMesh(TensorCount(2)), ArrangedMesh(WorldSize(4)))
     a = SlicedMesh(base, (Slice(0, 1), Slice(0, 2)))
     c = SlicedMesh(base, (Slice(0, 2), Slice(1, 3)))
@@ -149,7 +149,7 @@ def test_storage_mesh_disjoint_rejects_overlap():
 
 
 def test_storage_mesh_disjoint_accepts_touching_boundary():
-    from gdtensor._mesh import OuterProductMesh, Slice, SlicedMesh
+    from gdtensor.internal.mesh import OuterProductMesh, Slice, SlicedMesh
     base = OuterProductMesh(ArrangedMesh(TensorCount(1)), ArrangedMesh(WorldSize(4)))
     a = SlicedMesh(base, (None, Slice(0, 2)))
     b = SlicedMesh(base, (None, Slice(2, 4)))
@@ -158,8 +158,8 @@ def test_storage_mesh_disjoint_accepts_touching_boundary():
 
 def test_empty_slot_layout_passes():
     # 3-column world where one tensor uses columns 0,2 and another column 0.
-    from gdtensor._dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard
-    from gdtensor._mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
+    from gdtensor.internal.dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, Replicate, Shard
+    from gdtensor.internal.mesh import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
     W = 3
     base = OuterProductMesh(ArrangedMesh(ConstantOne(1)), ArrangedMesh(WorldSize(W)))
     a = NamedDTensor("A", NaiveDTensor(GlobalTensorMeta((200,), "U8", 1),
@@ -169,7 +169,7 @@ def test_empty_slot_layout_passes():
                                        (Replicate(), Replicate()),
                                        SlicedMesh(base, (None, Slice(0, 1)))))
     st = DTensorTable([a, b])
-    from gdtensor._layout import build_layout
+    from gdtensor.internal.layout import build_layout
     lay = build_layout(st, W, "safetensors", lambda t, w, nd: "f.safetensors")
     assert check_physical_layout(st, lay).ok
     assert TensorComponentPos("A", 1) not in lay.tensor_entries  # empty slot: no entry
@@ -300,7 +300,7 @@ def test_reshard_compute_to_compute_per_rank_disjoint_and_covering():
 
 
 def _cv(table, rank):
-    from gdtensor._views import ComputeDataAccessor, ComputeDTensorsView
+    from gdtensor.internal.views import ComputeDataAccessor, ComputeDTensorsView
     cv = ComputeDTensorsView(_ids(table), table, ComputeDataAccessor(rank, None))
     cv.data_accessor = ComputeDataAccessor(rank, None)
     return cv
@@ -319,8 +319,8 @@ def test_two_lists_mapping_to_one_path_is_rejected():
     victim_paths = dict(lay.file_paths)
     victim_paths[leaders[1]] = victim_paths[leaders[0]]
     bad = PhysicalLayoutTable(lay.container_format, dict(lay.tensor_entries), victim_paths)
-    from gdtensor._plan import check_physical_layout
+    from gdtensor.internal.plan import check_physical_layout
     assert not check_physical_layout(st, bad).ok
-    from gdtensor._layout import build_payload_index
+    from gdtensor.internal.layout import build_payload_index
     with pytest.raises(Exception):
         build_payload_index(st, bad)

@@ -17,10 +17,10 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from gdtensor._dtensor import global_tensor_meta_of, iv_normalize, iv_total, named_of, owned_intervals
-from gdtensor._layout import PayloadIndex
-from gdtensor._models import interval_elems
-from gdtensor._ranges import RangeFromComputeView, RangeFromStorageView
+from gdtensor.internal.dtensor import global_tensor_meta_of, iv_normalize, iv_total, named_of, owned_intervals
+from gdtensor.internal.layout import PayloadIndex
+from gdtensor.internal.models import interval_elems
+from gdtensor.internal.ranges import RangeFromComputeView, RangeFromStorageView
 
 
 def _slot_of(index: PayloadIndex, rng: RangeFromStorageView):

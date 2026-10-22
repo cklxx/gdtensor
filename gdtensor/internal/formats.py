@@ -35,11 +35,11 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ._dtensor import DTensorTable, global_tensor_meta_of, nbytes_of, numel_of, owned_box
-from ._iobackend import FileIO
-from ._layout import PayloadIndex, PhysicalLayoutTable, SlotPayload, TensorComponentPos, build_payload_index, pos_key
-from ._result import Fail, catch, invalid, io_error, not_found
-from .session import StorageLoadSession, StorageSaveSession
+from .dtensor import DTensorTable, global_tensor_meta_of, nbytes_of, numel_of, owned_box
+from .iobackend import FileIO
+from .layout import PayloadIndex, PhysicalLayoutTable, SlotPayload, TensorComponentPos, build_payload_index, pos_key
+from .result import Fail, catch, invalid, io_error, not_found
+from ..session import StorageLoadSession, StorageSaveSession
 
 METADATA_NAME = ".metadata"
 HF_INDEX_NAME = "model.safetensors.index.json"
@@ -166,7 +166,7 @@ class SaveSessionBase(_Base, StorageSaveSession):
     def init_data_accessor(self):
         if self.state != "open":
             raise invalid("session", f"init_data_accessor on {self.state} session")
-        from ._views import StorageDataAccessor
+        from .views import StorageDataAccessor
         return StorageDataAccessor(self.index, self.io, session=self)
 
     @catch
@@ -329,7 +329,7 @@ class LoadSessionBase(_Base, StorageLoadSession):
     def init_data_accessor(self):
         if self.state != "open":
             raise invalid("session", f"init_data_accessor on {self.state} session")
-        from ._views import StorageDataAccessor
+        from .views import StorageDataAccessor
         return StorageDataAccessor(self.index, self.io, session=self)
 
     @catch
@@ -411,7 +411,7 @@ def make_storage_view(
     coord=None,
 ):
     """Business constructor: a StorageDTensorsView over files in ``root``."""
-    from ._views import StorageDataAccessor, StorageDTensorsView
+    from .views import StorageDataAccessor, StorageDTensorsView
 
     io = io or FileIO()
     index = build_payload_index(table, layout)

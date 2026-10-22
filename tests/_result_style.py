@@ -29,7 +29,7 @@ def install():
     def unwrap_ok(self):
         return self.value
     def unwrap_err(self):
-        import gdtensor._result as R
+        import gdtensor.internal.result as R
         raise R.Fail(self.value)
     Ok.unwrap = unwrap_ok
     Err.unwrap = unwrap_err

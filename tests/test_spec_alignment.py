@@ -15,17 +15,17 @@ import pytest
 from gdtensor import get_d_tensor, get_gd_tensor, get_tensor_ids  # noqa: F401
 from gdtensor.access import DTensorDataAccessor
 from gdtensor.builder import DTensorsViewMapCore, d_tensors_view_map
-from gdtensor._constraints import check_constraints
-from gdtensor._dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, tensor_ids_of
-from gdtensor._formats import make_storage_view
-from gdtensor._mesh import (
+from gdtensor.internal.constraints import check_constraints
+from gdtensor.internal.dtensor import DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor, tensor_ids_of
+from gdtensor.internal.formats import make_storage_view
+from gdtensor.internal.mesh import (
     ArrangedMesh, LiteralMesh, OuterProductMesh, ReshapedMesh, Slice, SlicedMesh,
     resolve_compute_mesh, resolve_storage_mesh, storage_mesh_cells,
 )
-from gdtensor._models import (
+from gdtensor.internal.models import (
     ModelConfig, ParallelConfig, compute_table, layout_builder, storage_table,
 )
-from gdtensor._runner import compute_view
+from gdtensor.internal.runner import compute_view
 from gdtensor.session import StorageLoadSession, StorageSaveSession
 from gdtensor.builder import (
     CheckFailedError, ConstraintViolationError, GDTensorIOError,
@@ -34,7 +34,7 @@ from gdtensor.builder import (
 from gdtensor.tag import (
     Box, ConstantOne, Err, Ok, Partial, Replicate, Shard, TensorCount, WorldSize,
 )
-from gdtensor._views import ComputeFabric
+from gdtensor.internal.views import ComputeFabric
 
 M = ModelConfig(layers=1, hidden=8, ffn=12, vocab=16)
 
@@ -199,8 +199,8 @@ def test_get_and_reset_d_tensor_metadata_only():
 def test_concrete_sessions_are_spec_subclasses(tmp_path):
     import os
     from conftest import assert_all_ok
-    from gdtensor._models import fill_pattern
-    from gdtensor._runner import save_threads
+    from gdtensor.internal.models import fill_pattern
+    from gdtensor.internal.runner import save_threads
     from gdtensor.tag import Ok
     p = ParallelConfig(tp=1, dp=1, pp=1)
     ct = compute_table(M, p)

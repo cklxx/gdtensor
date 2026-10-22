@@ -17,8 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _result_style import install  # noqa: E402
 install()  # noqa: E402
 
-from gdtensor._dtensor import global_tensor_meta_of, iv_normalize, iv_total, named_of, nbytes_of, numel_of, owned_intervals  # noqa: E402
-from gdtensor._models import fill_pattern, full_tensor_bytes, interval_elems, pattern_bytes  # noqa: E402
+from gdtensor.internal.dtensor import global_tensor_meta_of, iv_normalize, iv_total, named_of, nbytes_of, numel_of, owned_intervals  # noqa: E402
+from gdtensor.internal.models import fill_pattern, full_tensor_bytes, interval_elems, pattern_bytes  # noqa: E402
 
 
 def raw_header(path):

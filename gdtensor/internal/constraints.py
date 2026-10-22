@@ -12,8 +12,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from ._result import ConstraintViolationError, ERROR_TYPES
-from .tag import Box, Err, Ok
+from .result import ConstraintViolationError, ERROR_TYPES
+from ..tag import Box, Err, Ok
 
 
 def _err(obj, constraint: str, msg: str):
@@ -60,7 +60,7 @@ def check_constraints(obj: Any):
 
 
 def _compute_view(o):
-    from ._dtensor import tensor_ids_of
+    from .dtensor import tensor_ids_of
     if tensor_ids_of(o.d_tensor_table) != list(o.tensor_ids):
         return _err(o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table")
     if o.data_accessor is None:
@@ -69,7 +69,7 @@ def _compute_view(o):
 
 
 def _storage_view(o):
-    from ._dtensor import tensor_ids_of
+    from .dtensor import tensor_ids_of
     if tensor_ids_of(o.d_tensor_table) != list(o.tensor_ids):
         return _err(o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table")
     if o.physical_layout is not None:
@@ -98,8 +98,8 @@ def _named(o):
 
 
 def _naive(o):
-    from ._mesh import mesh_shape
-    from .tag import Shard
+    from .mesh import mesh_shape
+    from ..tag import Shard
     try:
         shape = mesh_shape(o.mesh)
     except Exception as exc:  # noqa: BLE001
@@ -131,7 +131,7 @@ def _meta(o):
 
 
 def _layout(o):
-    from ._layout import leader_tensor_component_pos_of, list_cells, pos_key
+    from .layout import leader_tensor_component_pos_of, list_cells, pos_key
     if o.container_format not in ("safetensors", "distcp"):
         return _err(o, "container_format_unique", f"unknown container_format {o.container_format!r}")
     leaders, seen_cells = set(), set()
@@ -155,7 +155,7 @@ def _layout(o):
 
 
 def _list(o):
-    from ._mesh import storage_mesh_cells
+    from .mesh import storage_mesh_cells
     if not o.disjoint_storage_mesh_list:
         return _err(o, "list_non_empty", "disjoint_storage_mesh_list is empty")
     seen = set()

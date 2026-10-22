@@ -14,7 +14,7 @@ import functools
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from .tag import Err, Ok
+from ..tag import Err, Ok
 
 
 @dataclass(eq=True, frozen=False)

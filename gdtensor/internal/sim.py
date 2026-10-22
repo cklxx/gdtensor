@@ -5,7 +5,7 @@ index.json) or distcp (.metadata). The CLI reports write/read patterns and
 verifies the loaded bytes.
 
 Example:
-  python -m gdtensor._sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer
+  python -m gdtensor.internal.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer
 """
 from __future__ import annotations
 
@@ -20,14 +20,14 @@ from typing import Dict, List
 
 import numpy as np
 
-from ._iobackend import FileIO, IoTracer, MiB
-from ._layout import build_payload_index
-from ._dtensor import tensor_ids_of
-from ._dtensor import named_of
-from ._models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
-from ._plan import check_physical_layout
-from ._runner import load_threads, run_processes, save_threads
-from ._views import ComputeFabric
+from .iobackend import FileIO, IoTracer, MiB
+from .layout import build_payload_index
+from .dtensor import tensor_ids_of
+from .dtensor import named_of
+from .models import ModelConfig, ParallelConfig, compute_table, fill_pattern, layout_builder, storage_table
+from .plan import check_physical_layout
+from .runner import load_threads, run_processes, save_threads
+from .views import ComputeFabric
 
 SIZE_BINS = [("<4KiB", 4 << 10), ("4-64KiB", 64 << 10), ("64KiB-1MiB", MiB), ("1-16MiB", 16 * MiB), (">=16MiB", 1 << 62)]
 

@@ -25,13 +25,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ._dtensor import (
+from .dtensor import (
     DTensorTable, GlobalTensorMeta, NaiveDTensor, NamedDTensor,
     global_tensor_meta_of, named_of, nbytes_of, owned_intervals,
 )
-from ._result import Fail, InvalidArgumentError, catch
-from .tag import Ok, Replicate, Shard
-from ._views import ComputeFabric
+from .result import Fail, InvalidArgumentError, catch
+from ..tag import Ok, Replicate, Shard
+from .views import ComputeFabric
 
 _TORCH_DTYPE_TO_NAME = {
     "torch.float32": "F32", "torch.float": "F32",
@@ -64,7 +64,7 @@ def torch_placement_to_gd(pl):
     if name == "Replicate":
         return Replicate()
     if name == "_Partial":
-        from .tag import Partial
+        from ..tag import Partial
         return Partial()
     raise Fail(InvalidArgumentError(argument_name="placements", msg=f"unsupported torch placement {pl!r}"))
 
@@ -93,7 +93,7 @@ def parallel_config_from_mesh(device_mesh) -> Tuple[int, int, int]:
 
 def gd_compute_mesh(p, stage: int):
     """SlicedMesh fixing the PP stage, matching models.compute_mesh."""
-    from ._models import compute_mesh
+    from .models import compute_mesh
     return compute_mesh(p, stage)
 
 
@@ -118,9 +118,9 @@ def gd_tensor_make(d_tensor):
     Data, global meta, placements and ComputeMesh all come from the torch
     tensor. No topology arguments. Returns Result[GenericDTensor].
     """
-    from ._result import catch
+    from .result import catch
     if not _has_torch():
-        from .tag import Err
+        from ..tag import Err
         return Err(InvalidArgumentError(
             argument_name="d_tensor",
             msg="torch bridge requires torch (torch.distributed.tensor)",
@@ -139,7 +139,7 @@ def _make(d_tensor, tensor_id: str, p=None, stage: int = 0, placements=None):
     if not hasattr(dt, "device_mesh") or not hasattr(dt, "placements"):
         raise Fail(InvalidArgumentError(argument_name="d_tensor", msg="input is not a torch.DTensor"))
     if p is None:
-        from ._models import ParallelConfig
+        from .models import ParallelConfig
         pp, dp, tp = parallel_config_from_mesh(dt.device_mesh)
         p = ParallelConfig(tp=tp, dp=dp, pp=pp)
     dtype, itemsize = _dtype_name(dt)
