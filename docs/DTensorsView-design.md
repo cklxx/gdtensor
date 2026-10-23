@@ -1,23 +1,29 @@
 # 跨计算和存储的 DTensorsView 设计
 
-本文说明 DTensorsView 如何同时描述计算侧和存储侧的张量，以及如何在两者之间搬运数据。类型定义见附录 B，Python 映射见附录 C；本文解释模型、边界、执行顺序和不变量，不重复类型定义，也不记录变更历史。
+本文说明 DTensorsView 如何同时描述计算侧、存储侧和缓存侧的张量，以及如何在它们之间搬运数据。类型定义见附录 B，Python 映射见附录 C；本文解释模型、边界、执行顺序和不变量，不重复类型定义，也不记录变更历史。
 
 读者对象是第一次接触这套设计的实现者和调用方。文中的类型名以附录 B 为准；术语见附录 A。
 
 ## 1 问题
 
-一份逻辑张量，在计算侧和设备 mesh 绑定，在存储侧和文件、槽位绑定。两侧需要共同回答：
+本文面向写训练、评测和权重处理代码的人。他手上同时有两样东西：计算侧一组已经按某种并行方式切开、绑在设备上的 `torch.DTensor`；存储侧磁盘上的 checkpoint，里面是一个或多个文件，按文件格式装着同一批张量。
 
-- 逻辑上有哪些张量、每个张量有多少槽位；
-- 物理上这些槽位落在哪些文件、文件的哪个位置、文件路径和格式是什么；
-- 一个文件可能由一个 rank 写，也可能由多个 rank 合写；
-- 一个张量可能跨多个文件；
-- 保存和加载的并行度可以不同，reshard 不能依赖某一种固定拓扑；
-- 槽位可以为空。
+他反复要做三件事：把 checkpoint 读成计算侧的 `torch.DTensor`，把计算侧的结果写成 checkpoint，在两侧切分方式不同时把数据搬成目标切分。麻烦的地方是两侧的切分方式可以完全不同：
+
+- 写 checkpoint 时可能一个 rank 一个文件，可能多个 rank 合写一个文件，也可能一个张量拆到多个文件里；读的时候并行度还可以和写的时候不一样，用户不该为此改代码。
+- 一个文件里不一定装全部张量：可能只装本 pp stage 的张量，也可能 replicated 的张量在整组文件里只存一份。读的时候要能接受某个文件里没有某个张量，跳过它，不能报错，也不能把别的张量读错位置。
+- 一个逻辑张量可能跨多个文件，读的时候要能拼回一个张量。
+- 保存要能安全发布：读的人要么看到完整的新 checkpoint，要么看到旧的，不能读到写了一半的文件；不同格式的完成标记也不一样。
+- 同一份张量在两侧的名字和全局元数据必须对得上，切分方式和落在哪些设备上可以不同；对不上时要报错，不能悄悄读错。
+- 一次读可以在存储和计算之间经过一到两层节点本地缓存；用户希望能用同一套调用表达这条路径，并且在搬之前知道占多少内存、走多少流量。
+
+具体一点的例子是 LAWA：权重由训练集群按当时的并行度写成 checkpoint；事后要对最近 k 个 step 做逐元素平均，而处理往往不在原集群上——临时集群的卡数、切分方式和训练时都不一样，训练时的拓扑信息也未必拿得到。用户希望读、算、写三步都不依赖原集群长什么样：这里读出的是 storage 侧的切分，要落到的是临时集群这份 mesh 上的切分，中间的换算不该由用户写。
+
+用户不想为每种拓扑、每种文件格式、每种缓存层数各写一套搬运代码，也不想关心文件里第几个字节对应哪个张量。他需要一套统一的说法：有哪些张量、它们在两侧分别怎么切、怎么搬；搬运计划和偏移由库推出来，文件格式的差异留给格式实现。
 
 本文出现的 DCP 指 PyTorch distributed checkpoint；safetensors 是单文件张量格式；PP stage 指流水线并行的一段。
 
-设计目标是用一份逻辑表、一种复制计划、两种 view 覆盖这些情况；文件格式差异留在 session 的实现里，不进入核心类型。
+设计目标是让用户只给出张量清单和两侧的 view（计算侧、存储侧），就能表达读和写；读的同时把 storage 侧的切分换成 compute 侧的切分。核心不决定布局策略，也不做数据的序列化。
 
 ## 2 心智模型
 
@@ -25,18 +31,19 @@
 
 | 层 | 回答的问题 | 主要类型 |
 |---|---|---|
-| 逻辑层 | 有哪些张量、槽位怎么排 | `DTensorTable`、`NamedDTensor`、`StorageMesh` |
+| 逻辑层 | 有哪些张量、槽位怎么排 | `DTensorTable`、`NamedDTensor`、`StorageMesh`、`CacheMesh` |
 | 物理层 | 槽位落在哪个文件、什么格式 | `PhysicalLayoutTable`、`DisjointStorageMeshList`、`ContainerFormat` |
-| 执行层 | 怎么把源 range 搬到目标 range | `DTensorRange`、`CopyPlan`、plan、session、accessor |
+| 执行层 | 怎么把源 range 搬到目标 range | `DTensorRange`、`CopyPlan`、plan、session、accessor、读链 |
 
 view 是这一模型的句柄：
 
 - `ComputeDTensorsView`：`tensor_ids` + `DTensorTable[ComputeMesh]` + `DTensorDataAccessor[RangeFromComputeView]`；
-- `StorageDTensorsView`：`tensor_ids` + `DTensorTable[SingleTensorStorageMesh]` + `DTensorDataAccessor[RangeFromStorageView]` + `PhysicalLayoutTable` + `begin_save` / `begin_load`。
+- `StorageDTensorsView`：`tensor_ids` + `DTensorTable[SingleTensorStorageMesh]` + `DTensorDataAccessor[RangeFromStorageView]` + `PhysicalLayoutTable` + `begin_save` / `begin_load`；
+- `CacheDTensorsView`：`tensor_ids` + `DTensorTable[CacheMesh]` + `DTensorDataAccessor[RangeFromCacheView]`。缓存是计算节点上的伴生存储；`RangeFromCacheView` 就是 `RangeFromComputeView`（B.3.1），所以缓存不需要新的 range 类型，也不需要 session 和 `PhysicalLayoutTable`。
 
-两边都有 `tensor_ids`、逻辑表和 accessor。`DTensorsView` 是两支的 oneof：`ComputeDTensorsView | StorageDTensorsView`，reshard 用它表达源和目标。存储侧多一个物理布局表和 session，原因是文件是多个张量共享的线性容器，而且文件有 header / metadata 需要显式发布；设备内存由框架管理，计算侧不需要这一层。
+三个 view 都有 `tensor_ids`、逻辑表和 accessor。`DTensorsView` 是三支的 oneof：`ComputeDTensorsView | StorageDTensorsView | CacheDTensorsView`；内部的 plan 用它表达读链每一段的两端，对外的 load / save 各自收具体的 view 类型。存储侧多一个物理布局表和 session，原因是文件是多个张量共享的线性容器，而且文件有 header / metadata 需要显式发布；cache 和 compute 都不需要这一层，两者只差 mesh 的参与者：compute 是 rank / `world_size`，cache 是 node / `num_nodes`。带缓存的 load 由读链（`DTensorsReadChain`）描述，执行时拆成若干段，每段是一份 `CopyPlan`，见 5.8。
 
-计算侧的数据处理不走 `GenericDTensor` 本身，而是走 compute/torch 桥：`compute_d_tensors_view_get_gd_tensor` 按 tensor id 取 `GenericDTensor[ComputeMesh]`，`gd_tensor_get_d_tensor` 取出 `torch.DTensor`，处理完用 `gd_tensor_reset_d_tensor` 写回。storage 侧不提供数据处理 API；`GenericDTensor[StorageMesh]` 先经 load / reshard 变成 `GenericDTensor[ComputeMesh]`，再进入这座桥。
+计算侧的数据处理不走 `GenericDTensor` 本身，而是走 compute/torch 桥：`compute_d_tensors_view_get_gd_tensor` 按 tensor id 取 `GenericDTensor[ComputeMesh]`，`gd_tensor_get_d_tensor` 取出 `torch.DTensor`，处理完用 `gd_tensor_reset_d_tensor` 写回。storage 侧不提供数据处理 API；`GenericDTensor[StorageMesh]` 先经 load 或读链变成 `GenericDTensor[ComputeMesh]`，再进入这座桥。cache 侧也没有数据处理 API：缓存不参与计算，只作为中转被复制。
 
 ## 3 逻辑模型
 
@@ -54,7 +61,7 @@ view 是这一模型的句柄：
 
 ### 3.3 StorageMesh
 
-`StorageMesh` 是存储侧唯一的 mesh 概念，和计算侧的 `ComputeMesh` 对称。它的 `OuterProductMesh` 分支同时描述两个维度：
+`StorageMesh` 是存储侧唯一的 mesh 概念，和计算侧的 `ComputeMesh` 对称。它的 `SlotOuterProductMesh` 分支同时描述两个维度：
 
 - `tensor_slots`：`ArrangedMesh["tensor_count"]`，哪些张量；
 - `content_slots`：`ContentSlotsMesh`，即 `LiteralMesh["world_size"] | ArrangedMesh["world_size"]`，每个张量的哪些槽位；`LiteralMesh` 直接列出 rank，`ArrangedMesh` 用 `"world_size"` 表示列数。
@@ -80,6 +87,33 @@ single_tensor_mesh = multi_tensors_mesh[
 ```
 
 不能用一个覆盖多个张量槽的 mesh 代替单张量 mesh。`tensor_order_value_of` 是内部 helper，返回张量在 `DTensorTable.named_d_tensors` 里的顺序。
+
+### 3.4 CacheMesh
+
+`CacheMesh` 是缓存侧的 mesh 概念，和 `ComputeMesh` / `StorageMesh` 并列。它的参与者是计算侧的节点（node），不是 rank，所以这三个 mesh 类型不能互换。
+
+它有三个维度，`StCacheOuterProductMesh` 把它们相乘，`St` 是 spatiotemporal。`SlotOuterProductMesh` 是二维（tensor slots × content slots），这里是三维（step × node × buffer）；名字都带 `OuterProduct`，表示参与者是各维度各选一部分之后的坐标：
+
+- `temporal`：`TemporalCacheMesh`，`num_steps` 个 step；`num_steps` 是时间维复用的粒度：同一块缓存内存在 `num_steps` 个 step 之间复用，取值越大，摊到每个 step 上的占用越小；
+- `spatial`：`SpatioCacheMesh`，`num_nodes` 个节点；
+- `concurrency`：`ConcurrencyMesh`，即 `ArrangedMesh["concurrency_width"]`，`concurrency_width` 个并发缓冲槽。
+
+三个维度的放置符是固定搭配，`check_constraints` 拒绝别的组合：`temporal` 和 `concurrency` 一定是 `$shard`，`spatial` 一定是 `$replicate`。原因在 `spatial`：缓存要消减的是读热点。存储侧的数据只有一份，计算侧却可能有 24k 个 rank 都要它，直连时这 24k 个读者全压在存储的那一份上。`spatial` 每一级都用 `$replicate` 放大副本，逐级把读者摊开：
+
+```text
+storage:  Replicate() * ArrangedMesh(1)
+cache 1:  Replicate() * ArrangedMesh(10)
+cache 2:  Replicate() * ArrangedMesh(100)
+compute:  Replicate() * ArrangedMesh(24k)
+```
+
+一级缓存的 10 个节点各从存储读一次；每个一级缓存的副本再被 10 个二级缓存读；二级缓存共 100 份，每份只承担 240 个 rank，是直接访问时 24k 的 1%。这就是“一传十、十传百”。`temporal` 和 `concurrency` 切的是不同的数据片（不同的 step、不同的缓冲槽），不是同一份数据的副本，所以它们是 `$shard`。
+
+`$replicate` 逐级放大意味着每个节点都留一份完整副本，集群缓存内存会跟着涨；压内存靠 `temporal`：同一块缓存内存在 `num_steps` 个 step 之间复用，`num_steps` 越大摊到每个 step 上的占用越小，`num_steps = 1` 时这块内存只服务一个 step、占用最大。`concurrency` 再把同一个 step 的副本拆成 `concurrency_width` 个缓冲槽：执行层可以在填一个槽的同时读另一个槽，让填充的等待被流水掩盖，槽越多同时在途的段越多。双缓冲只是其中最简单的一种，即 `concurrency_width = 2`；例如 `[Shard(0), Replicate(), Shard(0)]` 配 `TemporalCacheMesh(10) * SpatioCacheMesh(10) * ConcurrencyMesh(2)`，最后一个维度就在当 double buffer 用。
+
+`CacheMesh` 顶层只有 `StCacheOuterProductMesh` 和 `PermutedMesh[CacheMesh]` 两个分支；`temporal` / `spatial` 各自可以 `ReshapedMesh` 成对方，用来换展开顺序。`ReshapedMesh` 保持元素总数不变，所以 temporal 与 spatial 之间的 reshape 只在两侧总数相等时成立；reshape 只改展开顺序，不改放置符。`CacheMesh` 没有 `SlicedMesh` 分支。
+
+node 和 rank 之间的换算由读链的 `num_ranks_per_node` 给出（5.8）：node `n` 覆盖 rank 区间 `[n * num_ranks_per_node, (n + 1) * num_ranks_per_node)`，且 `num_ranks_per_node * num_nodes == world_size`。`temporal` 和 `concurrency` 不增加 rank：它们是同一批 node 上的缓冲槽。
 
 ## 4 物理模型
 
@@ -125,6 +159,7 @@ single_tensor_mesh = multi_tensors_mesh[
 - `PhysicalLayoutTable` 是逻辑到物理的查表配置数据；没有函数字段，可以直接序列化。
 - placement 在 `NamedDTensor` 里；`StorageMesh` 不重复 placement。
 - `StorageDTensorsView` 是消费方句柄：张量子集 + 逻辑表 + accessor + 物理布局表 + session。它不带 rank；rank 是 `d_tensors_view_rank_*` 的参数。
+- `CacheDTensorsView` 没有 `PhysicalLayoutTable`，也没有 session：缓存在节点本地内存里，不是文件，读写由 accessor 负责；它同样不带 rank，参与者是 node。
 
 ## 5 执行模型
 
@@ -139,15 +174,17 @@ DTensorRange =
   | RangeFromStorageView
 ```
 
-`CopyPlan` 是 `list[($src DTensorRange, $dst DTensorRange)]`，每一对表示一次源 range 到目标 range 的复制。`CopyPlan` 是唯一的 pair 类型；compute/storage 的差异由 `DTensorRange` 的分支类型表达：`RangeFromComputeView` / `RangeFromStorageView`。类型上允许四种 branch 组合；具体 plan API 用前置条件限制合法组合：`plan_save` 产生 compute→storage，`plan_load` 产生 storage→compute，`plan_reshard` 允许混合。
+`CopyPlan` 是 `list[($src DTensorRange, $dst DTensorRange)]`，每一对表示一次源 range 到目标 range 的复制。`CopyPlan` 是唯一的 pair 类型；compute/storage 的差异由 `DTensorRange` 的分支类型表达：`RangeFromComputeView` / `RangeFromStorageView`。cache 一侧用 `RangeFromCacheView`，它就是 `RangeFromComputeView` 的别名（B.3.1），所以 `DTensorRange` 只有两个分支，缓存不引入新的 range 类型。类型上允许四种 branch 组合；具体 plan API 用前置条件限制合法组合：`d_tensors_view_rank_plan_load` 产生 storage→compute，`d_tensors_view_rank_plan_save` 产生 compute→storage，`d_tensors_view_rank_plan_chain_load` 给读链的每一段各产生一份，结果是 `CopyPlanChain`，两端的 view 种类不限。
 
 ### 5.2 plan API
 
-`d_tensors_view_rank_plan_load`、`d_tensors_view_rank_plan_save`、`d_tensors_view_rank_plan_reshard` 返回 `Result[CopyPlan]`。它们是纯函数，不打开 session，负责 range selection。
+`d_tensors_view_rank_plan_load`、`d_tensors_view_rank_plan_save` 返回 `Result[CopyPlan]`；`d_tensors_view_rank_plan_chain_load` 返回 `Result[CopyPlanChain]`。三者都是纯函数，不打开 session，负责 range selection。
 
-`d_tensors_view_rank_load`、`d_tensors_view_rank_save`、`d_tensors_view_rank_reshard` 是不带 plan 的 API，只做薄执行器：调用对应的 plan API，按 `CopyPlan` 执行复制，不重新选择区间。
+`CopyPlanChain` 与 `DTensorsReadChain` 同构：分支一一对应，但每个分支里的字段不是 view，而是一段数据流的 `CopyPlan`，按数据流顺序排。`Direct` 一个（`src_to_dst`），`OneLayerCached` 两个（`src_to_cache`、`cache_to_dst`），`TwoLayerCached` 三个；`Mixed` 与 `MixedDTensorsReadChain` 对应，每段一条 concrete plan 链。
 
-`d_tensors_view_rank_reshard` 的 `tensor_ids` 和 `global_tensor_meta` 前置条件放在 `d_tensors_view_rank_plan_reshard` 的 `Assert` 里；`global_tensor_meta_of` 从 `NamedDTensor` 取出全局 meta，naive 和 reshaped 两支都归到同一个全局 meta。取 `NamedDTensor` 时用 `tensor_order_value_of(d_tensor_table, tensor_id)` 得到列表下标，不能把 `tensor_id` 直接当 `named_d_tensors` 的下标。不带 plan 的 `d_tensors_view_rank_reshard` 只执行。
+`d_tensors_view_rank_load`、`d_tensors_view_rank_save`、`d_tensors_view_rank_chain_load` 是不带 plan 的 API，只做薄执行器：调用各自的 plan API，按 `CopyPlan` 执行复制，不重新选择区间。
+
+读链每一段的 `tensor_ids` 和 `global_tensor_meta` 前置条件放在 `d_tensors_view_rank_plan_chain_load` 的 `Assert` 里；`global_tensor_meta_of` 从 `NamedDTensor` 取出全局 meta，naive 和 reshaped 两支都归到同一个全局 meta。取 `NamedDTensor` 时用 `tensor_order_value_of(d_tensor_table, tensor_id)` 得到列表下标，不能把 `tensor_id` 直接当 `named_d_tensors` 的下标。不带 plan 的 `d_tensors_view_rank_chain_load` 只执行。
 
 ### 5.3 偏移：payload 偏移 vs 文件偏移
 
@@ -169,7 +206,7 @@ get_file_offset: A0=208, A2=308, B0=408
 
 read/write buffer 完全由 `view.data_accessor` 负责；session 只负责 `get_file_offset` 和生命周期，不做 payload 序列化 / 反序列化。
 
-### 5.4 save / load / reshard 的执行顺序
+### 5.4 save / load 的执行顺序
 
 save：
 
@@ -185,35 +222,32 @@ load：
 3. 对每个 `(src, dst)`：`src` 是 storage range，`dst` 是 compute range；`storage_view.data_accessor.read_to_buffer(src)` 读，`compute_view.data_accessor.write_from_buffer(dst)` 写；
 4. `session.finish()`。
 
-reshard：
-
-1. `plan = d_tensors_view_rank_plan_reshard(rank, src_view, dst_view)`；`tensor_ids` / `global_tensor_meta` 的前置条件在 plan 的 `Assert` 里；
-2. 源或目标是 storage view 时，分别 `begin_load` / `begin_save`；compute view 没有 session；
-3. 对每个 `(src, dst)`：按 range 的类型选 accessor（`RangeFromComputeView` / `RangeFromStorageView`）；storage 侧用 session 做实际文件偏移映射；
-4. 目标 `commit()`；源 `finish()`；失败时目标 `abort()`。
+带缓存的读走读链，执行顺序见 5.8。每次 load 本身就把 storage 侧的切分换成 compute 侧的切分，所以核心不再提供单独的换切分 API；写只有 `d_tensors_view_rank_save`。
 
 check 函数也收 `CopyPlan`，按 range 类型过滤出 compute 或 storage range，再做 disjoint / covering 检查。check 是内部一致性校验，不是 IO API。
 
 ### 5.5 d_tensors_view_map
 
-`d_tensors_view_map` 是 view 转换 API，Python 入口是 `gdtensor.builder.d_tensors_view_map`：它把一个 `DTensorsView` 转成同种类的另一个 `DTensorsView`，只做 view / session 的结构转换。它不选 range，不做 load / save / reshard 的跨 view 搬运，也不承担归约、平均这类数据处理；这些计算走 5.6。
+`d_tensors_view_map` 是 view 转换 API，Python 入口是 `gdtensor.builder.d_tensors_view_map`：它把一个 `DTensorsView` 转成同种类的另一个 `DTensorsView`，只做 view / session 的结构转换。它不选 range，不做 load / save / 读链的跨 view 搬运，也不承担归约、平均这类数据处理；这些计算走 5.6。
 
-`DTensorsViewMapCore` 是调用方提供的四个可选回调：
+`DTensorsViewMapCore` 是调用方提供的五个可选回调：
 
 - `convert_each_compute_view`：compute view 的每个 `GenericDTensor[ComputeMesh]` 转成一个新的 `GenericDTensor[ComputeMesh]`；
 - `convert_each_storage_view`：storage view 的每个 `GenericDTensor[StorageMesh]` 转成一个新的 `GenericDTensor[StorageMesh]`；
+- `convert_each_cache_view`：cache view 的每个 `GenericDTensor[CacheMesh]` 转成一个新的 `GenericDTensor[CacheMesh]`；
 - `convert_each_storage_load_session`：storage view 的每个 `StorageLoadSession` 转成一个新的 `StorageLoadSession`；
 - `convert_each_storage_save_session`：storage view 的每个 `StorageSaveSession` 转成一个新的 `StorageSaveSession`。
 
-这四个字段是 product，但都可以为 nil：tensor 字段为 nil 表示 identity，session 字段为 nil 表示跳过对应的 session。`d_tensors_view_map` 按 `origin` 的类型只处理对应字段。
+这五个字段是 product，但都可以为 nil：tensor 字段为 nil 表示 identity，session 字段为 nil 表示跳过对应的 session。`d_tensors_view_map` 按 `origin` 的类型只处理对应字段。
 
 执行顺序：
 
-1. `origin` 是 `ComputeDTensorsView`：对 `DTensorTable[ComputeMesh]` 的每个 `NamedDTensor[ComputeMesh].d_tensor` 调 `convert_each_compute_view`；该字段为 nil 时 tensor 原样保留；没有 session。
-2. `origin` 是 `StorageDTensorsView`：对 `DTensorTable[SingleTensorStorageMesh]` 的每个 `NamedDTensor[SingleTensorStorageMesh].d_tensor` 调 `convert_each_storage_view`；该字段为 nil 时 tensor 原样保留。再包装 load / save session 工厂：字段非 nil 时包装返回 view 的对应 `begin_load` / `begin_save`，字段为 nil 时保留原工厂。map 本身不打开或结束 session，不做文件 I/O。后续 rank IO 调用包装后的 `begin_*(view, rank)`：先打开原 session，再调用转换回调并把替换 session 交给 IO。转换返回 `$err` 时，包装逻辑立即 `abort`（save）或 `finish`（load）刚打开的原 session，并原样返回该错误。正常的 `commit` / `abort` / `finish` 由外层 rank IO 管理。
-3. 返回的 view 与 `origin` 同种类；`tensor_ids` 不变，`global_tensor_meta` 由转换函数决定。
+1. `origin` 是 `ComputeDTensorsView`：对 `DTensorTable[ComputeMesh]` 的每个 `NamedDTensor[ComputeMesh]` 调 `convert_each_compute_view`；该字段为 nil 时 tensor 原样保留；没有 session。
+2. `origin` 是 `StorageDTensorsView`：对 `DTensorTable[SingleTensorStorageMesh]` 的每个 `NamedDTensor[SingleTensorStorageMesh]` 调 `convert_each_storage_view`；该字段为 nil 时 tensor 原样保留。再处理 load / save session：字段非 nil 时打开对应 session 并调用，字段为 nil 时跳过该 session。session 的打开、提交、中止由 `d_tensors_view_map` 管；转换函数只替换 session。
+3. `origin` 是 `CacheDTensorsView`：对 `DTensorTable[CacheMesh]` 的每个 `NamedDTensor[CacheMesh]` 调 `convert_each_cache_view`；该字段为 nil 时 tensor 原样保留；没有 session。
+4. 返回的 view 与 `origin` 同种类；`tensor_ids` 不变，`global_tensor_meta` 由转换函数决定。
 
-张量转换回调返回 `$err` 时，`d_tensors_view_map` 原样返回那个 `Error`，不再调用后面的张量转换回调。session 转换回调在后续 rank IO 打开 session 时执行，其错误由包装后的 `begin_*` 原样返回。
+任一回调返回 `$err` 时，`d_tensors_view_map` 原样返回那个 `Error`，不再调用后面的回调。
 
 `d_tensors_view_map` 不承担归约、平均这类计算。需要计算时走 5.6：先把 `GenericDTensor[StorageMesh]` 变成 `GenericDTensor[ComputeMesh]`，再取 `torch.DTensor`。
 
@@ -236,11 +270,11 @@ Python 里这五个函数放顶层，在 `gdtensor` 包内按“动词 + 对象�
 3. `gd_tensor_get_d_tensor` 取出 `torch.DTensor`；返回 `nil` 时先 materialize（例如 load），或用 `gd_tensor_make`；
 4. 在 `torch.DTensor` 上做计算；
 5. `gd_tensor_reset_d_tensor` 写回；
-6. 用 save / reshard 把结果写回 storage。
+6. 用 save 把结果写回 storage。
 
-storage 侧没有对应的数据处理 API。`GenericDTensor[StorageMesh]` 总是先经 load / reshard 变成 `GenericDTensor[ComputeMesh]`，再进入这座桥；处理完再经 save / reshard 回到 storage。`d_tensors_view_map` 只做 view / session 的结构转换，不参与这里的计算。
+storage 侧没有对应的数据处理 API。`GenericDTensor[StorageMesh]` 总是先经 load 或读链变成 `GenericDTensor[ComputeMesh]`，再进入这座桥；处理完经 save 回到 storage。`d_tensors_view_map` 只做 view / session 的结构转换，不参与这里的计算。
 
-`gd_tensor_reset_d_tensor` 要求新的 `torch.DTensor` 的 `global_tensor_meta`、`placements`、`mesh` 与原 `gd_tensor` 一致；不一致时调用方先 reshard，或重新 `gd_tensor_make`。
+`gd_tensor_reset_d_tensor` 要求新的 `torch.DTensor` 的 `global_tensor_meta`、`placements`、`mesh` 与原 `gd_tensor` 一致；不一致时调用方自己在计算侧重新分配，或重新 `gd_tensor_make`。
 
 ### 5.7 类的 API
 
@@ -258,7 +292,7 @@ storage 侧没有对应的数据处理 API。`GenericDTensor[StorageMesh]` 总�
   - `nil`：跳过；
   - 任意子对象返回 `$err`，父对象立即返回同一个错误；父对象不包装、不改写它。
 
-`check_constraints` 的 `$err` 是顶层的 `Error` 的 `ConstraintViolationError` 分支（B.3.3）：`type_name` 是出错对象的类型名，`constraint_name` 是它没通过的那条约束，`msg` 说明原因。
+`check_constraints` 的 `$err` 是顶层的 `Error` 的 `ConstraintViolationError` 分支（B.3.4）：`type_name` 是出错对象的类型名，`constraint_name` 是它没通过的那条约束，`msg` 说明原因。
 
 构造 view 按这个约定：
 
@@ -275,6 +309,40 @@ must_ok(view.check_constraints())
 
 Python 实现里，build 接口放在 `<ClassName>BuilderMixin`；数据类写成 `class Foo(FooBuilderMixin)`；见附录 C。
 
+### 5.8 读链与缓存
+
+一次 load 可以在 storage 和 compute 之间经过一到两层缓存。缓存由 `CacheDTensorsView` 描述：它落在计算侧的节点上，accessor 用 compute range，所以既没有 session 也没有 `PhysicalLayoutTable`；mesh 的参与者是 node，见 3.4。
+
+写侧要解决的只是去重：同一份 payload 只写一次。读侧要解决的是热点：同一份存储数据可能有几万个 rank 要读，这部分压力靠存储自身消化不了，只能在计算侧用缓存逐级分担，也就是下面这套读链。`spatial` 每一级都用 `$replicate` 放大副本，把这个读者群逐级摊开，一传十、十传百；代价是内存，靠 `temporal` 在多个 step 之间复用同一块缓存内存、靠 `concurrency` 提供若干缓冲槽让填充和读取重叠（3.4）。
+
+`DTensorsReadChain` 描述一次 load 的数据流，分四支；源端 `src` 是 `StorageDTensorsView`，目标端 `dst` 是 `ComputeDTensorsView`：
+
+- `DirectDTensorsReadChain`：`src` → `dst`，没有缓存；
+- `OneLayerCachedDTensorsReadChain`：`src` → `cache` → `dst`；
+- `TwoLayerCachedDTensorsReadChain`：`src` → `small_cache` → `big_cache` → `dst`；
+- `MixedDTensorsReadChain`：若干 `DisjointTensorIdsAndReadChain`，每段一条 concrete 链，段的 `tensor_ids` 两两不重叠。
+
+concrete 链是前三支；`MixedDTensorsReadChain` 的每一段只能放 concrete 链，所以混合不会嵌套。`get_tensor_ids_of_read_chain` 返回整条链覆盖的 tensor id：前三支取 `dst.tensor_ids`；`Mixed` 支按列表顺序拼接各段的 `tensor_ids`。
+
+`d_tensors_view_rank_chain_load` 的执行顺序：
+
+1. `plan_chain = d_tensors_view_rank_plan_chain_load(rank, read_chain)`：它按数据流把链拆成段，每段一份 `CopyPlan`，放在与读链同构的 `CopyPlanChain` 里。`Direct` 一段，`OneLayerCached` 两段（`src → cache`、`cache → dst`），`TwoLayerCached` 三段；`Mixed` 先拆成互不重叠的子链，每个子链再拆段。
+2. 逐段执行：执行器按读链和 `plan_chain` 的同构分支取段；每段是一份 `CopyPlan`，里面若干对 range，每对把源 view 的一段 range 搬到目标 view 的一段 range，两端的切分可以不同。session 由 `src` 的 `StorageDTensorsView.begin_load` 提供，cache 和 compute 一侧的段直接用两端 view 的 `data_accessor`。
+3. 段与段按数据流顺序串行执行，前一段成功后才开始后一段；`src` 的 session 在该子链所有段执行完后 `finish`。
+4. 任一步返回 `$err` 时原样返回那个 `Error`，并 `finish` 已经打开的 session。
+
+`d_tensors_view_rank_chain_load` 是薄执行器：它只按 `CopyPlanChain` 执行、开关 session，不重新选区间。`Direct` 链只有一段，和 `d_tensors_view_rank_load` 做同一件事；两者的区别是读链还能带缓存。
+
+三个 `get_stat_*_of_chain_load` 是纯函数：只看链结构和各 view 的 mesh / `GlobalTensorMeta`，不打开 session，也不读 payload。它们返回 `list[int]`，下标是 node id，单位是字节，长度是链里出现的节点数：
+
+- `get_stat_mem_overhead_of_chain_load`：每个 node 上这份缓存占的内存。`temporal` 是复用维，同一块缓存内存在 `num_steps` 个 step 之间复用，所以这个值随 `num_steps` 增大而变小；多一个 `concurrency_width` 缓冲槽就多占一份；
+- `get_stat_outbound_traffic_of_chain_load`：每个 node 发出的字节数；
+- `get_stat_inbound_traffic_of_chain_load`：每个 node 收到的字节数。
+
+三个函数按段累加：每段的字节数由该段要搬的张量大小和该段在两侧 mesh 上的分片决定；同时按 node 归属记账，同一 node 内部的段不计流量，跨 node 的段分别计入发送 node 的 outbound 和接收 node 的 inbound。调用方可以先用这三个函数判断缓存装不装得下、流量是否超预算，再决定用哪一支链。
+
+这三个函数在这里固定下来的是口径：一个 node 一个值、单位字节、同一 node 内的段不计流量、`mem_overhead` 随 `num_steps` 增大而变小。具体的换算式（`num_steps`、`concurrency_width`、spatial 各级参与数怎么折算成字节）和两个流量函数的分摊方式由实现给出，本文不写式子。
+
 ## 6 不变量
 
 - `PhysicalLayoutTable` 对同一个 `DTensorTable[SingleTensorStorageMesh]` 必须是确定的：`container_format`、`tensor_entries` 的键、`file_paths` 的键、header 字节和区间偏移都一致。
@@ -285,7 +353,13 @@ Python 实现里，build 接口放在 `<ClassName>BuilderMixin`；数据类写�
 - `tensor_entries` 里的每个 list，其 leader `TensorComponentPos` 必须出现在 `file_paths` 的键里。
 - 所有 `DisjointStorageMeshList` 里的 mesh 两两不重叠；不同文件的 mesh 也不重叠；每个 slot 最多被一个 mesh 覆盖。
 - 每个空 content slot 占用 0 字节，不贡献物理区间，也不参与 offset 累加；`tensor_entries` 里没有对应的键。
-- reshard 要求两边 `tensor_ids` 相同，且同一个 `tensor_id` 的 `global_tensor_meta` 相同；placement 和 mesh 可以不同。
+- 读链要求 `src` 与 `dst` 的 `tensor_ids` 相同，且同一个 `tensor_id` 的 `global_tensor_meta` 相同；placement 和 mesh 可以不同。
+- `CacheDTensorsView.tensor_ids` 与它的 `d_tensor_table` 顺序一致；`data_accessor` 非空。
+- 一条链里 `src.tensor_ids == dst.tensor_ids`；有 cache 时 `cache.tensor_ids` 也相同，两层缓存时 `small_cache` / `big_cache` 的 `tensor_ids` 也相同。
+- 有 cache 时 `num_ranks_per_node * num_nodes == world_size`；cache 的 mesh 展开成 rank 后是 `dst` 的 mesh 的子集，两层缓存时 `small_cache` 的展开结果还是 `big_cache` 的展开结果的子集。
+- cache 张量的放置符按维度固定：`temporal` / `concurrency` 是 `$shard`，`spatial` 是 `$replicate`；只有 `spatial` 维的 node 展开成 rank。
+- `MixedDTensorsReadChain` 各段的 `tensor_ids` 两两不重叠；`DisjointTensorIdsAndReadChain.tensor_ids` 等于 `get_tensor_ids_of_read_chain(它的 read_chain)`。
+- 段只搬运字节，不改写 payload；缓存里的副本和 storage 里的对应区间逐字节相同。
 
 ## 7 用例矩阵
 
@@ -301,29 +375,39 @@ Python 实现里，build 接口放在 `<ClassName>BuilderMixin`；数据类写�
 | 空槽 | `tensor_entries` 没有对应键 | 两种 session 均可 | offset 不被空槽推动 |
 | 张量跨多个文件 | 一个张量对应多个 list | 两种 session 均可 | 每个 list 的 row slice 是单张量 mesh |
 | replicated 张量只存一份 | 一个非空 list，其余槽为空 | 两种 session 均可 | 不重复写同一份 payload |
-| reshard storage→storage | 源/目标各一份布局表 | 两端 session | `CopyPlan` 配对；meta 一致 |
-| reshard storage→compute | 源布局表 + compute mesh | 源 session | 目标 accessor 写设备 |
-| reshard compute→compute | 两侧 compute mesh | 无 storage session | 走通信，不走文件 |
+| 读链 storage→compute（直连） | 源一份布局表 + compute mesh | 源端 session | `CopyPlan` 配对；meta 一致 |
+| 单层缓存 load | storage + 一份 cache | 源端 session | 两段按序执行；cache 的 mesh 展开后是 dst 的子集 |
+| 两层缓存 load | storage + small_cache + big_cache | 源端 session | 三段按序执行；small_cache ⊆ big_cache ⊆ dst（展开后） |
+| 缓存只留一个 step（`num_steps = 1`） | cache mesh 的 temporal 取 `ArrangedMesh["num_steps"]`，size 为 1 | 源端 session | 同一块缓存内存只服务一个 step；单 step 占用最大 |
+| 缓存留住 N 个 step（`num_steps = N`） | 同一个 temporal 分支，size 为 N | 源端 session | N 个 step 复用同一块缓存内存；单 step 占用是 1 时的 1/N |
+| 读热点消减（spatial 逐级放大） | 各级 cache 的 spatial 都是 `$replicate`，参与数逐级变大 | 源端 session | 存储只被一级缓存读；每个末级缓存承担的读者是 1 / 末级参与数 |
+| 多缓冲（`concurrency_width = n`，2 就是双缓冲） | `StCacheOuterProductMesh` 的 concurrency 维为 n，放置 `$shard(0)` | 源端 session | 一个槽在填、别的槽在读，填充被流水掩盖 |
+| 放置符不合规 | temporal / spatial / concurrency 的放置符不是 shard / replicate / shard | 无 | `check_constraints` 返回 `ConstraintViolationError` |
+| mixed 链 | 按 tensor id 切成互不重叠的子链 | 每段自己的源端 session | 段间 tensor id 不重叠；段内顺序同单支 |
+| 链 load 统计 | 同一份链结构 | 无 | 三个 stats 只看 mesh 和 `GlobalTensorMeta` |
 | 对象存储 multipart | 同一份布局表 | safetensors session 的 multipart 实现 | payload 偏移仍连续；part 边界由 session 处理 |
 | 混格式 | 拆成多次操作，每次一份布局表 | 各自 session | 单个 view / plan 只有一种 format |
+
+`num_steps = 1` 和 `num_steps = N` 是缓存内存复用的两端：取 1 时同一块缓存内存只服务一个 step，单 step 占用最大；取 N 时 N 个 step 复用这块内存，单 step 占用降到 1/N，代价是每个 step 要等轮到自己。另一个开关是 `concurrency_width`：它把同一个 step 的副本拆成几个缓冲槽，2 就是双缓冲，也可以取更多；多一个槽多占一份，换来填充和读取的重叠。`num_steps` / `concurrency_width` 都是 cache mesh 的一部分，所以不同的取值是几份不同的 cache view，不是同一个 view 上可以随时改的字段。选哪一种可以在搬之前用 `get_stat_mem_overhead_of_chain_load` 和两个流量函数算出来（5.8），按内存和流量预算定。
 
 ## 8 IO、实现者与内部边界
 
 | 层 | 内容 | 说明 |
 |---|---|---|
-| IO API | `d_tensors_view_rank_load`、`d_tensors_view_rank_save`、`d_tensors_view_rank_reshard` | 这三个是跨 view 的搬运；plan 是内部 key function；session 由存储视图提供，格式实现者实现 |
-| 数据处理 API | `compute_d_tensors_view_get_tensor_ids`、`compute_d_tensors_view_get_gd_tensor`、`gd_tensor_make`、`gd_tensor_get_d_tensor`、`gd_tensor_reset_d_tensor` | compute 侧 view 与 `torch.DTensor` 的桥；所有数据处理都走这里；storage 侧不提供数据处理 API |
+| IO API | `d_tensors_view_rank_load`、`d_tensors_view_rank_save`、`d_tensors_view_rank_chain_load` | 这三个是跨 view 的搬运；plan 是内部 key function；session 由存储视图提供，格式实现者实现；`d_tensors_view_rank_chain_load` 把读链拆成若干段，每段是一份 `CopyPlan`；单段读和 `d_tensors_view_rank_load` 等价 |
+| 统计与查询 API | `get_tensor_ids_of_read_chain`、`get_stat_mem_overhead_of_chain_load`、`get_stat_outbound_traffic_of_chain_load`、`get_stat_inbound_traffic_of_chain_load` | 纯函数；只看链结构和各 view 的 mesh / `GlobalTensorMeta`，不打开 session，不读 payload |
+| 数据处理 API | `compute_d_tensors_view_get_tensor_ids`、`compute_d_tensors_view_get_gd_tensor`、`gd_tensor_make`、`gd_tensor_get_d_tensor`、`gd_tensor_reset_d_tensor` | compute 侧 view 与 `torch.DTensor` 的桥；所有数据处理都走这里；storage 侧和 cache 侧不提供数据处理 API |
 | 构造 API | `d_tensors_view_map` | 只构造 / 转换 view，不做文件 I/O |
 | 类 API | 每个数据 `Object` / `Oneof`（session / access 接口除外）的 `new_*` / `get_*` / `set_*` / `add_*` / `mutable_*` / `clear_*`；build 接口在 `<ClassName>BuilderMixin`，数据类写成 `class Foo(FooBuilderMixin)` | protobuf 风格；不生成 `has_*` / `which_*`，判空用 `get_*() is None`、判分支用 `type(get_*())`；`check_constraints` 在数据类上，递归检查自身和所有嵌套数据 |
-| Helper API | `global_tensor_meta_of`、`tensor_order_value_of`、`file_path_of`、`leader_tensor_component_pos_of` | 放已有的 `builder` namespace；不是主要 API，不放顶层 |
+| Helper API | `global_tensor_meta_of`、`tensor_order_value_of`、`file_path_of`、`leader_tensor_component_pos_of`、`is_cache_mesh_subset_of_mesh` | 放已有的 `builder` namespace；不是主要 API，不放顶层；`is_cache_mesh_subset_of_mesh` 供读链的 `Assert` 使用 |
 | 实现者接口 | `StorageSaveSession`、`StorageLoadSession`、`ContainerFormat`、布局构造器、`DTensorDataAccessor` | 格式实现者和布局构造者实现；session 管生命周期、offset，并通过 `init_data_accessor` 提供绑定到该 session 的 data accessor |
-| 内部构造 | `d_tensors_view_rank_plan_load`、`d_tensors_view_rank_plan_save`、`d_tensors_view_rank_plan_reshard`、`CopyPlan`、`DTensorRange`、check 函数 | 内部使用；不是 IO API |
+| 内部构造 | `d_tensors_view_rank_plan_load`、`d_tensors_view_rank_plan_save`、`d_tensors_view_rank_plan_chain_load`、`CopyPlan`、`CopyPlanChain`、`DTensorRange`、check 函数 | 内部使用；不是 IO API |
 
-附录 B 的 API 章节按“IO API / 数据处理 API / 构造 API / 类 API / Helper API / plan API / check API”分类，是为了完整描述核心；调用方需要 IO API、数据处理 API、构造 API 和类 API，Helper API 按需使用。plan API 是内部 key function，check 是内部一致性校验。
+附录 B 的 API 章节按“IO API / 统计 API / 数据处理 API / 构造 API / 类 API / Helper API / plan API / check API”分类，是为了完整描述核心；调用方需要 IO API、数据处理 API、构造 API 和类 API，Helper API 按需使用。plan API 是内部 key function，check 是内部一致性校验。
 
 ## 9 结论与非目标
 
-计算侧和存储侧共用 `NamedDTensor` / `GenericDTensor` / `NaiveDTensor`，各自只有一个 mesh 概念：`ComputeMesh` 和 `StorageMesh`。存储侧多一个 `PhysicalLayoutTable`，因为文件是多个张量共享的线性容器；多一个 session 层，因为文件格式和 header / metadata 需要显式发布。
+计算侧、存储侧和缓存侧共用 `NamedDTensor` / `GenericDTensor` / `NaiveDTensor`，各自只有一个 mesh 概念：`ComputeMesh`、`StorageMesh` 和 `CacheMesh`。缓存是第三种 view：`spatial` 逐级 `$replicate` 放大副本消减读热点，`temporal` / `concurrency` 把峰值内存压回可接受范围；带缓存的读由读链描述，执行时拆成若干次 range 到 range 的复制，所以 `DTensorRange`、`CopyPlan`、plan API 都不为缓存加分支。load 本身就把 storage 侧的切分换成 compute 侧的切分，所以核心不单独提供换切分 API。存储侧多一个 `PhysicalLayoutTable`，因为文件是多个张量共享的线性容器；多一个 session 层，因为文件格式和 header / metadata 需要显式发布。
 
 非目标：
 
@@ -331,6 +415,8 @@ Python 实现里，build 接口放在 `<ClassName>BuilderMixin`；数据类写�
 - 不在核心里提供 reduce API；归约、平均、Welford 这类数据处理都在 `torch.DTensor` 上做，核心只提供 5.6 的桥。
 - 不在核心里实现对象存储 multipart、分布式 barrier、重试；这些在 session / 实现层。
 - 不在核心里决定布局构造策略；对象只保存业务给出的 entry 和属性，拓扑仍由业务层决定。
+- 不在核心里决定缓存的换入换出、预取、淘汰策略，也不决定 `num_steps` 对应哪些 step、缓存放在哪种介质上；这些由业务构造 cache view 和链时决定。
+- 不支持带缓存的写、compute→compute 的换切分、storage→storage 的复制。这三类是按当前需求裁掉的，不是待补的缺口：读链只从 `StorageDTensorsView` 读到 `ComputeDTensorsView`，写只有 `d_tensors_view_rank_save`。
 
 ## 10 LAWA 示例
 
@@ -434,8 +520,9 @@ must_ok(io.rank_save(rank, acc_view, out_storage))
 - `latest_k_checkpoints`、`make_compute_view_like`、`make_storage_view_for_output` 都在调用方或业务层；core 只看到 `StorageDTensorsView` / `ComputeDTensorsView`。
 - `make_compute_view_like` / `make_storage_view_for_output` 用 protobuf 风格 API 构造：前者 `new_compute_d_tensors_view` + `mutable_d_tensor_table().add_named_d_tensor`；后者 `new_physical_layout_table` + `new_storage_d_tensors_view`；构造后调用 `check_constraints`。
 - `d_tensors_view_rank_load` 把每个 checkpoint 读进 compute view；`d_tensors_view_rank_save` 把平均结果写回 storage。
-- 所有 checkpoint 必须覆盖同一组 `tensor_ids`，且同名 tensor 的 `GlobalTensorMeta` 相同；否则先 reshard 或拒绝。
+- 所有 checkpoint 必须覆盖同一组 `tensor_ids`，且同名 tensor 的 `GlobalTensorMeta` 相同；否则对齐后再读，或拒绝。
 - 缺 tensor 或按元素加权时，用额外的 mask / weight `torch.DTensor`；core 不提供专门的归约 API。
+- 需要缓存时把 `io.rank_load(rank, acc_view, ckpt)` 换成 `io.chain_load(rank, chain)`：链由业务按 checkpoint 目录和可用缓存构造，平均逻辑不变。搬之前可以用 `io.chain_stat_mem_overhead` 等三个统计函数判断缓存和流量是否在预算内。
 - storage 侧没有 LAWA 专用 API；它只提供 load / save，数据处理统一走 5.6 的桥。
 
 ## 附录 A 术语
@@ -462,10 +549,24 @@ must_ok(io.rank_save(rank, acc_view, out_storage))
 | leader component pos | `DisjointStorageMeshList` 的规范键；由 `leader_tensor_component_pos_of` 得到 |
 | `DTensorRange` | 一次复制的一侧；`RangeFromComputeView` 或 `RangeFromStorageView` |
 | `CopyPlan` | 源 range 到目标 range 的列表；唯一的 pair 类型 |
-| plan | 纯函数，生成 `CopyPlan`；不打开 session |
+| plan | 纯函数，生成 `CopyPlan`；读链的 plan 生成 `CopyPlanChain`；都不打开 session |
+| `CopyPlanChain` | 与 `DTensorsReadChain` 同构的计划结构：分支一一对应，每个分支按数据流顺序放该段的 `CopyPlan` |
 | session | 文件生命周期 + offset；save 用 commit / abort，load 用 finish |
 | view（视图） | 张量句柄；`tensor_ids` + `DTensorTable` + accessor，存储侧多物理布局表和 session |
-| mesh（网格） | 张量在参与者维度上的排布；`ComputeMesh` / `StorageMesh` |
+| mesh（网格） | 张量在参与者维度上的排布；`ComputeMesh` / `StorageMesh` / `CacheMesh` |
+| node（节点） | 计算侧的一台机器；cache view 的参与者；`num_nodes` 是节点数 |
+| `num_ranks_per_node` | 每个节点上的 rank 数；node `n` 覆盖 rank 区间 `[n * num_ranks_per_node, (n + 1) * num_ranks_per_node)`；`num_ranks_per_node * num_nodes == world_size` |
+| cache（缓存） | 计算节点上的伴生存储；由 `CacheDTensorsView` 描述，不改变张量内容 |
+| `CacheMesh` | 缓存侧 mesh；`temporal`（`num_steps`）× `spatial`（`num_nodes`）× `concurrency`（`concurrency_width`） |
+| `StCacheOuterProductMesh` | 把缓存的 temporal、spatial、concurrency 三个维度相乘；`St` 是 spatiotemporal |
+| concurrency | 缓存的并发缓冲维度；`concurrency_width` 是缓冲槽数，取 2 就是双缓冲，也可以取更多 |
+| 读热点（hot spot） | 大量 rank 同时读同一份数据；缓存用 spatial 逐级 `$replicate` 放大副本把它消减掉 |
+| temporal | 缓存的 step 维度；`num_steps` 是 step 数 |
+| spatial | 缓存的空间维度；`num_nodes` 是节点数 |
+| 读链（read chain） | 一次带缓存的 load 的数据流结构；`DTensorsReadChain` |
+| concrete 链 | 不含 `Mixed` 的链：`Direct` / `OneLayerCached` / `TwoLayerCached` |
+| 段（segment） | 读链拆出来的一段，对应一份 `CopyPlan`：里面每对是源 view 的一段 range 到目标 view 的一段 range |
+| 统计 API | 三个 `get_stat_*_of_chain_load`；纯函数，不打开 session |
 | `LiteralMesh` | 显式的 rank 列表，`$max` 是 rank 的排他上界；表示无法用 `ArrangedMesh` 写出的 device mesh |
 | range（区间） | 一段连续字节的定位；`RangeFromComputeView` / `RangeFromStorageView` |
 | accessor | 裸字节读写接口；`DTensorDataAccessor[RangeT]` |
@@ -474,13 +575,13 @@ must_ok(io.rank_save(rank, acc_view, out_storage))
 | compute/torch 桥 | 5.6 的五个 API；在 compute view、`GenericDTensor[ComputeMesh]` 和 `torch.DTensor` 之间取和写 |
 | `check_*` | 内部一致性校验；disjoint / covering，不是 IO API |
 | `check_constraints` | 每个数据 `Object` / `Oneof` 的方法；session / access 接口除外；递归检查自身和所有嵌套数据 |
-| `DTensorsView` | `ComputeDTensorsView` / `StorageDTensorsView`；reshard 的源/目标 |
-| `GlobalTensorMeta` | 全局张量的 shape、dtype、itemsize |
+| `DTensorsView` | `ComputeDTensorsView` / `StorageDTensorsView` / `CacheDTensorsView`；内部 plan 的 view 参数类型，读链每一段的两端各是其中一支 |
+| `GlobalTensorMeta` | 全局张量的各维长度、dtype、itemsize |
 | multipart | 对象存储的分段上传；payload 偏移仍连续，段边界由 session 处理 |
 | barrier | 分布式同步点；多 rank 在提交或读取前对齐 |
 | 布局构造器 | 业务实现，生成 `PhysicalLayoutTable`；核心不提供策略类型 |
-| `Error` | 顶层错误类型；`Result` 的 `$err` 分支；每个分支是带 `msg` 的 Object（B.3.3） |
-| `Result` | 成功是 `$ok T`，失败是 `$err Error`（B.3.3） |
+| `Error` | 顶层错误类型；`Result` 的 `$err` 分支；每个分支是带 `msg` 的 Object（B.3.4） |
+| `Result` | 成功是 `$ok T`，失败是 `$err Error`（B.3.4） |
 
 ## 附录 B 类型定义
 
@@ -506,12 +607,12 @@ d_tensors_view_rank_save =
   <- $compute_view ComputeDTensorsView
   <- $storage_view StorageDTensorsView
 
-# Thin executor of d_tensors_view_rank_plan_reshard.
-d_tensors_view_rank_reshard =
+# Thin executor of a read chain. Legs and their ranges come from
+# d_tensors_view_rank_plan_chain_load; this only executes them in order.
+d_tensors_view_rank_chain_load =
     Result[void]
   <- $rank int
-  <- $src_view DTensorsView
-  <- $dst_view DTensorsView
+  <- $read_chain DTensorsReadChain
 ```
 
 #### B.1.2 Plan APIs
@@ -532,18 +633,20 @@ d_tensors_view_rank_plan_save =
   <- $compute_view ComputeDTensorsView
   <- $storage_view StorageDTensorsView
 
-# Internal key function behind d_tensors_view_rank_reshard. The tensor/meta
-# precondition lives here; the plan-less API stays a thin executor.
-d_tensors_view_rank_plan_reshard =
-    Result[CopyPlan]
+# Internal key function behind d_tensors_view_rank_chain_load. It returns one
+# CopyPlanChain, isomorphic to the read chain: one CopyPlan per leg, in
+# data-flow order. The tensor/meta precondition is checked per leg, and the
+# plan-less executor stays thin.
+d_tensors_view_rank_plan_chain_load =
+    Result[CopyPlanChain]
   <- $rank int
-  <- $src_view DTensorsView
-  <- $dst_view DTensorsView
+  <- $read_chain DTensorsReadChain
   <- Assert[{
-    src_view.tensor_ids == dst_view.tensor_ids
-    and forall tensor_id in src_view.tensor_ids:
-      global_tensor_meta_of(src_view.d_tensor_table.named_d_tensors[tensor_id])
-      == global_tensor_meta_of(dst_view.d_tensor_table.named_d_tensors[tensor_id])
+    forall leg in legs_of(read_chain):
+      leg.src.tensor_ids == leg.dst.tensor_ids
+      and forall tensor_id in leg.src.tensor_ids:
+        global_tensor_meta_of(leg.src.d_tensor_table.named_d_tensors[tensor_id])
+        == global_tensor_meta_of(leg.dst.d_tensor_table.named_d_tensors[tensor_id])
   }]
 ```
 
@@ -558,6 +661,16 @@ check_compute_d_tensors_access_disjoint =
 check_compute_d_tensors_access_full_covering =
     Result[void]
   <- $d_tensor_table DTensorTable[ComputeMesh]
+  <- $copy_plan CopyPlan
+
+check_cache_d_tensors_access_disjoint =
+    Result[void]
+  <- $d_tensor_table DTensorTable[CacheMesh]
+  <- $copy_plan CopyPlan
+
+check_cache_d_tensors_access_full_covering =
+    Result[void]
+  <- $d_tensor_table DTensorTable[CacheMesh]
   <- $copy_plan CopyPlan
 
 check_storage_d_tensors_access_disjoint =
@@ -626,9 +739,32 @@ d_tensors_view_map =
   <- $map_core DTensorsViewMapCore
 ```
 
+#### B.1.6 Stats APIs
+
+```bash
+# Pure functions over the chain structure: no session is opened and no
+# payload is read. Each result has one entry per node of the chain, indexed
+# by node id, in bytes.
+
+# Memory the cache occupies on each node.
+get_stat_mem_overhead_of_chain_load =
+    list[int]
+  <- $read_chain DTensorsReadChain
+
+# Bytes each node sends out.
+get_stat_outbound_traffic_of_chain_load =
+    list[int]
+  <- $read_chain DTensorsReadChain
+
+# Bytes each node takes in.
+get_stat_inbound_traffic_of_chain_load =
+    list[int]
+  <- $read_chain DTensorsReadChain
+```
+
 ### B.2 Entities
 
-实体分三侧：Compute、Storage、Common；`check_constraints` 的额外检查单列在 B.2.4。Python 实现的 `<ClassName>BuilderMixin` 见附录 C。`Slot` 是逻辑概念，`Layout` 是物理概念；类型名用 `Logical` / `Physical` 区分。
+实体分四侧：Compute、Storage、Cache、Common；`check_constraints` 的额外检查单列在 B.2.5。Python 实现的 `<ClassName>BuilderMixin` 见附录 C。`Slot` 是逻辑概念，`Layout` 是物理概念；类型名用 `Logical` / `Physical` 区分。
 
 #### B.2.1 Compute side
 
@@ -659,7 +795,7 @@ ComputeMesh =
 
 #### B.2.2 Storage side
 
-`slot`（槽位）是逻辑概念，不是文件或容器。把存储计划看成一个 `num_tensors × world_size` 的表：每一行是一个张量，每一列是一个全局 rank，每个格子是一个 slot；总 slot 数 = `num_tensors * world_size`。格子可以为空：该 rank 不持有这个张量、这个张量不在该 pp stage，或者它只存一份而其余列留空。同一行的非空格子按列顺序拼接，构成这个张量的存储区域。`StorageMesh` 的 `OuterProductMesh` 分支里，`tensor_slots` 选择行（张量），`content_slots` 选择列（slot）；`content_slots` 是 `ContentSlotsMesh`，即 `LiteralMesh["world_size"] | ArrangedMesh["world_size"]`：`LiteralMesh` 直接给出 rank 列表，`ArrangedMesh` 的 `"world_size"` 是列数。
+`slot`（槽位）是逻辑概念，不是文件或容器。把存储计划看成一个 `num_tensors × world_size` 的表：每一行是一个张量，每一列是一个全局 rank，每个格子是一个 slot；总 slot 数 = `num_tensors * world_size`。格子可以为空：该 rank 不持有这个张量、这个张量不在该 pp stage，或者它只存一份而其余列留空。同一行的非空格子按列顺序拼接，构成这个张量的存储区域。`StorageMesh` 的 `SlotOuterProductMesh` 分支里，`tensor_slots` 选择行（张量），`content_slots` 选择列（slot）；`content_slots` 是 `ContentSlotsMesh`，即 `LiteralMesh["world_size"] | ArrangedMesh["world_size"]`：`LiteralMesh` 直接给出 rank 列表，`ArrangedMesh` 的 `"world_size"` 是列数。
 
 ##### B.2.2.1 StorageDTensorsView
 
@@ -719,8 +855,7 @@ PhysicalLayoutTable =
   }]
 
 # Canonical TensorComponentPos of a DisjointStorageMeshList; used as its
-# dict key. Pick the smallest (row, column) cell; its tensor_id is
-# disjoint_storage_meshes.tensor_ids[row].
+# dict key.
 leader_tensor_component_pos_of =
     TensorComponentPos
   <- $disjoint_storage_meshes DisjointStorageMeshList
@@ -741,13 +876,6 @@ DisjointStorageMeshList =
     # One logical list per physical file. The meshes inside this list are
     # disjoint, and meshes from different files are disjoint too.
   * $disjoint_storage_mesh_list list[MultiTensorsStorageMesh]
-    # Row labels, in DTensorTable.named_d_tensors order. Filled by the
-    # business layout constructor; shared by all meshes in this list.
-  * $tensor_ids list[str]
-  * Assert[{
-      forall mesh in disjoint_storage_mesh_list:
-        check len(tensor_ids) equals the underlying OuterProductMesh.tensor_slots.size value
-  }]
   * Hint[{
     不同物理文件的 mesh 也互不重叠：每个 slot 最多被一个 mesh 覆盖。
     每个空 content slot 占用 0 字节；空槽不参与 offset 累加，所以 list 里有很多空槽也不会让后续张量的 offset 错位。
@@ -769,12 +897,12 @@ MultiTensorsStorageMesh = StorageMesh[ArrangedMesh["tensor_count"]]
 # Branches are named types; no tags.
 StorageMesh[TensorSlotsMeshT] =
     Oneof
-  | OuterProductMesh[TensorSlotsMeshT]
+  | SlotOuterProductMesh[TensorSlotsMeshT]
   | ReshapedMesh[StorageMesh[TensorSlotsMeshT]]
   | SlicedMesh[StorageMesh[TensorSlotsMeshT]]
 
 # The two dimensions: which tensors, which content slots.
-OuterProductMesh[TensorSlotsMeshT] =
+SlotOuterProductMesh[TensorSlotsMeshT] =
     Object
   * $tensor_slots TensorSlotsMeshT
   * $content_slots ContentSlotsMesh
@@ -872,18 +1000,99 @@ StorageLoadSession =
     )
 ```
 
-#### B.2.3 Common
+#### B.2.3 Cache side
 
-##### B.2.3.1 DTensorsView
+##### B.2.3.1 CacheDTensorsView
+
+```bash
+# Node-local companion storage on the compute side. Its range type is
+# RangeFromCacheView, which is RangeFromComputeView (B.3.1), so a cache view
+# needs no session and no PhysicalLayoutTable.
+CacheDTensorsView =
+    Object
+    # Tensors cached by this view.
+  * $tensor_ids list[str]
+    # Cache mesh; its participants are nodes, not ranks.
+  * $d_tensor_table DTensorTable[CacheMesh]
+    # Read/write raw cache ranges; same range type as the compute side.
+  * $data_accessor DTensorDataAccessor[RangeFromCacheView]
+```
+
+缓存是计算节点上的伴生存储：数据在节点本地，读写不经文件，所以这个 view 的字段和 `ComputeDTensorsView` 相同，只把 mesh 换成 `CacheMesh`。
+
+##### B.2.3.2 CacheMesh
+
+```bash
+# Branches are named types; no tags.
+CacheMesh =
+    Oneof
+  | StCacheOuterProductMesh
+  | PermutedMesh[CacheMesh]
+
+# St -- spatiotemporal. Three dimensions: temporal (steps), spatial (nodes)
+# and concurrency (buffer slots).
+StCacheOuterProductMesh =
+    Object
+  * $temporal TemporalCacheMesh
+  * $spatial SpatioCacheMesh
+  * $concurrency ConcurrencyMesh
+  * Hint[{
+    1. 放置符按维度固定：temporal / concurrency 是 $shard，spatial 是 $replicate；mesh 做了 PermutedMesh 时
+       placements 按同样的顺序排。check_constraints 拒绝别的组合。
+    2. spatial 逐级 $replicate 放大副本，用来消减读热点：存储的一份被少量节点读，这些节点再被更多节点读，
+       读者被摊到更多副本上，所以一传十、十传百。
+    3. spatial 各级参与数相乘会让缓存内存暴涨；temporal 让同一块缓存内存在 num_steps 个 step 之间复用，
+       concurrency 用 concurrency_width 提供并发缓冲槽，2 对应双缓冲，也可以更多，执行层可以让填充和读取重叠。
+    4. temporal / concurrency 切的是不同的数据片（不同 step、不同缓冲槽），不是同一份数据的副本，所以它们是 $shard。
+    5. 参与者坐标是 (step, node, buffer)；只有 spatial 维的 node 展开成 rank，temporal / concurrency 是同一批 node 上的缓冲槽。
+    6. ReshapedMesh 保持元素总数不变，所以 temporal 与 spatial 之间的 reshape 只在两侧总数相等时成立；reshape 只改展开顺序，不改放置符。
+    7. CacheMesh 没有 SlicedMesh 分支。
+  }]
+
+ConcurrencyMesh = ArrangedMesh["concurrency_width"]
+
+# Temporal dimension; num_steps is the number of steps.
+TemporalCacheMesh =
+    Oneof
+  | ArrangedMesh["num_steps"]
+  | ReshapedMesh[SpatioCacheMesh]
+
+# Spatial dimension; num_nodes is the number of nodes.
+SpatioCacheMesh =
+    Oneof
+  | LiteralMesh["num_nodes"]
+  | ReshapedMesh[TemporalCacheMesh]
+```
+
+##### B.2.3.3 is_cache_mesh_subset_of_mesh
+
+```bash
+# True when every rank covered by lhs is also covered by rhs. A cache mesh
+# is expanded to ranks through its spatial dimension only: node n maps to
+# [n * num_ranks_per_node, (n + 1) * num_ranks_per_node), and the temporal /
+# concurrency dimensions are buffer slots on those same nodes, so they add no
+# ranks. rhs is expanded the same way when it is a cache mesh, and is already
+# in ranks when it is a compute mesh. Used by the read chain Assert in B.3.2.
+is_cache_mesh_subset_of_mesh =
+    bool
+  <- $lhs CacheMesh
+  <- $rhs (CacheMesh | ComputeMesh)
+  <- $num_ranks_per_node int
+```
+
+#### B.2.4 Common
+
+##### B.2.4.1 DTensorsView
 
 ```bash
 DTensorsView =
     Oneof
   | ComputeDTensorsView
   | StorageDTensorsView
+  | CacheDTensorsView
 ```
 
-##### B.2.3.2 DTensorDataAccessor
+##### B.2.4.2 DTensorDataAccessor
 
 ```bash
 DTensorDataAccessor[RangeT] =
@@ -904,7 +1113,7 @@ DTensorDataAccessor[RangeT] =
     )
 ```
 
-##### B.2.3.3 NamedDTensor
+##### B.2.4.3 NamedDTensor
 
 ```bash
 NamedDTensor[MeshT] =
@@ -917,7 +1126,7 @@ NamedDTensor[MeshT] =
   * $alias list[str]
 ```
 
-##### B.2.3.4 GenericDTensor
+##### B.2.4.4 GenericDTensor
 
 ```bash
 GenericDTensor[MeshT] =
@@ -935,7 +1144,7 @@ ReshapedDTensor[MeshT] =
   * $shape list[int]
 ```
 
-##### B.2.3.5 NaiveDTensor
+##### B.2.4.5 NaiveDTensor
 
 ```bash
 NaiveDTensor[MeshT] =
@@ -952,7 +1161,7 @@ NaiveDTensor[MeshT] =
   * $torch_d_tensor (torch.DTensor | nil)
 ```
 
-##### B.2.3.6 GlobalTensorMeta
+##### B.2.4.6 GlobalTensorMeta
 
 ```bash
 GlobalTensorMeta =
@@ -965,7 +1174,7 @@ GlobalTensorMeta =
   * $itemsize int
 ```
 
-##### B.2.3.7 Placement
+##### B.2.4.7 Placement
 
 ```bash
 Placement =
@@ -978,7 +1187,7 @@ Placement =
   | $partial ()
 ```
 
-##### B.2.3.8 DTensorTable
+##### B.2.4.8 DTensorTable
 
 ```bash
 DTensorTable[MeshT] =
@@ -987,7 +1196,7 @@ DTensorTable[MeshT] =
   * $named_d_tensors list[NamedDTensor[MeshT]]
 ```
 
-##### B.2.3.9 GlobalTensorMetaOf
+##### B.2.4.9 GlobalTensorMetaOf
 
 ```bash
 global_tensor_meta_of[MeshT] =
@@ -995,7 +1204,7 @@ global_tensor_meta_of[MeshT] =
   <- $named_d_tensor NamedDTensor[MeshT]
 ```
 
-##### B.2.3.10 TensorOrderValueOf
+##### B.2.4.10 TensorOrderValueOf
 
 ```bash
 # List index of tensor_id in named_d_tensors; a missing id returns $err
@@ -1006,12 +1215,12 @@ tensor_order_value_of[MeshT] =
   <- $tensor_id str
 ```
 
-##### B.2.3.11 DTensorsViewMapCore
+##### B.2.4.11 DTensorsViewMapCore
 
 ```bash
-# Four optional callbacks for d_tensors_view_map. Compute and storage tensor
-# callbacks are separate because their tensor types differ; storage also
-# converts sessions. A nil tensor callback means identity; a nil session
+# Five optional callbacks for d_tensors_view_map. Compute, storage and cache
+# tensor callbacks are separate because their tensor types differ; storage
+# also converts sessions. A nil tensor callback means identity; a nil session
 # callback means skip that session.
 DTensorsViewMapCore =
     Object
@@ -1023,6 +1232,10 @@ DTensorsViewMapCore =
           Result[GenericDTensor[StorageMesh]]
         <- $tensor GenericDTensor[StorageMesh]
       ) | nil)
+  * $convert_each_cache_view ((
+          Result[GenericDTensor[CacheMesh]]
+        <- $tensor GenericDTensor[CacheMesh]
+      ) | nil)
   * $convert_each_storage_load_session ((
           Result[StorageLoadSession]
         <- $session StorageLoadSession
@@ -1033,7 +1246,7 @@ DTensorsViewMapCore =
       ) | nil)
 ```
 
-### B.2.4 check_constraints
+### B.2.5 check_constraints
 
 每个数据 `Object` / `Oneof`（session / access 接口除外）都有：
 
@@ -1046,17 +1259,26 @@ check_constraints = Result[void] <- $self T
 | 类型 | 额外检查（递归之外） |
 |---|---|
 | `ComputeDTensorsView` | `tensor_ids` 与 `d_tensor_table` 的顺序一致；`data_accessor` 非空 |
-| `StorageDTensorsView` | `tensor_ids` 与 `d_tensor_table` 的顺序一致；`physical_layout` 的 entry 的 `tensor_id` 在 table 里；每个物理 list 的 `tensor_ids` 等于 table 的张量顺序；`data_accessor` / `begin_save` / `begin_load` 非空 |
+| `StorageDTensorsView` | `tensor_ids` 与 `d_tensor_table` 的顺序一致；`physical_layout` 的 entry 的 `tensor_id` 在 table 里；`data_accessor` / `begin_save` / `begin_load` 非空 |
+| `CacheDTensorsView` | `tensor_ids` 与 `d_tensor_table` 的顺序一致；`data_accessor` 非空；每个 cache 张量的 `placements` 与 mesh 三个维度对应：`temporal` / `concurrency` 是 `$shard`，`spatial` 是 `$replicate` |
 | `DTensorTable` | `global_tensor_id` 不重复 |
 | `NamedDTensor` | `global_tensor_id` 非空 |
 | `NaiveDTensor` | `global_tensor_meta` / `placements` / `mesh` 一致；`torch_d_tensor` 可空 |
 | `GlobalTensorMeta` | `global_shape` 非空；`itemsize > 0`；`dtype` 非空 |
 | `PhysicalLayoutTable` | `container_format` 唯一；`file_paths` 的键是 leader pos；entry 的 leader 在 `file_paths` 里；mesh 两两不重叠 |
-| `DisjointStorageMeshList` | list 非空；mesh 两两不重叠；`len(tensor_ids)` 等于每个 mesh 的 tensor_count |
+| `DisjointStorageMeshList` | list 非空；mesh 两两不重叠 |
 | `StorageMesh` | `content_slots` 的 `ArrangedMesh` 的 size > 0 |
 | `ComputeMesh` | `ArrangedMesh` 的 size > 0 |
+| `CacheMesh` | `temporal` / `spatial` / `concurrency` 里的 `ArrangedMesh` 的 size > 0 |
 | `LiteralMesh` | `ranks` 非空；每个 rank 满足 `0 <= rank < max`；`ranks` 无重复 |
+| `DirectDTensorsReadChain` | `src.tensor_ids == dst.tensor_ids` |
+| `OneLayerCachedDTensorsReadChain` | `src` / `cache` / `dst` 的 `tensor_ids` 相同；`num_ranks_per_node * num_nodes == world_size`；`is_cache_mesh_subset_of_mesh(cache.mesh, dst.mesh, num_ranks_per_node)` |
+| `TwoLayerCachedDTensorsReadChain` | `src` / `small_cache` / `big_cache` / `dst` 的 `tensor_ids` 相同；`num_ranks_per_node * num_nodes == world_size`；`is_cache_mesh_subset_of_mesh(small_cache.mesh, big_cache.mesh, num_ranks_per_node)` 且 `is_cache_mesh_subset_of_mesh(big_cache.mesh, dst.mesh, num_ranks_per_node)` |
+| `MixedDTensorsReadChain` | 各段的 `tensor_ids` 两两不重叠 |
+| `DisjointTensorIdsAndReadChain` | `tensor_ids` 等于 `get_tensor_ids_of_read_chain(read_chain)` |
 | `ConstraintViolationError` / `CheckFailedError` / `NotFoundError` / `InvalidArgumentError` / `GDTensorIOError` | `msg` 非空 |
+
+`OneLayerCachedDTensorsReadChain` / `TwoLayerCachedDTensorsReadChain` 的 mesh 约束里，`num_nodes` 取 cache mesh 的节点维度，`world_size` 取 `dst` 的 mesh 的参与者总数；展开规则见 3.4。
 
 `check_constraints` 不替代 `check_*`：前者递归检查对象自身和所有嵌套数据；后者检查一次 `CopyPlan` 的 disjoint / covering。
 
@@ -1069,7 +1291,8 @@ Python 实现里，`check_constraints` 在数据类 `Foo` 上；build 接口在 
 #### B.3.1 Ranges
 
 ```bash
-# A range on either side of a copy: a compute view or a storage view.
+# A range on either side of a copy: a compute, storage, or cache view. A
+# cache view uses RangeFromComputeView, so there are only two branches.
 DTensorRange =
     Oneof
   | RangeFromComputeView
@@ -1087,6 +1310,11 @@ RangeFromComputeView =
   * $global_tensor_offset int
   * $size int
 
+# A cache range is a compute range: the cache lives on the compute side and
+# its accessor takes the same range type, so DTensorRange has no cache
+# branch.
+RangeFromCacheView = RangeFromComputeView
+
 RangeFromStorageView =
     Object
   * $file_path str
@@ -1101,7 +1329,158 @@ RangeFromStorageView =
   * $size int
 ```
 
-#### B.3.2 Meshes
+#### B.3.2 读链
+
+```bash
+DTensorsReadChain =
+    Oneof
+  | DirectDTensorsReadChain
+  | OneLayerCachedDTensorsReadChain
+  | TwoLayerCachedDTensorsReadChain
+  | MixedDTensorsReadChain
+
+# Tensor ids covered by the chain: dst.tensor_ids for the concrete branches;
+# the concatenation of the segments in list order for Mixed.
+get_tensor_ids_of_read_chain =
+    list[str]
+  <- $read_chain DTensorsReadChain
+
+# Views at the two ends of each leg, in data-flow order: Direct gives one
+# pair (src, dst); OneLayerCached gives (src, cache) and (cache, dst);
+# TwoLayerCached gives three pairs; Mixed concatenates its segments' pairs.
+legs_of =
+    list[($src DTensorsView, $dst DTensorsView)]
+  <- $read_chain DTensorsReadChain
+
+# A concrete chain has no Mixed branch, so a Mixed chain does not nest.
+ConcreteDTensorsReadChain =
+    Oneof
+  | DirectDTensorsReadChain
+  | OneLayerCachedDTensorsReadChain
+  | TwoLayerCachedDTensorsReadChain
+
+MixedDTensorsReadChain =
+    Object
+  * $disjoint_tensor_ids_and_read_chain_list list[DisjointTensorIdsAndReadChain]
+  * Assert[{
+      let tensor_ids = [
+        x
+        for segment in disjoint_tensor_ids_and_read_chain_list
+        for x in get_tensor_ids_of_read_chain(segment.read_chain)
+      ]
+      check len(tensor_ids) == len(set(tensor_ids))
+    }]
+
+DisjointTensorIdsAndReadChain =
+    Object
+  * $tensor_ids list[str]
+  * $read_chain ConcreteDTensorsReadChain
+  * Assert[{
+      tensor_ids == get_tensor_ids_of_read_chain(read_chain)
+    }]
+
+DirectDTensorsReadChain =
+    Object
+  * $src StorageDTensorsView
+  * $dst ComputeDTensorsView
+  * Assert[{
+      src.tensor_ids == dst.tensor_ids
+    }]
+
+# data-flow: src -> cache -> dst
+OneLayerCachedDTensorsReadChain =
+    Object
+  * $src StorageDTensorsView
+  * $cache CacheDTensorsView
+  * $dst ComputeDTensorsView
+  * $num_ranks_per_node int
+  * Hint[{
+      假定就是伴生存储：cache 仍然最终落在计算侧的节点上，只是视角不同。
+      ComputeDTensorsView 的视角是 rank / world_size；
+      CacheDTensorsView 的视角是 node / num_nodes；
+      node n 覆盖 rank 区间 [n * num_ranks_per_node, (n + 1) * num_ranks_per_node)。
+    }]
+  * Assert[{
+      check num_ranks_per_node * num_nodes == world_size
+      check src.tensor_ids == cache.tensor_ids == dst.tensor_ids
+      check is_cache_mesh_subset_of_mesh(
+        cache.mesh, dst.mesh, num_ranks_per_node
+      )
+    }]
+
+# data-flow: src -> small_cache -> big_cache -> dst
+TwoLayerCachedDTensorsReadChain =
+    Object
+  * $src StorageDTensorsView
+  * $small_cache CacheDTensorsView
+  * $big_cache CacheDTensorsView
+  * $dst ComputeDTensorsView
+  * $num_ranks_per_node int
+  * Hint[{
+      假定就是伴生存储：两层 cache 仍然最终落在计算侧的节点上，只是视角和容量不同。
+      ComputeDTensorsView 的视角是 rank / world_size；
+      CacheDTensorsView 的视角是 node / num_nodes；
+      node n 覆盖 rank 区间 [n * num_ranks_per_node, (n + 1) * num_ranks_per_node)。
+    }]
+  * Assert[{
+      check num_ranks_per_node * num_nodes == world_size
+      check src.tensor_ids == dst.tensor_ids
+        == small_cache.tensor_ids == big_cache.tensor_ids
+      check is_cache_mesh_subset_of_mesh(
+        small_cache.mesh, big_cache.mesh, num_ranks_per_node
+      )
+      check is_cache_mesh_subset_of_mesh(
+        big_cache.mesh, dst.mesh, num_ranks_per_node
+      )
+    }]
+
+# Plan of a read chain. Isomorphic to DTensorsReadChain: the branches match
+# one to one, and each branch holds one CopyPlan per leg, in data-flow order.
+# Direct has one leg, OneLayerCached two, TwoLayerCached three.
+CopyPlanChain =
+    Oneof
+  | DirectCopyPlanChain
+  | OneLayerCachedCopyPlanChain
+  | TwoLayerCachedCopyPlanChain
+  | MixedCopyPlanChain
+
+DirectCopyPlanChain =
+    Object
+  * $src_to_dst CopyPlan
+
+# data-flow: src -> cache -> dst
+OneLayerCachedCopyPlanChain =
+    Object
+  * $src_to_cache CopyPlan
+  * $cache_to_dst CopyPlan
+
+# data-flow: src -> small_cache -> big_cache -> dst
+TwoLayerCachedCopyPlanChain =
+    Object
+  * $src_to_small_cache CopyPlan
+  * $small_cache_to_big_cache CopyPlan
+  * $big_cache_to_dst CopyPlan
+
+# Same nesting rule as the read chain: a Mixed plan chain holds concrete ones.
+ConcreteCopyPlanChain =
+    Oneof
+  | DirectCopyPlanChain
+  | OneLayerCachedCopyPlanChain
+  | TwoLayerCachedCopyPlanChain
+
+MixedCopyPlanChain =
+    Object
+  * $disjoint_tensor_ids_and_copy_plan_chain_list list[DisjointTensorIdsAndCopyPlanChain]
+
+DisjointTensorIdsAndCopyPlanChain =
+    Object
+  * $tensor_ids list[str]
+  * $copy_plan_chain ConcreteCopyPlanChain
+```
+
+`num_nodes` 是 cache mesh 的 `spatial` 维（节点数），`world_size` 是 `dst` 的 mesh 的参与者总数；`temporal` / `concurrency` 不加 rank，它们只是同一批 node 上的缓冲槽；`is_cache_mesh_subset_of_mesh` 见 B.2.3.3。
+
+#### B.3.3 Meshes
 
 ```bash
 ArrangedMesh[tag_name] =
@@ -1154,7 +1533,7 @@ Slice =
   * $step (int | nil)
 ```
 
-#### B.3.3 Error 与 Result
+#### B.3.4 Error 与 Result
 
 `Error` 是顶层类型，所有 `Result` 的 `$err` 分支都用它，不用裸 `str`。每个分支都是一个 Object，至少带 `msg`；调用方按分支类型处理，不解析 `msg`。
 
@@ -1223,10 +1602,10 @@ GDTensorIOError =
 
 | 分支 | 产生方 |
 |---|---|
-| `ConstraintViolationError` | 所有 `check_constraints`（B.2.4） |
+| `ConstraintViolationError` | 所有 `check_constraints`（B.2.5） |
 | `CheckFailedError` | B.1.3 的 `check_*`：不 disjoint、不 covering、storage mesh 重叠 |
 | `NotFoundError` | `compute_d_tensors_view_get_gd_tensor` 的 id、`tensor_order_value_of` 的 id、`file_path_of` 的 `tensor_entries` / `file_paths` 键 |
-| `InvalidArgumentError` | `d_tensors_view_rank_plan_reshard` 的 `Assert` 失败；session 在生命周期之外被调用（`begin_*` 之前，或 `commit` / `abort` / `finish` 之后） |
+| `InvalidArgumentError` | `d_tensors_view_rank_plan_chain_load` 的 `Assert` 失败；session 在生命周期之外被调用（`begin_*` 之前，或 `commit` / `abort` / `finish` 之后） |
 | `GDTensorIOError` | `begin_save` / `begin_load` / `commit` / `abort` / `finish` / `init_data_accessor` 的文件操作，以及 accessor 的 buffer 读写 |
 
 ```bash
@@ -1299,9 +1678,18 @@ CopyPlan = list[tuple[DTensorRange, DTensorRange]]
 sum type（viba `Oneof`）统一映射成 `types.UnionType`。带 tag 的分支在 `gdtensor.tag` 里各有一个类：类名是 tag 名的 PascalCase，payload 是泛型参数。
 
 ```python
-DTensorsView = ComputeDTensorsView | StorageDTensorsView
+DTensorsView = ComputeDTensorsView | StorageDTensorsView | CacheDTensorsView
 DTensorRange = RangeFromComputeView | RangeFromStorageView
 GenericDTensor = NaiveDTensor | ReshapedDTensor
+DTensorsReadChain = (
+    DirectDTensorsReadChain | OneLayerCachedDTensorsReadChain
+    | TwoLayerCachedDTensorsReadChain | MixedDTensorsReadChain
+)
+ConcreteDTensorsReadChain = (
+    DirectDTensorsReadChain | OneLayerCachedDTensorsReadChain
+    | TwoLayerCachedDTensorsReadChain
+)
+CacheMesh = StCacheOuterProductMesh | PermutedMesh[CacheMesh]
 Placement = tag.Shard[int] | tag.Replicate | tag.Partial
 Error = (
     ConstraintViolationError | CheckFailedError | NotFoundError
@@ -1309,11 +1697,11 @@ Error = (
 )
 ```
 
-情况分两类：分支 payload 是独立命名类型的（`DTensorsView`、`DTensorRange`、`GenericDTensor`、`Error`、mesh 各 Oneof）直接用分支自己的类，不带 tag；payload 是 `int` / void / 泛型 `T` 的（`Placement`、`Result`）必须带 tag，tag 类和 `tagged[...]` 字段都进 `gdtensor.tag`。
+情况分两类：分支 payload 是独立命名类型的（`DTensorsView`、`DTensorRange`、`GenericDTensor`、`DTensorsReadChain`、`Error`、mesh 各 Oneof）直接用分支自己的类，不带 tag；payload 是 `int` / void / 泛型 `T` 的（`Placement`、`Result`）必须带 tag，tag 类和 `tagged[...]` 字段都进 `gdtensor.tag`。
 
-mesh 的 Oneof 因此就是分支类型的 union，例如 `type ComputeMesh = LiteralMesh[tag.WorldSize[int]] | ArrangedMesh[tag.WorldSize[int]] | ReshapedMesh[ComputeMesh] | PermutedMesh[ComputeMesh] | SlicedMesh[ComputeMesh]`。
+mesh 的 Oneof 因此就是分支类型的 union，例如 `type ComputeMesh = LiteralMesh[tag.WorldSize[int]] | ArrangedMesh[tag.WorldSize[int]] | ReshapedMesh[ComputeMesh] | PermutedMesh[ComputeMesh] | SlicedMesh[ComputeMesh]`；缓存同理，`type CacheMesh = StCacheOuterProductMesh | PermutedMesh[CacheMesh]`。
 
-viba 的 `tagged[tag_name, T]`（不是 Oneof，是带名 tag 的标量）也进 `gdtensor.tag`：`tagged["world_size", int]` 对应 `tag.WorldSize[int]`，值是 `tag.WorldSize(4)`。`ArrangedMesh` 的 `$size` 和 `LiteralMesh` 的 `$max` 都是这种用法：`$size tagged["world_size", int]` 写成 `size: tag.WorldSize[int]`，`LiteralMesh["world_size"]` 写成 `LiteralMesh[tag.WorldSize[int]]`。
+viba 的 `tagged[tag_name, T]`（不是 Oneof，是带名 tag 的标量）也进 `gdtensor.tag`：`tagged["world_size", int]` 对应 `tag.WorldSize[int]`，值是 `tag.WorldSize(4)`；同理 `tagged["num_steps", int]` 是 `tag.NumSteps[int]`，`tagged["num_nodes", int]` 是 `tag.NumNodes[int]`，`tagged["concurrency_width", int]` 是 `tag.ConcurrencyWidth[int]`。`ArrangedMesh` 的 `$size` 和 `LiteralMesh` 的 `$max` 都是这种用法：`$size tagged["world_size", int]` 写成 `size: tag.WorldSize[int]`，`LiteralMesh["world_size"]` 写成 `LiteralMesh[tag.WorldSize[int]]`。
 
 tag 类不逐个手写：一个 `Box` 基类加一个 `make_box_subclass`，每个 tag 一行。
 
@@ -1447,6 +1835,7 @@ class DTensorDataAccessor[RangeT](abc.ABC):
 | namespace | Python path | full name |
 |---|---|---|
 |  | `gdtensor.get_tensor_ids` | `compute_d_tensors_view_get_tensor_ids` |
+|  | `gdtensor.get_chain_tensor_ids` | `get_tensor_ids_of_read_chain` |
 |  | `gdtensor.get_gd_tensor` | `compute_d_tensors_view_get_gd_tensor` |
 |  | `gdtensor.make_gd_tensor` | `gd_tensor_make` |
 |  | `gdtensor.get_d_tensor` | `gd_tensor_get_d_tensor` |
@@ -1455,11 +1844,15 @@ class DTensorDataAccessor[RangeT](abc.ABC):
 |  | `gdtensor.Error` | `Error` |
 | `io` | `gdtensor.io.rank_load` | `d_tensors_view_rank_load` |
 | `io` | `gdtensor.io.rank_save` | `d_tensors_view_rank_save` |
-| `io` | `gdtensor.io.rank_reshard` | `d_tensors_view_rank_reshard` |
+| `io` | `gdtensor.io.chain_load` | `d_tensors_view_rank_chain_load` |
+| `io` | `gdtensor.io.chain_stat_mem_overhead` | `get_stat_mem_overhead_of_chain_load` |
+| `io` | `gdtensor.io.chain_stat_outbound_traffic` | `get_stat_outbound_traffic_of_chain_load` |
+| `io` | `gdtensor.io.chain_stat_inbound_traffic` | `get_stat_inbound_traffic_of_chain_load` |
 | `builder` | `gdtensor.builder.d_tensors_view_map` | `d_tensors_view_map` |
 | `builder` | `gdtensor.builder.DTensorsView` | `DTensorsView` |
 | `builder` | `gdtensor.builder.ComputeDTensorsView` | `ComputeDTensorsView` |
 | `builder` | `gdtensor.builder.StorageDTensorsView` | `StorageDTensorsView` |
+| `builder` | `gdtensor.builder.CacheDTensorsView` | `CacheDTensorsView` |
 | `builder` | `gdtensor.builder.DTensorsViewMapCore` | `DTensorsViewMapCore` |
 | `builder` | `gdtensor.builder.DTensorTable` | `DTensorTable` |
 | `builder` | `gdtensor.builder.NamedDTensor` | `NamedDTensor` |
@@ -1470,7 +1863,7 @@ class DTensorDataAccessor[RangeT](abc.ABC):
 | `builder` | `gdtensor.builder.Placement` | `Placement` |
 | `builder` | `gdtensor.builder.ComputeMesh` | `ComputeMesh` |
 | `builder` | `gdtensor.builder.StorageMesh` | `StorageMesh` |
-| `builder` | `gdtensor.builder.OuterProductMesh` | `OuterProductMesh` |
+| `builder` | `gdtensor.builder.SlotOuterProductMesh` | `SlotOuterProductMesh` |
 | `builder` | `gdtensor.builder.ContentSlotsMesh` | `ContentSlotsMesh` |
 | `builder` | `gdtensor.builder.LiteralMesh` | `LiteralMesh` |
 | `builder` | `gdtensor.builder.ArrangedMesh` | `ArrangedMesh` |
@@ -1478,6 +1871,17 @@ class DTensorDataAccessor[RangeT](abc.ABC):
 | `builder` | `gdtensor.builder.PermutedMesh` | `PermutedMesh` |
 | `builder` | `gdtensor.builder.SlicedMesh` | `SlicedMesh` |
 | `builder` | `gdtensor.builder.Slice` | `Slice` |
+| `builder` | `gdtensor.builder.CacheMesh` | `CacheMesh` |
+| `builder` | `gdtensor.builder.StCacheOuterProductMesh` | `StCacheOuterProductMesh` |
+| `builder` | `gdtensor.builder.TemporalCacheMesh` | `TemporalCacheMesh` |
+| `builder` | `gdtensor.builder.SpatioCacheMesh` | `SpatioCacheMesh` |
+| `builder` | `gdtensor.builder.DTensorsReadChain` | `DTensorsReadChain` |
+| `builder` | `gdtensor.builder.ConcreteDTensorsReadChain` | `ConcreteDTensorsReadChain` |
+| `builder` | `gdtensor.builder.DirectDTensorsReadChain` | `DirectDTensorsReadChain` |
+| `builder` | `gdtensor.builder.OneLayerCachedDTensorsReadChain` | `OneLayerCachedDTensorsReadChain` |
+| `builder` | `gdtensor.builder.TwoLayerCachedDTensorsReadChain` | `TwoLayerCachedDTensorsReadChain` |
+| `builder` | `gdtensor.builder.MixedDTensorsReadChain` | `MixedDTensorsReadChain` |
+| `builder` | `gdtensor.builder.DisjointTensorIdsAndReadChain` | `DisjointTensorIdsAndReadChain` |
 | `builder` | `gdtensor.builder.PhysicalLayoutTable` | `PhysicalLayoutTable` |
 | `builder` | `gdtensor.builder.DisjointStorageMeshList` | `DisjointStorageMeshList` |
 | `builder` | `gdtensor.builder.ContainerFormat` | `ContainerFormat` |
@@ -1498,16 +1902,20 @@ class DTensorDataAccessor[RangeT](abc.ABC):
 | `tag` | `gdtensor.tag.ConstantOne` | `tagged["constant_one", int]` |
 | `tag` | `gdtensor.tag.TensorCount` | `tagged["tensor_count", int]` |
 | `tag` | `gdtensor.tag.WorldSize` | `tagged["world_size", int]` |
+| `tag` | `gdtensor.tag.NumSteps` | `tagged["num_steps", int]` |
+| `tag` | `gdtensor.tag.NumNodes` | `tagged["num_nodes", int]` |
+| `tag` | `gdtensor.tag.ConcurrencyWidth` | `tagged["concurrency_width", int]` |
 
 每个数据类 `Foo` 都在 `gdtensor.builder` 提供 `FooBuilderMixin`。例如：
 
 - `gdtensor.builder.DTensorsViewMapCoreBuilderMixin`
 - `gdtensor.builder.ComputeDTensorsViewBuilderMixin`
 - `gdtensor.builder.StorageDTensorsViewBuilderMixin`
+- `gdtensor.builder.CacheDTensorsViewBuilderMixin`
 - `gdtensor.builder.DTensorTableBuilderMixin`
 - `gdtensor.builder.PhysicalLayoutTableBuilderMixin`
 
-`gdtensor.tag` 里的类是一对一翻译过来的 tag：类名是 tag 名的 PascalCase，payload 是泛型参数；`gdtensor.Result` 是顶层别名 `type Result[T] = tag.Ok[T] | tag.Err[Error]`；`gdtensor.Error` 是五个错误类的 union，放顶层方便调用方按 `Error` 做分类。tag 在 viba 里不是类型名，表里 `full name` 列写的是对应的 viba 写法：Oneof 分支的 tag，或者 `tagged[...]` 的名字。`check_constraints` 在 `Foo` 上，不在 Mixin；`new_foo()` 也在 `gdtensor.builder`。`DTensorsView` / `GenericDTensor` / `ComputeMesh` / `StorageMesh` / `ContentSlotsMesh` / `Error` / `Placement` 是 `types.UnionType`，`Result` 是 `type` 别名，都没有 BuilderMixin；`ContainerFormat` 是类型别名，也没有 BuilderMixin；`TensorComponentPos` 和五个 `*Error` 是 product，按类处理。`session` / `access` 是抽象基类，不放进 builder，不套 BuilderMixin / check_constraints；它们的 Python 形态见 C.2。
+`gdtensor.tag` 里的类是一对一翻译过来的 tag：类名是 tag 名的 PascalCase，payload 是泛型参数；`gdtensor.Result` 是顶层别名 `type Result[T] = tag.Ok[T] | tag.Err[Error]`；`gdtensor.Error` 是五个错误类的 union，放顶层方便调用方按 `Error` 做分类。tag 在 viba 里不是类型名，表里 `full name` 列写的是对应的 viba 写法：Oneof 分支的 tag，或者 `tagged[...]` 的名字。`check_constraints` 在 `Foo` 上，不在 Mixin；`new_foo()` 也在 `gdtensor.builder`。`DTensorsView` / `DTensorsReadChain` / `ConcreteDTensorsReadChain` / `GenericDTensor` / `ComputeMesh` / `StorageMesh` / `CacheMesh` / `TemporalCacheMesh` / `SpatioCacheMesh` / `ContentSlotsMesh` / `Error` / `Placement` 是 `types.UnionType`，`Result` 是 `type` 别名，都没有 BuilderMixin；`ContainerFormat` 是类型别名，也没有 BuilderMixin；`TensorComponentPos` 和五个 `*Error` 是 product，按类处理。`session` / `access` 是抽象基类，不放进 builder，不套 BuilderMixin / check_constraints；它们的 Python 形态见 C.2。
 
 ### C.4 Helper functions
 
@@ -1519,3 +1927,5 @@ helpers 放已有的 `builder` namespace，不新增 namespace，也不放顶层
 | `builder` | `gdtensor.builder.tensor_order_value_of` | `tensor_order_value_of` |
 | `builder` | `gdtensor.builder.file_path_of` | `file_path_of` |
 | `builder` | `gdtensor.builder.leader_tensor_component_pos_of` | `leader_tensor_component_pos_of` |
+| `builder` | `gdtensor.builder.is_cache_mesh_subset_of_mesh` | `is_cache_mesh_subset_of_mesh` |
+| `builder` | `gdtensor.builder.legs_of` | `legs_of` |

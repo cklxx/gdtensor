@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+
+jobs:
+  checks:
+    name: Checks (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.9.24"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Format
+        run: uv run --locked ruff format --check gdtensor gdtensor_sim tests
+      - name: Lint
+        run: uv run --locked ruff check --no-cache gdtensor gdtensor_sim tests
+      - name: Compile
+        run: uv run --locked python -m compileall -q gdtensor gdtensor_sim tests
+      - name: Public API, IO, checkpoint, sim and demo tests
+        run: uv run --locked pytest -v -p no:cacheprovider --ignore=tests/torch
+      - name: Behavioral mutations
+        if: matrix.python == '3.12'
+        run: uv run --locked python tests/mutation_check.py
+
+  torch:
+    name: Torch, types and LAWA (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GDTENSOR_TORCH_TESTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.9.24"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install locked CPU torch dependencies
+        run: uv sync --locked --extra torch-cpu
+      - name: Type check (ty)
+        run: uv run --locked --extra torch-cpu ty check --error-on-warning
+      - name: Type check (Pyrefly)
+        run: uv run --locked --extra torch-cpu pyrefly check --min-severity=warn
+      - name: Native bridge and real 2 to 32 rank LAWA
+        run: uv run --locked --extra torch-cpu pytest -v -s -p no:cacheprovider tests/torch
+
+  gate:
+    name: CI gate
+    if: always()
+    needs: [checks, torch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every job to pass
+        env:
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          TORCH_RESULT: ${{ needs.torch.result }}
+        run: test "$CHECKS_RESULT" = success && test "$TORCH_RESULT" = success

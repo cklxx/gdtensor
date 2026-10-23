@@ -1,6 +1,6 @@
 # gdtensor
 
-通用分布式张量的 view、布局和 IO 核心。唯一设计依据是 [DTensorsView-design.md](docs/DTensorsView-design.md)。实现与测试的对应关系见 [SPEC_TRACEABILITY.md](SPEC_TRACEABILITY.md)。
+通用分布式张量的 view、布局和 IO 核心。仓库：[cklxx/gdtensor](https://github.com/cklxx/gdtensor)。唯一设计依据是 [DTensorsView-design.md](docs/DTensorsView-design.md)。实现与测试的对应关系见 [SPEC_TRACEABILITY.md](SPEC_TRACEABILITY.md)。
 
 | namespace | 导出范围 |
 |---|---|
@@ -124,7 +124,7 @@ uv run --locked python tests/mutation_check.py
 
 `precommit.sh` 检查 fmt、lint、编译、导入和 API 合约。`full_check.sh` 还检查 ty（警告视为失败）和 Pyrefly，启用真实 torch 测试并运行全部 pytest。两者显示测试名称和执行阶段。缩进检查覆盖 core、sim 和 tests，代码块最多三层；括号内的换行对齐不计层级。
 
-CI 用 `uv sync --locked` 安装依赖并检查格式，不安装 torch。`.githooks/pre-commit` 调用快速检查，可用 `git config core.hooksPath .githooks` 启用。
+GitHub Actions 在 push main、PR 和手动触发时运行。Python 3.12 / 3.13 检查格式、lint、编译和全部非 torch 用例；Python 3.12 另跑 9 项行为变异，以及 CPU torch 的类型检查、原生桥和全部 2–32 rank LAWA 用例。`CI gate` 汇总所有任务，任一失败则不通过。配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)。依赖默认来自 PyPI，CI 使用 `uv sync --locked --extra torch-cpu` 安装官方 CPU wheel；日常 `--extra torch` 保留 PyPI 的默认构建；版本与哈希由 `uv.lock` 固定。`.githooks/pre-commit` 调用快速检查，可用 `git config core.hooksPath .githooks` 启用。
 
 `formal/` 中的 TLA+ / Lean 制品描述抽象模型，不证明 Python 实现。
 
