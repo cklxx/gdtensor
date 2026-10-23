@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import gdtensor.io as gio
-from tests.support.compat import rank_reshard
+from tests.support.checkpoint import corrupt_distcp_payload, repack_via_compute
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import (
     DST,
@@ -39,30 +39,49 @@ def test_io_arange_crc_elastic_and_reshard(tmp_path, fmt, kind, mode):
 
     for branch in ("compute", "storage"):
         destination = ArrayFabric(target, target_points)
-        src = lambda r: (
-            source.view(r, allow_remote_reads=True)
-            if branch == "compute"
-            else read_view
-        )
-        run_ranks(
-            int(np.prod(DST)),
-            lambda r: rank_reshard(r, src(r), destination.view(r)),
-        )
+        if branch == "compute":
+            # The design cuts compute->compute reshard (§419); the live fabric
+            # reaches the destination topology through the two-phase boundary:
+            # persist it to a scratch checkpoint (rank_save), then elastically
+            # load it (rank_load).
+            scratch = storage_view(
+                tmp_path / "scratch", ct, SRC, kind, mode, fmt, save=True
+            )
+            run_ranks(
+                int(np.prod(SRC)),
+                lambda r: gio.rank_save(r, source.view(r), scratch),
+            )
+            run_ranks(
+                int(np.prod(DST)),
+                lambda r: gio.rank_load(
+                    r,
+                    destination.view(r),
+                    storage_view(tmp_path / "scratch", ct, SRC, kind, mode, fmt),
+                ),
+            )
+        else:
+            run_ranks(
+                int(np.prod(DST)),
+                lambda r: gio.rank_load(r, destination.view(r), read_view),
+            )
         destination.assert_values(values)
 
-    # Exercise compute->storage and storage->storage, then load both results.
+    # Exercise compute->storage and the two-phase storage->storage repack,
+    # then load both results back onto the source topology.
     for branch in ("compute", "storage"):
         out = tmp_path / branch
         output_fmt = "distcp" if fmt == "safetensors" else "safetensors"
         dst = storage_view(
             out, target, DST, "per_rank", "mirror", output_fmt, save=True
         )
-        src = lambda r: (
-            loaded.view(r, allow_remote_reads=True)
-            if branch == "compute"
-            else read_view
-        )
-        run_ranks(int(np.prod(DST)), lambda r: rank_reshard(r, src(r), dst))
+        if branch == "compute":
+            run_ranks(
+                int(np.prod(DST)), lambda r: gio.rank_save(r, loaded.view(r), dst)
+            )
+        else:
+            repack_via_compute(
+                int(np.prod(DST)), read_view, dst, target, target_points, values
+            )
         verify_crc(out, output_fmt, target, DST, "mirror", values)
         back = ArrayFabric(ct, points)
         output = storage_view(out, target, DST, "per_rank", "mirror", output_fmt)
@@ -77,10 +96,13 @@ def test_io_crc_detects_payload_corruption(tmp_path, fmt):
     sv = storage_view(tmp_path, ct, SRC, "single", "hf", fmt, save=True)
     run_ranks(int(np.prod(SRC)), lambda r: gio.rank_save(r, source.view(r), sv))
     verify_crc(tmp_path, fmt, ct, SRC, "hf", values)
-    tid, slot, info, data, path, start = next(payload_regions(tmp_path, fmt))
-    with path.open("r+b") as f:
-        f.seek(start)
-        f.write(bytes([data[0] ^ 1]))
+    if fmt == "safetensors":
+        tid, slot, info, data, path, start = next(payload_regions(tmp_path, fmt))
+        with path.open("r+b") as f:
+            f.seek(start)
+            f.write(bytes([data[0] ^ 1]))
+    else:
+        corrupt_distcp_payload(tmp_path)
     with pytest.raises(AssertionError):
         verify_crc(tmp_path, fmt, ct, SRC, "hf", values)
     # Raw IO does not promise checksum validation. The independent oracle must fail.
@@ -119,12 +141,4 @@ def test_many_ranks_many_tensors(tmp_path, fmt, src_p, dst_p, tensor_count, kind
         int(np.prod(dst_p)), lambda r: gio.rank_load(r, loaded.view(r), read_view)
     )
     loaded.assert_values(values)
-    resharded = ArrayFabric(target, target_points)
-    run_ranks(
-        int(np.prod(dst_p)),
-        lambda r: rank_reshard(
-            r, source.view(r, allow_remote_reads=True), resharded.view(r)
-        ),
-    )
-    resharded.assert_values(values)
     source.assert_values(values)

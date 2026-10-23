@@ -41,3 +41,17 @@
 这 5 个内部 check 当前没有对外 API 调用路径。按所有测试只用对外 API 的要求，本轮对它们做源码与边界推导审查，并检查声明，不宣称做了直接行为测试。plan 的行为通过公开 IO 测试验证。无效物理 mesh 在公开 `check_constraints` 路径返回 `ConstraintViolationError`，不再向调用方抛出 Python 异常。
 
 形式化制品仅验证抽象模型。本次重构的正确性证据是设计 API 测试、独立数据 oracle、真实 torch 进程和行为变异；不宣称完成了真实 1000 rank 或完整 DeepSeek 模型验证。
+
+## 本轮门禁已验证范围（2026-10-24，证据在 log/gate/ 与 formal/）
+
+- 形式化：`formal/lean/ShardAlgebra.lean`（工具链 `leanprover/lean4:v4.34.0`，`formal/lean/check.sh` 拒绝 sorry/admit/axiom，编译 exit 0）；`formal/tla/CopyPlan.tla`（S∈{2,3}×N∈{1,2,3,5,6} 含 N=1 零 size 边界）与 `AtomicPublish.tla`（`formal/tla/run_tlc.sh`，全部不变量通过，log 落 `log/tla/`）。形式化仅证抽象模型。
+- 行为变异：`tests/mutation_check.py` 9/9 killed（log/gate/mutation_final.txt）。pyrefly 已 0（core 将 negative issubclass 反射与构造分独立测试，未 ignore/未改产品 API）。
+- 单元：tests/core + tests/io 独立复跑 486 passed / 0 skip；torch env 全量 1314 passed / 0 skip（log/gate/full_check_final2.txt）；precommit.sh 本体 exit 0（557 passed）；ty/pyrefly 全绿。
+- CI：checks job 仅允许 torch importorskip；torch job 跑 tests/torch+sim+checkpoint+demo 且强制 zero skip；collection 计数已预验（no-torch 1255、torch 816 含 distcp）。
+
+## 待决设计项（不记 pass）
+
+- 公开 `leader_tensor_component_pos_of(group)` 现返回 `TensorComponentPos("", 0)`（空 tensor_id），测试仅固化该行为；属设计缺口，未视为满足设计。
+- DCP distcp `get_file_offset`：存在 pos 的真实文件偏移未决——逻辑 archive framing（A0=0/B1577）与实际 raw（704/2281）不一致；若 torch DCP 不可表示真实偏移，记设计缺口，不按 format 放宽文档。
+- concurrency 槽 C 对 `mem_overhead` 的贡献：3.4（temporal/concurrency 分片、非副本）与 5.8（多一槽多占一份）存在表述张力，待设计最小确认；最终验收以真实峰值与 accessor 实际 bytes 为准，不接受跨时间 box union 或 stats 自证。
+- cache 覆盖缺口（返修中）：multi-tensor 链、`PermutedMesh`/`ReshapedMesh[CacheMesh]`、Mixed chain 段间失败生命周期、world=4/k=2 真峰值反例。

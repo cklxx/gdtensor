@@ -102,10 +102,12 @@ def d_tensors_view_rank_save(
     ):
         raise invalid("views", "rank_save requires a compute view and a storage view")
     plan = must_ok(d_tensors_view_rank_plan_save(rank, compute_view, storage_view))
+    assert isinstance(plan, list)
     validate_rank_save(rank, compute_view, storage_view, plan)
     _log_plan("save", rank, plan)
     assert storage_view.begin_save is not None
     session = must_ok(storage_view.begin_save(storage_view, rank))
+    assert session is not None
     try:
         _copy(plan, compute_view, _session_view(storage_view, session))
     except BaseException:
@@ -125,10 +127,12 @@ def d_tensors_view_rank_load(
     ):
         raise invalid("views", "rank_load requires a compute view and a storage view")
     plan = must_ok(d_tensors_view_rank_plan_load(rank, compute_view, storage_view))
+    assert isinstance(plan, list)
     validate_rank_load(rank, compute_view, storage_view, plan)
     _log_plan("load", rank, plan)
     assert storage_view.begin_load is not None
     session = must_ok(storage_view.begin_load(storage_view, rank))
+    assert session is not None
     try:
         _copy(plan, _session_view(storage_view, session), compute_view)
     except BaseException:
@@ -189,8 +193,10 @@ def _run_concrete_chain(rank, chain, pc, legs) -> None:
     """Open the src storage session once and execute every leg in order."""
     storage = chain.src
     assert type(storage) is StorageDTensorsView
+    assert storage.begin_load is not None
     _LOG.info("chain_load rank=%d phase=begin", rank)
     session = must_ok(storage.begin_load(storage, rank))
+    assert session is not None
     storage_session_view = _session_view(storage, session)
     try:
         _execute_chain_legs(pc, legs, storage, storage_session_view)
@@ -225,10 +231,13 @@ def d_tensors_view_rank_chain_load(rank: int, read_chain) -> Result[None]:
 def _chain_plans(plan_chain):
     from .chain import (
         DirectCopyPlanChain,
+        DisjointTensorIdsAndCopyPlanChain,
         OneLayerCachedCopyPlanChain,
         TwoLayerCachedCopyPlanChain,
     )
 
+    if type(plan_chain) is DisjointTensorIdsAndCopyPlanChain:
+        plan_chain = plan_chain.copy_plan_chain
     t = type(plan_chain)
     if t is DirectCopyPlanChain:
         return [plan_chain.src_to_dst]

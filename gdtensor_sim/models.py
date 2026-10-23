@@ -278,7 +278,7 @@ def _storage_tensor(nd, order, p, mode, aggregate_tp):
         if (
             aggregate_tp
             and isinstance(naive.placements[tp_dim], Shard)
-            and naive.placements[tp_dim].value == 1
+            and naive.placements[tp_dim].axis == 1
             and slices[tp_dim] is None
         ):
             placements = placements[:tp_dim] + (R,) + placements[tp_dim + 1 :]
@@ -458,7 +458,9 @@ def build_layout(
     for path in sorted(groups):
         cells = groups[path]
         lst = DisjointStorageMeshList(_cells_to_meshes(cells, len(ids), world_size))
-        file_paths[leader_tensor_component_pos_of(lst, ids)] = path
+        leader = leader_tensor_component_pos_of(lst)  # canonical leader rank, tid=""
+        t0 = min(t for t, _ in cells)  # leader row in table order
+        file_paths[TensorComponentPos(ids[t0], leader.rank)] = path
         for t, w in cells:
             tensor_entries[TensorComponentPos(ids[t], w)] = lst
     return PhysicalLayoutTable(container_format, tensor_entries, file_paths)

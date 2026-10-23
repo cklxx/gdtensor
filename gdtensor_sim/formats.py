@@ -49,7 +49,6 @@ from ._result import catch, invalid, io_error, not_found
 from .iobackend import FileIO
 from gdtensor.session import StorageLoadSession, StorageSaveSession
 
-METADATA_NAME = ".metadata"
 HF_INDEX_NAME = "model.safetensors.index.json"
 
 
@@ -115,39 +114,6 @@ def safetensors_header(table: DTensorTable, index: PayloadIndex, path: str) -> b
     raw = json.dumps(header, separators=(",", ":")).encode()
     raw += b" " * (-len(raw) % 8)
     return struct.pack("<Q", len(raw)) + raw
-
-
-def distcp_metadata(
-    table: DTensorTable, layout: PhysicalLayoutTable, index: PayloadIndex
-) -> bytes:
-    tensors = []
-    for nd in table.named_d_tensors:
-        m = global_tensor_meta_of(nd)
-        tensors.append(
-            {
-                "id": nd.global_tensor_id,
-                "shape": list(m.global_shape),
-                "dtype": m.dtype,
-                "itemsize": m.itemsize,
-            }
-        )
-    chunks = []
-    for path in sorted(index.files):
-        for s in index.files[path].slots:
-            lo, hi = _storage_box(table.named_d_tensors[s.tensor_order], s.pos.rank)
-            chunks.append(
-                {
-                    "tensor_id": s.pos.tensor_id,
-                    "slot": s.pos.rank,
-                    "file": path,
-                    "offset": s.contiguous_payload_offset,
-                    "size": s.nbytes,
-                    "box_lo": lo,
-                    "box_hi": hi,
-                }
-            )
-    doc = {"format": "gdtensor-distcp", "tensors": tensors, "chunks": chunks}
-    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
 
 
 # ------------------------------------------------------------------ sessions
@@ -351,30 +317,6 @@ class SafeTensorsSaveSession(SaveSessionBase):
         os.replace(tmp, os.path.join(self.root, HF_INDEX_NAME))
 
 
-class DcpSaveSession(SaveSessionBase):
-    def __init__(self, *a, **kw) -> None:
-        super().__init__(*a, **kw)
-        self._open_files()
-
-    def _coordinator(self) -> int:
-        return min(fp.leader.rank for fp in self.index.files.values())
-
-    def _publish(self) -> None:
-        for path in self._leader_files():
-            _sync_file(self.abspath(path))
-
-    def _after_barrier(self) -> None:
-        if self.rank != self._coordinator():
-            return
-        tmp = os.path.join(self.root, METADATA_NAME + ".tmp")
-        data = distcp_metadata(self.table, self.layout, self.index)
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(self.root, METADATA_NAME))
-
-
 class LoadSessionBase(_Base, StorageLoadSession):
     def __init__(self, *a, **kw) -> None:
         super().__init__(*a, **kw)
@@ -470,59 +412,6 @@ def _safetensors_slot_offset(table, slot, header, seen, path, full):
     ):
         raise io_error("read", f"{path}: metadata mismatch for {tid}", full)
     return begin
-
-
-class DcpLoadSession(LoadSessionBase):
-    def __init__(self, *a, **kw) -> None:
-        super().__init__(*a, **kw)
-        full = os.path.join(self.root, METADATA_NAME)
-        if not os.path.exists(full):
-            raise io_error(
-                "open", "distcp checkpoint is incomplete: .metadata is missing", full
-            )
-        doc = json.loads(self.io.pread(self.rank, full, 0, os.path.getsize(full)))
-        expected_tensors = [_tensor_schema(nd) for nd in self.table.named_d_tensors]
-        if (
-            doc.get("format") != "gdtensor-distcp"
-            or doc.get("tensors") != expected_tensors
-        ):
-            raise io_error(
-                "read", ".metadata tensor schema disagrees with layout", full
-            )
-        self.offsets = _dcp_offsets(self.index, doc, full)
-
-
-def _tensor_schema(nd):
-    meta = global_tensor_meta_of(nd)
-    return {
-        "id": nd.global_tensor_id,
-        "shape": list(meta.global_shape),
-        "dtype": meta.dtype,
-        "itemsize": meta.itemsize,
-    }
-
-
-def _dcp_offsets(index, doc, full):
-    offsets = {}
-    for chunk in doc["chunks"]:
-        pos = TensorComponentPos(chunk["tensor_id"], chunk["slot"])
-        hit = index.slots.get(pos)
-        if hit is None or pos in offsets:
-            raise io_error(
-                "read", f".metadata has unknown or duplicate chunk {pos_key(pos)}", full
-            )
-        path, slot = hit
-        if chunk["file"] != path or chunk["size"] != slot.nbytes:
-            raise io_error(
-                "read", f".metadata chunk disagrees with layout at {pos_key(pos)}", full
-            )
-        offsets[pos] = chunk["offset"]
-    for pos, (_, slot) in index.slots.items():
-        if offsets.get(pos) != slot.contiguous_payload_offset:
-            raise io_error(
-                "read", f".metadata disagrees with layout at {pos_key(pos)}", full
-            )
-    return offsets
 
 
 # ------------------------------------------------------------------ factory

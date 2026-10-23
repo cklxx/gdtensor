@@ -42,8 +42,16 @@ jobs:
         run: uv run --locked ruff check --no-cache gdtensor gdtensor_sim tests
       - name: Compile
         run: uv run --locked python -m compileall -q gdtensor gdtensor_sim tests
-      - name: Public API, IO, checkpoint, sim and demo tests
-        run: uv run --locked pytest -v -p no:cacheprovider --ignore=tests/torch
+      - name: Public API, IO, checkpoint, sim and demo tests (no torch)
+        run: |
+          set -euo pipefail
+          uv run --locked pytest -v -p no:cacheprovider --ignore=tests/torch -rs | tee no_torch.txt
+          bad="$(grep '^SKIPPED' no_torch.txt | grep -v "could not import 'torch" || true)"
+          if [ -n "$bad" ]; then
+            echo "Unexpected skips in no-torch job (only torch importorskip is legal):" >&2
+            echo "$bad" >&2
+            exit 1
+          fi
       - name: Behavioral mutations
         if: matrix.python == '3.12'
         run: uv run --locked python tests/mutation_check.py
@@ -67,8 +75,16 @@ jobs:
         run: uv run --locked --extra torch-cpu ty check --error-on-warning
       - name: Type check (Pyrefly)
         run: uv run --locked --extra torch-cpu pyrefly check --min-severity=warn
-      - name: Native bridge and real 2 to 32 rank LAWA
-        run: uv run --locked --extra torch-cpu pytest -v -s -p no:cacheprovider tests/torch
+      - name: Bridge, LAWA, sim DCP and checkpoint distcp (zero skip)
+        run: |
+          set -euo pipefail
+          uv run --locked --extra torch-cpu pytest -v -s -p no:cacheprovider \
+            tests/torch tests/sim tests/checkpoint tests/demo -rs | tee torch.txt
+          if grep -q '^SKIPPED' torch.txt; then
+            echo "Unexpected skips in torch job (must be zero):" >&2
+            grep '^SKIPPED' torch.txt >&2
+            exit 1
+          fi
 
   gate:
     name: CI gate

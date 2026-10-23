@@ -102,21 +102,24 @@ def test_naive_equality_and_hash_include_the_torch_handle():
     assert a != b
 
 
-def test_file_leader_uses_caller_supplied_row_labels():
+def test_file_leader_and_path_resolution_by_list_identity():
     mesh = gb.SlotOuterProductMesh(
         gb.ArrangedMesh(gt.TensorCount(2)), gb.ArrangedMesh(gt.WorldSize(2))
     )
     group = gb.DisjointStorageMeshList([mesh])
-    leader = gb.leader_tensor_component_pos_of(group, ["z_first", "a_second"])
+    leader = gb.leader_tensor_component_pos_of(group)
+    a0 = gb.TensorComponentPos("a_second", 0)
     queried = gb.TensorComponentPos("a_second", 1)
     layout = gb.PhysicalLayoutTable(
         "safetensors",
-        {leader: group, queried: group},
-        {leader: "shared", queried: "shared"},
+        {a0: group, queried: group},
+        {a0: "shared"},
     )
     assert type(group.check_constraints()) is gb.Ok
-    assert gb.leader_tensor_component_pos_of(group, ["z_first", "a_second"]) == leader
-    assert gb.file_path_of(layout, queried, ["z_first", "a_second"]) == gb.Ok("shared")
+    assert leader.rank == 0  # geometric leader; tensor_id needs table context
+    assert gb.file_path_of(layout, queried) == gb.Ok("shared")
+    missing = gb.file_path_of(layout, gb.TensorComponentPos("absent", 0))
+    assert type(missing) is gb.Err and type(missing.value) is gb.NotFoundError
 
 
 def test_physical_lists_with_the_same_leader_cannot_hide_overlap():

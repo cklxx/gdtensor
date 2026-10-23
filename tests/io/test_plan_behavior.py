@@ -7,7 +7,6 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-from tests.support.compat import rank_reshard
 import gdtensor.tag as gt
 from tests.support.memory import Memory, compute_view, storage_view
 
@@ -59,20 +58,22 @@ def _storage_rows(memory, events):
 
 
 def _run(operation, rank, src, dst):
-    if operation == "save":
+    if operation in ("save", "cs"):
         return gio.rank_save(rank, src, dst)
     if operation == "load":
         return gio.rank_load(rank, dst, src)
-    return rank_reshard(rank, src, dst)
+    if operation == "sc":
+        return gio.chain_load(rank, gb.DirectDTensorsReadChain(src=src, dst=dst))
+    raise ValueError(operation)
 
 
 def _expected_bytes(operation, rank):
+    # Every supported direction moves the compute-owned columns: the compute
+    # side owns them, and storage mirrors the same bytes.
     # 2x5 I16, column chunks of 2 elements on ranks [2, 0, 3, 1].
     columns = {0: [4, 5, 6, 7, 14, 15, 16, 17], 2: [0, 1, 2, 3, 10, 11, 12, 13]}
     columns[3] = [8, 9, 18, 19]
-    # Storage row chunks: first row on rank 0, second row on rank 1.
-    rows = {0: list(range(10)), 1: list(range(10, 20))}
-    return (rows if operation in ("cs", "ss") else columns).get(rank, [])
+    return columns.get(rank, [])
 
 
 def _accessed_bytes(memory):
@@ -83,7 +84,7 @@ def _accessed_bytes(memory):
     ]
 
 
-@pytest.mark.parametrize("operation", ["save", "load", "cc"])
+@pytest.mark.parametrize("operation", ["save", "load"])
 @pytest.mark.parametrize("rank", range(4))
 def test_permuted_mesh_changes_owners_without_changing_tensor_bytes(operation, rank):
     source, target, events = TraceMemory(range(20)), TraceMemory([0xA5] * 20), []
@@ -171,19 +172,19 @@ def test_sliced_mesh_step_preserves_save_and_load_ownership(selection, owners):
     np.testing.assert_array_equal(saved.data, np.arange(8, dtype=np.uint8))
 
 
-@pytest.mark.parametrize("operation", ["save", "load", "cc", "cs", "sc", "ss"])
+@pytest.mark.parametrize("operation", ["save", "load", "cs", "sc"])
 @pytest.mark.parametrize("rank", range(5))
 def test_public_io_plans_discontiguous_bytes_and_empty_ranks(operation, rank):
     events = []
     source, target = TraceMemory(range(20)), TraceMemory([0xA5] * 20)
     src = (
         _storage_rows(source, events)
-        if operation in ("load", "sc", "ss")
+        if operation in ("load", "sc")
         else _compute_columns(source)
     )
     dst = (
         _storage_rows(target, events)
-        if operation in ("save", "cs", "ss")
+        if operation in ("save", "cs")
         else _compute_columns(target)
     )
     schema = copy.deepcopy((src.d_tensor_table, dst.d_tensor_table))
@@ -207,19 +208,17 @@ def test_public_io_plans_discontiguous_bytes_and_empty_ranks(operation, rank):
     )
 
 
-@pytest.mark.parametrize("operation", ["load", "sc", "ss"])
+@pytest.mark.parametrize("operation", ["load", "sc"])
 def test_source_gap_fails_in_plan_before_any_session_or_access(operation):
     events = []
     source, target = TraceMemory(range(20)), TraceMemory([0xA5] * 20)
     src = _storage_rows(source, events)
-    dst = (
-        _storage_rows(target, events) if operation == "ss" else _compute_columns(target)
-    )
+    dst = _compute_columns(target)
     group = next(iter(src.physical_layout.tensor_entries.values()))
     base = group.disjoint_storage_mesh_list[0]
     group.set_disjoint_storage_mesh_list([gb.SlicedMesh(base, [None, gb.Slice(0, 1)])])
     del src.physical_layout.tensor_entries[gb.TensorComponentPos("w", 1)]
-    result = _run(operation, 1 if operation == "ss" else 2, src, dst)
+    result = _run(operation, 2, src, dst)
     assert type(result) is gb.Err and type(result.value) is gb.InvalidArgumentError
     assert (
         result.value.argument_name == "src_view"
@@ -329,3 +328,106 @@ def test_replicated_save_writes_each_tensor_once_in_table_order():
         f"writes={target.ranges} payload={target.data.tolist()} each_tensor_written_once=True",
         flush=True,
     )
+
+
+def test_wrong_leader_file_paths_key_is_rejected():
+    ids = ["z_first", "a_second", "m_third", "b_fourth", "y_fifth"]
+    source, target, events = TraceMemory(range(5)), TraceMemory([0] * 15), []
+    cv, sv = compute_view(source), storage_view(target, events)
+    compute_table, storage_table, entries = [], [], {}
+    group = gb.DisjointStorageMeshList(
+        [
+            gb.SlotOuterProductMesh(
+                gb.ArrangedMesh(gt.TensorCount(5)), gb.ArrangedMesh(gt.WorldSize(1))
+            )
+        ]
+    )
+    for size, tid in enumerate(ids, 1):
+        meta = gb.GlobalTensorMeta([size], "U8", 1)
+        compute_table.append(
+            gb.NamedDTensor(
+                tid,
+                gb.NaiveDTensor(
+                    meta, [gb.Replicate()], gb.LiteralMesh([4, 1, 6], gt.WorldSize(7))
+                ),
+            )
+        )
+        storage_table.append(
+            gb.NamedDTensor(
+                tid,
+                gb.NaiveDTensor(
+                    meta,
+                    [gb.Replicate()] * 2,
+                    sv.d_tensor_table.named_d_tensors[0].d_tensor.mesh,
+                ),
+            )
+        )
+        entries[gb.TensorComponentPos(tid, 0)] = group
+    cv.set_tensor_ids(ids)
+    cv.set_d_tensor_table(gb.DTensorTable(compute_table))
+    sv.set_tensor_ids(ids)
+    sv.set_d_tensor_table(gb.DTensorTable(storage_table))
+    sv.physical_layout.set_tensor_entries(entries)
+    # Key file_paths to the LAST row instead of the header-first leader.
+    sv.physical_layout.set_file_paths({gb.TensorComponentPos("y_fifth", 0): "memory"})
+    result = gio.rank_save(0, cv, sv)
+    assert type(result) is gb.Err, result
+
+
+def test_value_equal_lists_share_one_file_without_identity():
+    import copy as _copy
+
+    ids = ["z_first", "a_second", "m_third", "b_fourth", "y_fifth"]
+
+    def run(use_deepcopy):
+        source, target, events = TraceMemory(range(5)), TraceMemory([0] * 15), []
+        cv, sv = compute_view(source), storage_view(target, events)
+        compute_table, storage_table, entries = [], [], {}
+        group = gb.DisjointStorageMeshList(
+            [
+                gb.SlotOuterProductMesh(
+                    gb.ArrangedMesh(gt.TensorCount(5)), gb.ArrangedMesh(gt.WorldSize(1))
+                )
+            ]
+        )
+        for size, tid in enumerate(ids, 1):
+            meta = gb.GlobalTensorMeta([size], "U8", 1)
+            compute_table.append(
+                gb.NamedDTensor(
+                    tid,
+                    gb.NaiveDTensor(
+                        meta,
+                        [gb.Replicate()],
+                        gb.LiteralMesh([4, 1, 6], gt.WorldSize(7)),
+                    ),
+                )
+            )
+            storage_table.append(
+                gb.NamedDTensor(
+                    tid,
+                    gb.NaiveDTensor(
+                        meta,
+                        [gb.Replicate()] * 2,
+                        sv.d_tensor_table.named_d_tensors[0].d_tensor.mesh,
+                    ),
+                )
+            )
+            entries[gb.TensorComponentPos(tid, 0)] = (
+                _copy.deepcopy(group) if use_deepcopy else group
+            )
+        cv.set_tensor_ids(ids)
+        cv.set_d_tensor_table(gb.DTensorTable(compute_table))
+        sv.set_tensor_ids(ids)
+        sv.set_d_tensor_table(gb.DTensorTable(storage_table))
+        sv.physical_layout.set_tensor_entries(entries)
+        sv.physical_layout.set_file_paths(
+            {gb.TensorComponentPos("z_first", 0): "memory"}
+        )
+        for rank in (6, 0, 4, 1):
+            result = gio.rank_save(rank, cv, sv)
+            assert type(result) is gb.Ok, result
+        return target.data.tobytes()
+
+    original = run(use_deepcopy=False)
+    deepcopied = run(use_deepcopy=True)
+    assert original == deepcopied

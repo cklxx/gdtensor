@@ -123,8 +123,9 @@ def _file_layout(storage, points, kind, stages):
     entries, paths = {}, {}
     for path, cells in groups.items():
         group = gb.DisjointStorageMeshList(_group_meshes(base, cells))
-        leader = gb.leader_tensor_component_pos_of(group, storage.ids)
-        paths[leader] = path
+        leader = gb.leader_tensor_component_pos_of(group)  # canonical leader rank
+        t0 = min(order for order, _ in cells)  # leader row in table order
+        paths[gb.TensorComponentPos(storage.ids[t0], leader.rank)] = path
         slots, size = _file_slots(storage, cells, points, path, group, entries)
         header = _file_header(storage.table, slots)
         storage.headers[path] = header
@@ -196,6 +197,7 @@ class FileStorage:
         self.ids = [nd.global_tensor_id for nd in table.named_d_tensors]
         self.files, self.offsets, self.headers = {}, {}, {}
         layout = _file_layout(self, points, kind, stages)
+        self.layout = layout
         self.view = gb.StorageDTensorsView(
             self.ids,
             table,
@@ -205,8 +207,28 @@ class FileStorage:
             self.begin_load,
         )
 
+    def _real_dcp_session(self, load: bool, rank: int):
+        """Route distcp through the genuine torch DCP backend (no JSON metadata)."""
+        from gdtensor_sim._layout import build_payload_index
+        from gdtensor_sim.dcp_backend import DcpLoadSession, DcpSaveSession
+
+        index = build_payload_index(self.table, self.layout)
+        if load:
+            return DcpLoadSession(rank, self.root, self.table, self.layout, index)
+        return DcpSaveSession(
+            rank,
+            str(self.root),
+            self.table,
+            self.layout,
+            index,
+            coord=self.coord,
+            mode="process",
+        )
+
     @_result
     def begin_save(self, view, rank):
+        if self.fmt == "distcp":
+            return self._real_dcp_session(False, rank)
         self.root.mkdir(parents=True, exist_ok=True)
         for path, info in self.files.items():
             _prepare_file(self, path, info, rank)
@@ -215,10 +237,8 @@ class FileStorage:
     @_result
     def begin_load(self, view, rank):
         if self.fmt == "distcp":
-            doc = json.loads((self.root / ".metadata").read_bytes())
-            assert doc == self.metadata()
-        else:
-            _validate_headers(self)
+            return self._real_dcp_session(True, rank)
+        _validate_headers(self)
         return _Load(self)
 
     def metadata(self):

@@ -52,6 +52,11 @@ PRODUCT_FIELDS = {
     "NotFoundError": ("key_name", "key", "msg"),
     "InvalidArgumentError": ("argument_name", "msg"),
     "GDTensorIOError": ("file_path", "operation", "msg"),
+    "Ok": ("value",),
+    "Err": ("value",),
+    "Shard": ("axis",),
+    "Replicate": (),
+    "Partial": (),
 }
 
 
@@ -111,6 +116,10 @@ def test_products_mixins_and_factories(name, fields):
         assert match is not None
         declaration = match.group(1)
         declared_fields = tuple(re.findall(r"\$(\w+)", declaration))
+    elif name in ("Replicate", "Partial"):
+        # Field-less products: `Name = Object` on one line, no `* $field`.
+        assert re.search(rf"^{name} = Object\s*$", design, re.MULTILINE)
+        declared_fields = ()
     else:
         match = re.search(
             rf"^{name}(?:\[[^\n]*\])? =\n    Object\n(.*?)(?=^\S)",
@@ -173,11 +182,11 @@ def test_products_mixins_and_factories(name, fields):
         ("gdtensor.builder.tensor_order_value_of", ["d_tensor_table", "tensor_id"]),
         (
             "gdtensor.builder.file_path_of",
-            ["physical_layout", "pos", "tensor_ids"],
+            ["layout", "pos"],
         ),
         (
             "gdtensor.builder.leader_tensor_component_pos_of",
-            ["disjoint_storage_meshes", "tensor_ids"],
+            ["disjoint_storage_meshes"],
         ),
     ],
 )

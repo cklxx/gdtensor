@@ -19,9 +19,14 @@ import numpy as np
 import pytest
 
 import gdtensor.io as gio
-from tests.support.compat import rank_reshard
 import gdtensor.builder as gb
-from tests.support.checkpoint import file_bytes, small_schema
+from tests.support.checkpoint import (
+    corrupt_distcp_payload,
+    file_bytes,
+    payload_file_bytes,
+    repack_via_compute,
+    small_schema,
+)
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import payload_regions, storage_points, storage_view
 
@@ -125,9 +130,9 @@ def _read_schedules(table, points, storage, baseline, world):
     return concurrent
 
 
-def _canonicalize(root, fmt, source, serial_table):
+def _canonicalize(root, fmt, source, serial_table, serial_points, values):
     destination = storage_view(root, serial_table, ONE, "single", "hf", fmt, save=True)
-    _ok(rank_reshard(0, source, destination))
+    repack_via_compute(1, source, destination, serial_table, serial_points, values)
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
@@ -172,9 +177,9 @@ def test_serial_parallel_io_matches_exactly(
     from_parallel = _read_schedules(table, points, distributed, baseline, world)
     _assert_rank_buffers(from_parallel, from_serial)
     canonical = tmp_path / "parallel_consolidated"
-    _canonicalize(canonical, fmt, distributed, serial_table)
-    assert file_bytes(canonical) == serial_bytes, (
-        "parallel consolidated files differ from serial files"
+    _canonicalize(canonical, fmt, distributed, serial_table, serial_points, baseline)
+    assert payload_file_bytes(canonical) == payload_file_bytes(serial_root), (
+        "parallel consolidated payload files differ from serial payload files"
     )
     assert (
         file_bytes(serial_root) == serial_bytes
@@ -218,14 +223,21 @@ def test_serial_baseline_detects_swapped_parallel_shards(tmp_path, fmt):
     )
     source = ArrayFabric(table, points, values)
     _concurrent(3, lambda rank: gio.rank_save(rank, source.view(rank), distributed))
-    regions = [
-        region
-        for region in payload_regions(parallel_root, fmt)
-        if region[0] == "matrix"
-    ]
-    left, right = regions[:2]
-    assert left[4] != right[4] and len(left[3]) == len(right[3]) and left[3] != right[3]
-    _swap_regions(left, right)
+    if fmt == "safetensors":
+        regions = [
+            region
+            for region in payload_regions(parallel_root, fmt)
+            if region[0] == "matrix"
+        ]
+        left, right = regions[:2]
+        assert (
+            left[4] != right[4]
+            and len(left[3]) == len(right[3])
+            and left[3] != right[3]
+        )
+        _swap_regions(left, right)
+    else:
+        corrupt_distcp_payload(parallel_root, "matrix")
     baseline = _read_one(serial_table, serial_points, serial)
     broken = _read_one(serial_table, serial_points, distributed)
     dtype = values["matrix"].dtype

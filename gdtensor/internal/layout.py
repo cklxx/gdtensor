@@ -21,9 +21,9 @@ from .dtensor import (
     NamedDTensor,
     global_tensor_meta_of,
     iv_total,
+    order_of,
     owned_intervals,
     participants_of,
-    tensor_ids_of,
 )
 from .mesh import is_multi_tensors_storage_mesh, storage_mesh_cells
 from .result import catch, invalid, not_found
@@ -99,22 +99,20 @@ def list_cells(lst: DisjointStorageMeshList) -> List[Tuple[int, int]]:
 
 def leader_tensor_component_pos_of(
     disjoint_storage_meshes: DisjointStorageMeshList,
-    tensor_ids: List[str] | None = None,
 ) -> TensorComponentPos:
-    """Canonical key: the smallest (row, column) cell.
+    """Canonical key: the smallest (row, column) cell (design B.2.2.2).
 
-    ``tensor_ids`` maps tensor-slot rows to tensor ids in header order.
-    Without it positional row labels are used; internal plan layers always
-    supply the table ids so layouts are validated lazily per file.
+    This is a pure geometric helper. Row ``t`` corresponds to
+    ``d_tensor_table.named_d_tensors[t]``; the caller maps that row to its real
+    tensor id when using the returned pos as a ``file_paths`` key.
     """
     cells = list_cells(disjoint_storage_meshes)
     if not cells:
         raise invalid(
             "disjoint_storage_meshes", "empty DisjointStorageMeshList has no leader"
         )
-    t, w = cells[0]
-    label = tensor_ids[t] if tensor_ids is not None else f"tensor_{t}"
-    return TensorComponentPos(label, w)
+    _t, w = cells[0]
+    return TensorComponentPos("", w)
 
 
 @dataclass(eq=True)
@@ -134,14 +132,12 @@ class PhysicalLayoutTable(PhysicalLayoutTableBuilderMixin):
 def file_path_of(
     physical_layout: PhysicalLayoutTable,
     pos: TensorComponentPos,
-    tensor_ids: List[str] | None = None,
 ) -> str:
     """tensor_entries[pos] -> list -> that list's unique file path.
 
-    Each physical list has exactly one ``file_paths`` key sitting on one of
-    its own component positions. Resolving by list identity avoids remapping
-    positional tensor rows to ids, which needs DTensorTable header order that
-    the layout alone does not carry.
+    Resolving by list identity (design B.2.2.2): tensor_entries[pos] gives the
+    list, and the list's single file_paths key is whichever entry points at the
+    same list object. A missing key at either step returns Err(NotFoundError).
     """
     lst = physical_layout.tensor_entries.get(pos)
     if lst is None:
@@ -149,25 +145,9 @@ def file_path_of(
             "tensor_entries", pos_key(pos), f"{pos_key(pos)} has no physical file"
         )
     for key, path in physical_layout.file_paths.items():
-        if physical_layout.tensor_entries.get(key) is lst:
+        if physical_layout.tensor_entries.get(key) == lst:
             return path
-    raise not_found(
-        "file_paths", pos_key(pos), f"{pos_key(pos)} list has no file path"
-    )
-
-
-def _layout_tensor_ids(layout: PhysicalLayoutTable) -> List[str]:
-    """Header-order tensor ids: first-appearance order in tensor_entries.
-
-    Business code populates ``tensor_entries`` in DTensorTable (header) order,
-    so the layout alone recovers the positional row labels without sorting
-    alphabetically or taking a tensor_ids argument.
-    """
-    ids: List[str] = []
-    for pos in layout.tensor_entries:
-        if pos.tensor_id not in ids:
-            ids.append(pos.tensor_id)
-    return ids
+    raise not_found("file_paths", pos_key(pos), f"{pos_key(pos)} list has no file path")
 
 
 # ------------------------------------------------------------- payload maps (internal)
@@ -216,21 +196,25 @@ def nonempty_columns(nd: NamedDTensor) -> Dict[int, np.ndarray]:
 
 def unique_lists(
     layout: PhysicalLayoutTable,
-    tensor_ids: List[str] | None = None,
+    table: DTensorTable,
 ) -> Dict[TensorComponentPos, DisjointStorageMeshList]:
-    """leader -> list, in a deterministic order."""
-    lists: Dict[TensorComponentPos, DisjointStorageMeshList] = {}
-    seen = set()
-    labels = tensor_ids if tensor_ids is not None else _layout_tensor_ids(layout)
-    for lst in layout.tensor_entries.values():
-        if id(lst) in seen:
-            continue
-        seen.add(id(lst))
-        leader = leader_tensor_component_pos_of(lst, labels)
-        if leader in lists and lists[leader] != lst:
+    """leader -> list, ordered by (DTensorTable header row, rank).
+
+    Entries pointing at value-equal lists (deepcopy) are the same physical file.
+    The leader of a list is its smallest actual ``tensor_entries`` key once
+    keys are ordered by DTensorTable header row of their tensor_id, then by
+    rank. This is independent of dict insertion order or file row order.
+    """
+    by_list: Dict[Any, list] = {}
+    for pos, lst in layout.tensor_entries.items():
+        by_list.setdefault(lst, [lst, []])[1].append(pos)
+    leaders: Dict[TensorComponentPos, DisjointStorageMeshList] = {}
+    for lst, positions in by_list.values():
+        leader = min(positions, key=lambda p: (order_of(table, p.tensor_id), p.rank))
+        if leader in leaders and leaders[leader] != lst:
             raise invalid("tensor_entries", "different physical lists share a leader")
-        lists.setdefault(leader, lst)
-    return dict(sorted(lists.items(), key=lambda kv: pos_key(kv[0])))
+        leaders[leader] = lst
+    return dict(sorted(leaders.items(), key=lambda kv: pos_key(kv[0])))
 
 
 def _nonempty_cells(lst, columns):
@@ -240,24 +224,40 @@ def _nonempty_cells(lst, columns):
             yield tensor, rank, intervals
 
 
+def _path_for_list(layout: PhysicalLayoutTable, lst) -> str:
+    for key, path in layout.file_paths.items():
+        if layout.tensor_entries.get(key) == lst:
+            return path
+    raise not_found(
+        "file_paths",
+        "leader",
+        "physical list has no file path",
+    )
+
+
 def build_payload_index(
     table: DTensorTable, layout: PhysicalLayoutTable
 ) -> PayloadIndex:
     files: Dict[str, FilePayload] = {}
     slots: Dict[TensorComponentPos, Tuple[str, SlotPayload]] = {}
     cols_by_row = [nonempty_columns(nd) for nd in table.named_d_tensors]
-    table_ids = tensor_ids_of(table)
-    lists = unique_lists(layout, table_ids)
+    lists = unique_lists(layout, table)
     for leader, lst in sorted(
-        lists.items(), key=lambda kv: layout.file_paths.get(kv[0], "")
+        lists.items(), key=lambda kv: _path_for_list(layout, kv[1])
     ):
-        if leader not in layout.file_paths:
-            raise not_found(
+        path = _path_for_list(layout, lst)
+        # The business must key file_paths by the real header-order leader;
+        # any other component pos of the same list is rejected (B.2.2.2).
+        fp_key = next(
+            pos
+            for pos, p in layout.file_paths.items()
+            if p == path and layout.tensor_entries.get(pos) == lst
+        )
+        if fp_key != leader:
+            raise invalid(
                 "file_paths",
-                pos_key(leader),
-                f"leader {pos_key(leader)} has no file path",
+                f"file_paths key {pos_key(fp_key)} is not the leader {pos_key(leader)}",
             )
-        path = layout.file_paths[leader]
         fp = FilePayload(path=path, leader=leader)
         off = 0
         for t, w, iv in _nonempty_cells(lst, cols_by_row):

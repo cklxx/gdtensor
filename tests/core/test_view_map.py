@@ -36,6 +36,7 @@ def test_view_map_selects_its_domain_and_keeps_origin_unchanged(branch):
     result = gb.d_tensors_view_map(origin, core)
     assert type(result) is gb.Ok and calls == [original] and not events
     mapped = result.value
+    assert mapped is not None
     assert mapped.d_tensor_table.named_d_tensors[0].d_tensor is replacement
     assert origin.d_tensor_table.named_d_tensors[0].d_tensor is original
     assert mapped.tensor_ids == origin.tensor_ids
@@ -240,6 +241,7 @@ def test_view_map_stops_at_first_tensor_error_and_preserves_ids_and_aliases():
     assert result == gb.Err(error) and len(calls) == 1
     core.convert_each_compute_view = lambda dt: gb.Ok(dt)
     mapped = gb.d_tensors_view_map(origin, core).value
+    assert mapped is not None
     assert mapped.tensor_ids == ["w", "second"]
     assert [nd.alias for nd in mapped.d_tensor_table.named_d_tensors] == [
         ["weight"],

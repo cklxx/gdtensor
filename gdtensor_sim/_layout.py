@@ -50,11 +50,11 @@ class PayloadIndex:
 
 
 def _file_payload(layout, pos, ids, files):
-    path = file_path_of(layout, pos, ids)
+    path = file_path_of(layout, pos)
     if type(path) is Err:
         raise Fail(path.value)
     group = layout.tensor_entries[pos]
-    leader = leader_tensor_component_pos_of(group, ids)
+    leader = leader_tensor_component_pos_of(group)
     fp = files.setdefault(path.value, FilePayload(path.value, leader))
     if fp.leader != leader:
         raise invalid("file_paths", "two physical lists use one path")

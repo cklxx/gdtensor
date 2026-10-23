@@ -350,7 +350,7 @@ def _covers_owned(nd, rank: int, pairs, check: str) -> None:
     _assert_disjoint(byte_iv, f"compute {nd.global_tensor_id}", check)
     got = iv_normalize((byte_iv // itemsize).astype(np.int64)) if pairs else EMPTY
     want = iv_normalize(owned_intervals(nd, "compute", rank))
-    if not (got.shape == want.shape and bool(np.array_equal(got, want))):
+    if not (got.shape == want.shape and np.array_equal(got, want)):
         raise check_failed(
             check,
             f"rank {rank} compute {nd.global_tensor_id}: plan covers "

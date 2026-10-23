@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
-import torch
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
@@ -32,6 +31,15 @@ def _storage(root, ct, p, kind, mode, fmt, *, save=False):
     return view
 
 
+def _require_real_dcp(fmt):
+    """Real distcp is genuine torch DCP: gate only on that real dependency.
+
+    Safetensors paths must run with no torch installed; distcp skips there.
+    """
+    if fmt == "distcp":
+        pytest.importorskip("torch.distributed.checkpoint")
+
+
 @pytest.mark.parametrize(
     "fmt,field",
     [
@@ -47,6 +55,7 @@ def _storage(root, ct, p, kind, mode, fmt, *, save=False):
     ],
 )
 def test_format_load_rejects_checkpoint_metadata_mismatch(tmp_path, fmt, field):
+    _require_real_dcp(fmt)
     p = (1, 1, 1)
     ct, points, values = tensor_schema(p)
     source = ArrayFabric(ct, points, values)
@@ -84,6 +93,7 @@ def test_format_load_rejects_checkpoint_metadata_mismatch(tmp_path, fmt, field):
     else:  # bigger_shape: demand more elements than the checkpoint stored
         import pickle
 
+        torch = pytest.importorskip("torch")
         path = tmp_path / ".metadata"
         meta = pickle.loads(path.read_bytes())
         tid = ct.named_d_tensors[0].global_tensor_id
@@ -101,6 +111,7 @@ def test_format_load_rejects_checkpoint_metadata_mismatch(tmp_path, fmt, field):
 
 
 def test_format_distcp_save_returns_after_metadata_is_published(tmp_path, monkeypatch):
+    _require_real_dcp("distcp")
     import os
 
     replace = os.replace
@@ -125,6 +136,7 @@ def test_format_distcp_save_returns_after_metadata_is_published(tmp_path, monkey
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
 def test_format_save_publish_failure_reaches_all_ranks(tmp_path, monkeypatch, fmt):
+    _require_real_dcp(fmt)
     import os
 
     fsync = os.fsync
@@ -155,6 +167,7 @@ def test_format_save_publish_failure_reaches_all_ranks(tmp_path, monkeypatch, fm
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
 @pytest.mark.parametrize("terminal", ["commit", "abort"])
 def test_save_session_rejects_calls_after_terminal_state(tmp_path, fmt, terminal):
+    _require_real_dcp(fmt)
     p = (1, 1, 1)
     table, _, _ = tensor_schema(p)
     view = _storage(tmp_path, table, p, "single", "hf", fmt)
@@ -162,9 +175,15 @@ def test_save_session_rejects_calls_after_terminal_state(tmp_path, fmt, terminal
     opened = view.begin_save(view, 0)
     assert type(opened) is gb.Ok, opened
     session = opened.value
+    assert session is not None
     pos = gb.TensorComponentPos("matrix", 0)
     offset = session.get_file_offset(pos)
-    assert type(offset) is gb.Ok and offset.value >= 0
+    # get_file_offset maps contiguous_payload_offset to the real file offset for an
+    # existing pos; NotFound only when the pos has no physical slot. Both formats
+    # return a real offset (>=0); the save-unpublished staging region is header-less.
+    assert type(offset) is gb.Ok and offset.value is not None and offset.value >= 0, (
+        offset
+    )
     assert type(session.init_data_accessor()) is gb.Ok
     assert type(getattr(session, terminal)()) is gb.Ok
     for call in (
@@ -181,6 +200,7 @@ def test_save_session_rejects_calls_after_terminal_state(tmp_path, fmt, terminal
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
 def test_load_session_rejects_calls_after_finish(tmp_path, fmt):
+    _require_real_dcp(fmt)
     p = (1, 1, 1)
     table, points, values = tensor_schema(p)
     source = ArrayFabric(table, points, values)
@@ -190,8 +210,16 @@ def test_load_session_rejects_calls_after_finish(tmp_path, fmt):
     opened = view.begin_load(view, 0)
     assert type(opened) is gb.Ok, opened
     session = opened.value
+    assert session is not None
     pos = gb.TensorComponentPos("matrix", 0)
-    assert type(session.get_file_offset(pos)) is gb.Ok
+    off = session.get_file_offset(pos)
+    # Save-unpublished staging (safetensors): real offset >=0.
+    # Real DCP load: metadata does not expose raw byte offsets -> explicit Err,
+    # not a fake offset, not NotFound for an existing pos.
+    if fmt == "distcp":
+        assert type(off) is gb.Err, off
+    else:
+        assert type(off) is gb.Ok and off.value is not None and off.value >= 0, off
     assert type(session.init_data_accessor()) is gb.Ok
     assert type(session.finish()) is gb.Ok
     for call in (

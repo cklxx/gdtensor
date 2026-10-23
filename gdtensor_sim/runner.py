@@ -15,7 +15,6 @@ from typing import Callable, Dict, Optional
 
 from gdtensor import Result
 from gdtensor.io import rank_load, rank_save
-from tests.support.compat import rank_reshard
 from .coord import ProcessCoordinator, ThreadCoordinator
 from gdtensor.builder import ComputeDTensorsView, DTensorTable, GDTensorIOError
 from .formats import make_storage_view
@@ -86,12 +85,6 @@ def load_threads(
         world, lambda r: rank_load(r, compute_view(table, fabric, r), sv)
     )
     return res, io
-
-
-def reshard_threads(
-    world: int, make_src: Callable[[int], object], make_dst: Callable[[int], object]
-):
-    return _run_threads(world, lambda r: rank_reshard(r, make_src(r), make_dst(r)))
 
 
 # ------------------------------------------------------------------ processes

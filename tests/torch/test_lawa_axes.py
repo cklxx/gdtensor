@@ -143,7 +143,7 @@ def compute_view(torch, topology, rank, values):
             local.contiguous(),
             mesh,
             _torch_placements(places),
-            shape=flat,
+            shape=torch.Size(int(x) for x in flat),
             stride=tuple(int(np.prod(flat[i + 1 :])) for i in range(len(flat))),
         )
         gd = gdtensor.make_gd_tensor(dt)
@@ -168,7 +168,7 @@ def _local_shape(flat, topology, rank, stage, expert, places):
         if type(places[axis]) is gb.Shard:
             size = 1 if axis == 2 and expert is not None else topology[axis]
             coord = 0 if axis == 2 and expert is not None else coords[axis]
-            dim = places[axis].value
+            dim = places[axis].axis
             chunk = (shape[dim] + size - 1) // size
             shape[dim] = max(0, min(chunk, shape[dim] - coord * chunk))
     return tuple(shape)
@@ -267,7 +267,9 @@ def _worker(rank, init_file, root, label, src, dst, coords):
     os.dup2(log.fileno(), 2)
     torch.set_num_threads(1)
     world = int(np.prod(src))
-    dist.init_process_group(
+    _init = getattr(dist, "init_process_group")
+    _destroy = getattr(dist, "destroy_process_group")
+    _init(
         "gloo",
         init_method="file://" + init_file,
         rank=rank,
@@ -277,7 +279,7 @@ def _worker(rank, init_file, root, label, src, dst, coords):
     try:
         run_rank(torch, rank, Path(root), label, src, dst, coords, stream)
     finally:
-        dist.destroy_process_group()
+        _destroy()
         log.close()
         stream.close()
 

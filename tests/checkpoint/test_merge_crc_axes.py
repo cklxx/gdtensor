@@ -18,11 +18,14 @@ import numpy as np
 import pytest
 
 import gdtensor.io as gio
-from tests.support.compat import rank_reshard
 import gdtensor.builder as gb
 from gdtensor_sim.coord import ThreadCoordinator
 from tests.support import axes
-from tests.support.checkpoint import file_bytes
+from tests.support.checkpoint import (
+    corrupt_distcp_payload,
+    file_bytes,
+    repack_via_compute,
+)
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import payload_regions, run_ranks
 from tests.support.storage import FileStorage
@@ -84,10 +87,10 @@ def _save(root, topology, fmt, values):
 
 
 def _repack_and_load(root, stored, topology, fmt, values):
-    target = _storage(root, topology, fmt, "per_stage", save=True)
-    run_ranks(int(np.prod(topology)), lambda r: rank_reshard(r, stored, target))
-    _verify("REPACK", root, topology, fmt, values)
     table, points, _, _ = axes.schema(topology)
+    target = _storage(root, topology, fmt, "per_stage", save=True)
+    repack_via_compute(int(np.prod(topology)), stored, target, table, points, values)
+    _verify("REPACK", root, topology, fmt, values)
     loaded = ArrayFabric(table, points)
     readable = _storage(root, topology, fmt, "per_stage")
     before = file_bytes(root)
@@ -172,9 +175,11 @@ def test_axes_checkpoint_merge_crc(tmp_path, fmt, weights, shift, label, src, mi
     final_root = tmp_path / "final"
     target = _storage(final_root, dst, other, "single", save=True)
     readable = _storage(out, mid, fmt, "rank_multi")
-    run_ranks(int(np.prod(dst)), lambda r: rank_reshard(r, readable, target))
-    _verify("CONSOLIDATE", final_root, dst, other, expected, files=1)
     final_table, final_points, _, _ = axes.schema(dst)
+    repack_via_compute(
+        int(np.prod(dst)), readable, target, final_table, final_points, expected
+    )
+    _verify("CONSOLIDATE", final_root, dst, other, expected, files=1)
     final = ArrayFabric(final_table, final_points)
     final_view = _storage(final_root, dst, other, "single")
     run_ranks(int(np.prod(dst)), lambda r: gio.rank_load(r, final.view(r), final_view))
@@ -190,18 +195,20 @@ def test_axes_swapped_expert_payloads_fail_crc_and_values(tmp_path, fmt):
     topology = (2, 1, 2, 2)
     _, _, values, _ = axes.schema(topology)
     stored = _save(tmp_path, topology, fmt, values)
-    regions = list(payload_regions(tmp_path, fmt))
-    first = next(r for r in regions if ".experts.0." in r[0])
-    second = next(
-        r
-        for r in regions
-        if ".experts.2." in r[0] and len(r[3]) == len(first[3]) and r[4] != first[4]
-    )
-    assert first[3] != second[3]
-    for region, data in ((first, second[3]), (second, first[3])):
-        with region[4].open("r+b") as file:
-            file.seek(region[5])
-            file.write(data)
+    if fmt == "safetensors":
+        regions = list(payload_regions(tmp_path, fmt))
+        first = next(r for r in regions if ".experts.0." in r[0])
+        second = next(
+            r
+            for r in regions
+            if ".experts.2." in r[0] and len(r[3]) == len(first[3]) and r[4] != first[4]
+        )
+        assert first[3] != second[3]
+        _swap_region_bytes(first, second)
+        fault = f"swapped {first[0]}<->{second[0]}"
+    else:
+        corrupt_distcp_payload(tmp_path, ".experts.0.")
+        fault = "expert_tensor_shifted"
     with pytest.raises(AssertionError):
         _verify("CORRUPT", tmp_path, topology, fmt, values)
     table, points, _, _ = axes.schema((1, 1, 1, 1))
@@ -210,8 +217,7 @@ def test_axes_swapped_expert_payloads_fail_crc_and_values(tmp_path, fmt):
     with pytest.raises(AssertionError):
         loaded.assert_values(values)
     print(
-        f"[CRC+ARANGE][AXES][CORRUPTION][PASS] swapped {first[0]}<->{second[0]} "
-        f"crc=detected values=detected",
+        f"[CRC+ARANGE][AXES][CORRUPTION][PASS] {fault} crc=detected values=detected",
         flush=True,
     )
 
@@ -221,3 +227,12 @@ def test_merge_cases_cross_ep_with_other_axes():
         assert all(len(g) == 4 for g in grids)
         assert any(g[2] > 1 for g in grids), label
     assert any(src[0] > 1 and src[2] > 1 for _, src, _, _ in CASES)
+
+
+def _swap_region_bytes(left, right):
+    with left[4].open("r+b") as f:
+        f.seek(left[5])
+        f.write(right[3])
+    with right[4].open("r+b") as f:
+        f.seek(right[5])
+        f.write(left[3])

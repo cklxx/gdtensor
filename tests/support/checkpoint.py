@@ -59,3 +59,72 @@ def _tensor_points(points, nd, parallel, order):
 
 def file_bytes(root):
     return {path.name: path.read_bytes() for path in root.iterdir() if path.is_file()}
+
+
+def payload_file_bytes(root):
+    """Whole-directory byte map of payload files, excluding the DCP container
+    metadata.
+
+    Real torch DCP embeds a fresh per-write ``storage_uuid`` in ``.metadata``;
+    two saves of identical tensors therefore never produce byte-identical
+    ``.metadata`` even though every payload shard is deterministic. Comparing
+    payload files keeps the byte-level canonicalization assertion without
+    pinning the non-deterministic container header.
+    """
+    return {
+        path.name: path.read_bytes()
+        for path in sorted(root.iterdir())
+        if path.is_file() and path.name != ".metadata"
+    }
+
+
+def corrupt_distcp_payload(root, tid_substring=None):
+    """Inject a real on-disk byte fault into a real torch DCP checkpoint.
+
+    Decodes each tensor through the independent oracle (torch's own reader,
+    not gdtensor_sim), locates one tensor's raw bytes inside the shard by
+    direct search, and flips a single byte there. The fault never goes through
+    the backend's save path — the container is left byte-corrupted on disk,
+    so the oracle re-decoding afterwards reads genuinely wrong payloads.
+    """
+    from tests.support.schemas import payload_regions
+
+    shards = list(root.glob("*.distcp"))
+    assert shards, "no distcp shard to corrupt"
+    regions = list(payload_regions(root, "distcp"))
+    if tid_substring is not None:
+        region = next(r for r in regions if tid_substring in r[0])
+    else:
+        region = regions[0]
+    data = region[3]
+    raw = bytearray(shards[0].read_bytes())
+    idx = raw.find(data[:32])
+    assert idx >= 0, "tensor payload bytes not found in shard"
+    raw[idx] ^= 0xFF
+    shards[0].write_bytes(bytes(raw))
+
+
+def repack_via_compute(world, src_read_view, dst_save_view, table, points, values=None):
+    """Two-phase storage->storage repack (design §10.3, §419).
+
+    The design has no storage->storage copy and no compute->compute reshard;
+    both are cut on purpose. Redistribution through the public IO boundary is
+    exactly two calls: rank_load into an intermediate compute fabric on the
+    destination topology, then rank_save out.
+
+    When ``values`` (the independent dense arange oracle) is given, the
+    intermediate fabric is asserted per-rank and per-element right after the
+    load, before the save phase — a bad load cannot be masked away by a later
+    write. The fabric returns to the caller for further assertions.
+    """
+    import gdtensor.io as gio
+
+    from tests.support.oracle import ArrayFabric
+    from tests.support.schemas import run_ranks
+
+    mid = ArrayFabric(table, points)
+    run_ranks(world, lambda rank: gio.rank_load(rank, mid.view(rank), src_read_view))
+    if values is not None:
+        mid.assert_values(values)
+    run_ranks(world, lambda rank: gio.rank_save(rank, mid.view(rank), dst_save_view))
+    return mid

@@ -3,13 +3,21 @@
 The upper layer keeps the gdtensor copy plan and data accessor on the data
 path. Ranks write their owned slots to a staging area. The coordinator
 assembles the logical tensors and writes the checkpoint with the real
-``torch.distributed.checkpoint`` API, so the on-disk artifact is genuine DCP,
-not a gdtensor-defined JSON format.
+``torch.distributed.checkpoint`` API, so the on-disk artifact is genuine DCP:
+a pickle ``.metadata`` (TensorStorageMetadata + storage_data) and torch_save
+payload files (``__<rank>_<shard>.distcp``).
+
+Dtype handling is byte-exact: staged slot bytes are the raw element bytes of
+the tensor dtype. We never widen BF16 through float32 -- the 2-byte slot bytes
+are interpreted directly as ``torch.bfloat16`` on save and recovered as raw
+bytes through a ``uint8`` view on load. numpy has no bfloat16, so the torch
+tensor is built straight from the raw buffer.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from dataclasses import dataclass, field
 from typing import Dict
@@ -27,23 +35,11 @@ from gdtensor.session import StorageLoadSession, StorageSaveSession
 
 from ._geometry import iv_total
 from ._layout import PayloadIndex
-from ._result import catch, invalid, io_error
+from ._result import catch, invalid, io_error, not_found
 
 STAGE_DIR = ".gdtensor_dcp_stage"
 
-_DTYPE_TO_NP = {
-    "F16": np.float16,
-    "BF16": np.float32,
-    "F32": np.float32,
-    "F64": np.float64,
-    "I8": np.int8,
-    "U8": np.uint8,
-    "I32": np.int32,
-    "I64": np.int64,
-    "BOOL": np.bool_,
-}
-
-_DTYPE_TO_TORCH = {
+_TORCH_DTYPES = {
     "F16": "float16",
     "BF16": "bfloat16",
     "F32": "float32",
@@ -56,9 +52,11 @@ _DTYPE_TO_TORCH = {
 }
 
 
-def _np_dtype(meta):
+def _torch_dtype(meta):
+    import torch
+
     try:
-        return _DTYPE_TO_NP[meta.dtype]
+        return getattr(torch, _TORCH_DTYPES[meta.dtype])
     except KeyError:
         raise invalid("dtype", f"unsupported dtype for DCP simulation: {meta.dtype!r}")
 
@@ -116,49 +114,67 @@ def _stage_for(root: str) -> _Stage:
         return stage
 
 
-def _slot_bytes(nd, rank, intervals, stage: _Stage, on_disk: bool) -> np.ndarray:
+def _slot_raw_bytes(nd, rank, intervals, stage: _Stage, on_disk: bool) -> bytes:
+    """Raw element bytes of one rank's slot, in slot order."""
+    from ._geometry import nonempty_columns  # noqa: F401  (kept for symmetry)
+
     pos = TensorComponentPos(nd.global_tensor_id, rank)
     if on_disk:
         path = stage.path(pos)
         if not os.path.exists(path):
             raise io_error("read", f"missing staged slot {_slot_key(pos)}", path)
         with open(path, "rb") as handle:
-            raw = handle.read()
-    else:
-        try:
-            raw = stage.bytes_of(pos)
-        except KeyError:
-            raise io_error("read", f"missing staged slot {_slot_key(pos)}") from None
-    return np.frombuffer(raw, dtype=_np_dtype(global_tensor_meta_of(nd)))
+            return handle.read()
+    try:
+        return stage.bytes_of(pos)
+    except KeyError:
+        raise io_error("read", f"missing staged slot {_slot_key(pos)}") from None
 
 
-def _assemble_tensor(nd, stage: _Stage, on_disk: bool) -> np.ndarray:
-    """Rebuild one full global tensor from its non-empty storage slots."""
+def _assemble_tensor(nd, stage: _Stage, on_disk: bool):
+    """Rebuild one full global tensor from its non-empty storage slots.
+
+    Returns a torch tensor in the tensor's own dtype (BF16 stays BF16; it is
+    never widened through float32). Verifies every expected slot is present and
+    byte-complete and that every element of the global tensor was staged.
+    """
     from ._geometry import nonempty_columns
 
     meta = global_tensor_meta_of(nd)
-    out = np.zeros(int(np.prod(meta.global_shape)), dtype=_np_dtype(meta))
+    n = int(np.prod(meta.global_shape))
+    itemsize = meta.itemsize
+    raw = bytearray(n * itemsize)
+    filled = np.zeros(n, dtype=bool)
     for rank, intervals in nonempty_columns(nd).items():
-        chunk = _slot_bytes(nd, rank, intervals, stage, on_disk)
-        expect = iv_total(intervals)
-        if chunk.size != expect:
-            msg = f"slot rank {rank} has {chunk.size} elements, expected {expect}"
-            raise io_error("read", msg)
+        chunk = _slot_raw_bytes(nd, rank, intervals, stage, on_disk)
+        expect = iv_total(intervals) * itemsize
+        if len(chunk) != expect:
+            raise io_error(
+                "read",
+                f"slot rank {rank} has {len(chunk)} bytes, expected {expect}",
+            )
         cursor = 0
         for lo, hi in intervals:
-            n = int(hi - lo)
-            out[lo:hi] = chunk[cursor : cursor + n]
-            cursor += n
-    return out.reshape(tuple(meta.global_shape))
+            seg = (hi - lo) * itemsize
+            raw[lo * itemsize : hi * itemsize] = chunk[cursor : cursor + seg]
+            filled[lo:hi] = True
+            cursor += seg
+    if not filled.all():
+        raise io_error(
+            "read", f"tensor {nd.global_tensor_id} staged incompletely before publish"
+        )
+    return _torch_from_raw(bytes(raw), meta)
 
 
-def _torch_tensor(arr: np.ndarray, dtype_name: str):
+def _torch_from_raw(raw: bytes, meta):
     import torch
 
-    tensor = torch.as_tensor(np.ascontiguousarray(arr))
-    if dtype_name == "BF16":
-        tensor = tensor.to(torch.bfloat16)
-    return tensor
+    shape = tuple(meta.global_shape)
+    if int(np.prod(shape)) == 0:
+        return torch.empty(shape, dtype=_torch_dtype(meta))
+    arr = np.frombuffer(raw, dtype=np.uint8).copy()
+    flat = torch.from_numpy(arr)
+    return flat.view(_torch_dtype(meta)).reshape(shape)
 
 
 def _real_dcp_save(
@@ -167,9 +183,7 @@ def _real_dcp_save(
     from torch.distributed.checkpoint import save as dcp_save
 
     state = {
-        nd.global_tensor_id: _torch_tensor(
-            _assemble_tensor(nd, stage, on_disk), global_tensor_meta_of(nd).dtype
-        )
+        nd.global_tensor_id: _assemble_tensor(nd, stage, on_disk)
         for nd in table.named_d_tensors
     }
     dcp_save(state, checkpoint_id=root, no_dist=True)
@@ -178,20 +192,30 @@ def _real_dcp_save(
 def _empty_torch_tensor(meta):
     import torch
 
-    return torch.empty(
-        tuple(meta.global_shape), dtype=getattr(torch, _DTYPE_TO_TORCH[meta.dtype])
-    )
+    return torch.empty(tuple(meta.global_shape), dtype=_torch_dtype(meta))
 
 
-def _real_dcp_load(table: DTensorTable, root: str) -> Dict[str, np.ndarray]:
+def _real_dcp_load(table: DTensorTable, root: str) -> Dict[str, object]:
     from torch.distributed.checkpoint import load as dcp_load
 
-    state = {
+    state: Dict[str, object] = {
         nd.global_tensor_id: _empty_torch_tensor(global_tensor_meta_of(nd))
         for nd in table.named_d_tensors
     }
     dcp_load(state, checkpoint_id=root, no_dist=True)
-    return {key: value.numpy() for key, value in state.items()}
+    return state
+
+
+def _storage_offsets(root: str) -> Dict[str, int]:
+    """Read ``storage_data[MetadataIndex(fqn)].offset`` from the real pickle
+    ``.metadata``. This is the genuine byte offset of each tensor's payload
+    region inside the torch-written ``.distcp`` archive (not a safetensors
+    header computation)."""
+    import pickle
+
+    with open(os.path.join(root, ".metadata"), "rb") as handle:
+        meta = pickle.loads(handle.read())
+    return {idx.fqn: sd.offset for idx, sd in meta.storage_data.items()}
 
 
 def _resolve_slot(index: PayloadIndex, rng):
@@ -215,11 +239,17 @@ class _DcpAccessor(DTensorDataAccessor):
     """Routes gdtensor copy ranges to staged slots (save) or to full tensors
     loaded by real DCP (load)."""
 
-    def __init__(self, mode: str, index: PayloadIndex, stage: _Stage, full=None):
+    def __init__(
+        self,
+        mode: str,
+        index: PayloadIndex,
+        stage: _Stage,
+        full: Dict[str, object] | None = None,
+    ):
         self.mode = mode
         self.index = index
         self.stage = stage
-        self.full = full
+        self.full: Dict[str, object] = full if full is not None else {}
         self._owned: Dict[TensorComponentPos, np.ndarray] = {}
 
     def _owned_linear(self, pos: TensorComponentPos) -> np.ndarray:
@@ -251,14 +281,17 @@ class _DcpAccessor(DTensorDataAccessor):
 
     @catch
     def read_to_buffer(self, global_range, read_to_buffer) -> None:
+        import torch
+
         from .access import call_buffer_callback
 
         slot, rel = _resolve_slot(self.index, global_range)
         owned = self._owned_linear(slot.pos)
         n = global_range.size // slot.itemsize
         start = rel // slot.itemsize
-        flat = self.full[slot.pos.tensor_id].reshape(-1)
-        data = np.ascontiguousarray(flat[owned[start : start + n]]).tobytes()
+        flat = torch.as_tensor(self.full[slot.pos.tensor_id]).reshape(-1)
+        sel = flat[owned[start : start + n]].contiguous()
+        data = sel.view(torch.uint8).numpy().tobytes()
         call_buffer_callback(read_to_buffer, bytearray(data))
 
 
@@ -292,7 +325,18 @@ class DcpSaveSession(StorageSaveSession):
     def get_file_offset(self, pos):
         if self.state != "open":
             raise invalid("session", f"get_file_offset on {self.state} session")
-        return Ok(0)
+        # Save-unpublished: staged slots live in the staging payload region with
+        # no header, laid out contiguously in slot order. Map the slot's
+        # contiguous_payload_offset directly; unknown pos is NotFound.
+        hit = self.index.slots.get(pos)
+        if hit is None:
+            raise not_found(
+                "tensor_entries",
+                f"{pos.tensor_id}:{pos.rank}",
+                f"{pos.tensor_id}:{pos.rank} has no physical file",
+            )
+        _path, slot = hit
+        return Ok(slot.contiguous_payload_offset)
 
     @catch
     def commit(self):
@@ -319,12 +363,21 @@ class DcpSaveSession(StorageSaveSession):
         return None
 
     def _publish_real(self) -> None:
-        # No copied data: publish a valid empty real DCP checkpoint.
+        # No copied data: publish a valid real DCP checkpoint.
         if not self._any_slot_present():
             self._publish_empty()
             return
         on_disk = self.mode == "process"
         _real_dcp_save(self.table, self.stage, self.root, on_disk)
+        self._clear_stage()
+
+    def _clear_stage(self) -> None:
+        # Reuse protection: drop staged bytes once published so a later save to
+        # the same root cannot assemble stale slots from a previous cycle.
+        if self.mode == "thread":
+            self.stage.slots.clear()
+        else:
+            shutil.rmtree(self.stage.stage_dir(), ignore_errors=True)
 
     def _any_slot_present(self) -> bool:
         if self.mode == "thread":
@@ -363,6 +416,9 @@ class DcpLoadSession(StorageLoadSession):
             self.full = _real_dcp_load(table, root)
         except BaseException as exc:  # noqa: BLE001
             raise io_error("read", f"real DCP load failed: {exc}", root) from None
+        # Genuine byte offsets of each tensor's payload region inside the torch
+        # ``.distcp`` archive, read from the real pickle .metadata.
+        self.offsets = _storage_offsets(root)
 
     @catch
     def init_data_accessor(self):
@@ -374,7 +430,18 @@ class DcpLoadSession(StorageLoadSession):
     def get_file_offset(self, pos):
         if self.state != "open":
             raise invalid("session", f"get_file_offset on {self.state} session")
-        return Ok(0)
+        # Real torch DCP ``.distcp`` is a pickle-wrapped archive: the public
+        # ``storage_data.offset`` is a logical offset into torch's internal
+        # unpacking, NOT a raw-byte pread location (pread at it returns pickle
+        # framing, not tensor bytes). The raw payload region is not exposed by the
+        # public metadata API, so this load session cannot truthfully return a raw
+        # file offset. Report the gap explicitly rather than faking storage_data.offset.
+        raise invalid(
+            "file_offset",
+            f"{pos.tensor_id}:{pos.rank}: real DCP metadata does not expose raw "
+            "byte offsets; storage_data.offset is a logical archive offset, not a "
+            "raw pread location",
+        )
 
     @catch
     def finish(self):

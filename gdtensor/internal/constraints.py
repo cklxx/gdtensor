@@ -124,13 +124,28 @@ def _named(o):
 
 
 def _naive(o):
-    from .mesh import mesh_shape
+    from .mesh import (
+        StCacheOuterProductMesh,
+        cache_concurrency_width,
+        cache_num_nodes,
+        cache_num_steps,
+        mesh_shape,
+    )
     from .products import Shard
 
-    try:
-        shape = mesh_shape(o.mesh)
-    except Exception as exc:  # noqa: BLE001
-        return _err(o, "mesh_valid", str(exc))
+    if type(o.mesh) is StCacheOuterProductMesh:
+        # Cache mesh participants are (num_steps x num_nodes x concurrency_width);
+        # only the spatial node dimension expands to ranks.
+        shape = (
+            cache_num_steps(o.mesh),
+            cache_num_nodes(o.mesh),
+            cache_concurrency_width(o.mesh),
+        )
+    else:
+        try:
+            shape = mesh_shape(o.mesh)
+        except Exception as exc:  # noqa: BLE001
+            return _err(o, "mesh_valid", str(exc))
     if len(o.placements) != len(shape):
         return _err(
             o,
@@ -170,7 +185,7 @@ def _layout(o):
     # Structural invariants that hold without the DTensorTable header order:
     # each distinct physical list has exactly one file_paths key sitting on a
     # component position of that list, and distinct files never share a cell.
-    lists: dict[int, object] = {}
+    lists: dict[int, Any] = {}
     for lst in o.tensor_entries.values():
         lists.setdefault(id(lst), lst)
     error = _check_file_path_keys(o, lists)
@@ -316,28 +331,34 @@ def _cache_view(o):
 
 def _st_cache_mesh(o):
     from .mesh import (
-        TemporalCacheMesh,
-        SpatioCacheMesh,
         ArrangedMesh,
+        LiteralMesh,
+        ReshapedMesh,
+        _unwrap_cache,
     )
 
     t, s, c = o.temporal, o.spatial, o.concurrency
-    if type(t) is TemporalCacheMesh:
-        if t.size is None or t.reshaped is not None:
-            return _err(o, "temporal_one_branch", "temporal must set one branch")
-    elif type(s) is SpatioCacheMesh and t.reshaped is s:
-        pass
-    else:
-        return _err(o, "temporal_branch", "temporal must be arranged or reshaped")
-    if type(s) is SpatioCacheMesh:
-        if (s.ranks is None or s.max is None) or s.reshaped is not None:
-            return _err(o, "spatial_one_branch", "spatial must set one branch")
-    elif type(t) is TemporalCacheMesh and s.reshaped is t:
-        pass
-    else:
-        return _err(o, "spatial_branch", "spatial must be literal or reshaped")
+    if type(t) not in (ArrangedMesh, ReshapedMesh):
+        return _err(
+            o, "temporal_branch", "temporal must be ArrangedMesh or ReshapedMesh"
+        )
+    if type(s) not in (LiteralMesh, ReshapedMesh):
+        return _err(o, "spatial_branch", "spatial must be LiteralMesh or ReshapedMesh")
     if type(c) is not ArrangedMesh:
         return _err(o, "concurrency_arranged", "concurrency must be ArrangedMesh")
+    # Exactly one anchor branch; the other dimension reshape-wraps it.
+    tb, sb = _unwrap_cache(t), _unwrap_cache(s)
+    anchored = (
+        (type(t) is ArrangedMesh and type(s) is LiteralMesh)
+        or (type(s) is ReshapedMesh and type(tb) is ArrangedMesh)
+        or (type(t) is ReshapedMesh and type(sb) is LiteralMesh)
+    )
+    if not anchored:
+        return _err(
+            o,
+            "temporal_spatial_anchor",
+            "one of temporal/spatial anchors (Arranged/Literal) and the other reshapes it",
+        )
     # Placements fixed by dimension: temporal/concurrency shard, spatial replicate.
     # Placements live on the NaiveDTensor whose mesh is this CacheMesh; the mesh
     # constraint only fixes shape validity.

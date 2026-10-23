@@ -8,7 +8,6 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-from tests.support.compat import rank_reshard
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import run_ranks, storage_view, tensor_schema, verify_crc
 
@@ -40,38 +39,40 @@ def test_io_world_layout_matrix(tmp_path, p, kind, mode, fmt):
     loaded = ArrayFabric(target, target_points)
     run_ranks(world, lambda rank: gio.rank_load(rank, loaded.view(rank), read_view))
     loaded.assert_values(values)
-    converted = ArrayFabric(target, target_points)
-    run_ranks(
-        world,
-        lambda rank: rank_reshard(
-            rank, source.view(rank, allow_remote_reads=True), converted.view(rank)
-        ),
-    )
-    converted.assert_values(values)
     source.assert_values(values)
 
 
 @pytest.mark.parametrize("world", [1, 2, 4, 8])
-def test_compute_reshard_is_idempotent(world):
+def test_save_load_roundtrip_is_idempotent(tmp_path, world):
     p = (1, 1, world)
     ct, points, values = tensor_schema(p)
     fabric = ArrayFabric(ct, points, values)
-    for _ in range(2):
-        run_ranks(
-            world,
-            lambda rank: rank_reshard(rank, fabric.view(rank), fabric.view(rank)),
-        )
-        fabric.assert_values(values)
+    for i in range(2):
+        root = tmp_path / f"round{i}"
+        saved = storage_view(root, ct, p, "single", "hf", "safetensors", save=True)
+        run_ranks(world, lambda rank: gio.rank_save(rank, fabric.view(rank), saved))
+        reread = ArrayFabric(ct, points)
+        read_view = storage_view(root, ct, p, "single", "hf", "safetensors")
+        run_ranks(world, lambda rank: gio.rank_load(rank, reread.view(rank), read_view))
+        reread.assert_values(values)
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
-def test_storage_fixture_reshard_to_same_view(tmp_path, fmt):
+def test_storage_fixture_roundtrip_rewrites_same_bytes(tmp_path, fmt):
     p = (1, 2, 2)
     ct, points, values = tensor_schema(p)
     fabric = ArrayFabric(ct, points, values)
     sv = storage_view(tmp_path, ct, p, "single", "hf", fmt, save=True)
     run_ranks(4, lambda rank: gio.rank_save(rank, fabric.view(rank), sv))
-    run_ranks(4, lambda rank: rank_reshard(rank, sv, sv))
+    reread = ArrayFabric(ct, points)
+    run_ranks(
+        4,
+        lambda rank: gio.rank_load(
+            rank, reread.view(rank), storage_view(tmp_path, ct, p, "single", "hf", fmt)
+        ),
+    )
+    rewritten = storage_view(tmp_path, ct, p, "single", "hf", fmt, save=True)
+    run_ranks(4, lambda rank: gio.rank_save(rank, reread.view(rank), rewritten))
     verify_crc(tmp_path, fmt, ct, p, "hf", values)
 
 
@@ -105,11 +106,15 @@ def test_empty_tensor_moves_no_bytes(tmp_path):
     points = {rank: {tid: arrays[tid]} for rank, arrays in points.items()}
     values = {tid: values[tid]}
     source = ArrayFabric(ct, points, values)
+    saved = storage_view(tmp_path, ct, p, "single", "hf", "safetensors", save=True)
+    run_ranks(2, lambda rank: gio.rank_save(rank, source.view(rank), saved))
     dest = ArrayFabric(ct, points)
     run_ranks(
         2,
-        lambda rank: rank_reshard(
-            rank, source.view(rank, allow_remote_reads=True), dest.view(rank)
+        lambda rank: gio.rank_load(
+            rank,
+            dest.view(rank),
+            storage_view(tmp_path, ct, p, "single", "hf", "safetensors"),
         ),
     )
     dest.assert_values(values)

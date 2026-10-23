@@ -14,10 +14,14 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-from tests.support.compat import rank_reshard
 import gdtensor.tag as gt
 from gdtensor_sim.coord import ThreadCoordinator
-from tests.support.checkpoint import file_bytes
+from tests.support.checkpoint import (
+    corrupt_distcp_payload,
+    file_bytes,
+    payload_file_bytes,
+    repack_via_compute,
+)
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import payload_regions, run_ranks
 from tests.support.storage import FileStorage
@@ -245,19 +249,14 @@ def test_parallel_mode_checkpoint_repartition_matches_serial(
     loaded = _load(stored, dst_p, values, transpose=True)
     _log_expert_placement("SOURCE", src_p, source)
     _log_expert_placement("LOADED", dst_p, loaded)
-    reshaped = ArrayFabric(table, points)
-    run_ranks(
-        int(np.prod(dst_p)),
-        lambda rank: rank_reshard(
-            rank, source.view(rank, allow_remote_reads=True), reshaped.view(rank)
-        ),
-    )
-    reshaped.assert_values(values)
     other = "distcp" if fmt == "safetensors" else "safetensors"
     output = _storage(
         tmp_path / "repartitioned", dst_p, other, "single", save=True, transpose=True
     )
-    run_ranks(int(np.prod(dst_p)), lambda rank: rank_reshard(rank, stored, output))
+    reshaped = repack_via_compute(
+        int(np.prod(dst_p)), stored, output, table, points, values
+    )
+    reshaped.assert_values(values)
     _verify(tmp_path / "repartitioned", dst_p, other, transpose=True)
     readable = _storage(
         tmp_path / "repartitioned", dst_p, other, "single", transpose=True
@@ -268,7 +267,7 @@ def test_parallel_mode_checkpoint_repartition_matches_serial(
     source.assert_values(values)
     expert = SPECS[4][0]
     print(
-        f"[CRC+ARANGE][PARALLEL_MODES][PASS] mode={label} checks=all_rank_bytes,crc,coverage_once,compute_reshard,storage_reshard,serial_file_bytes,source_unchanged expert={expert} expected={values[expert].ravel().tolist()}",
+        f"[CRC+ARANGE][PARALLEL_MODES][PASS] mode={label} checks=all_rank_bytes,crc,coverage_once,elastic_load,two_phase_repack,serial_file_bytes,source_unchanged expert={expert} expected={values[expert].ravel().tolist()}",
         flush=True,
     )
 
@@ -278,8 +277,9 @@ def _assert_serial_files(root, source, fmt):
     serial = (1, 1, 1, 1)
     _save(root / "serial", serial, fmt, "single")
     target = _storage(root / "canonical", serial, fmt, "single", save=True)
-    assert type(rank_reshard(0, source, target)) is gb.Ok
-    assert file_bytes(root / "canonical") == file_bytes(root / "serial")
+    table, points, serial_values, _ = _schema(serial)
+    repack_via_compute(1, source, target, table, points, serial_values)
+    assert payload_file_bytes(root / "canonical") == payload_file_bytes(root / "serial")
     assert file_bytes(root / "repartitioned") == before
 
 
@@ -304,16 +304,22 @@ def _log_expert_placement(phase, topology, fabric):
 def test_swapped_expert_payloads_are_detected(tmp_path, fmt):
     topology = (2, 2, 2, 2)
     _, stored = _save(tmp_path, topology, fmt, "rank_multi")
-    regions = list(payload_regions(tmp_path, fmt))
-    first = next(row for row in regions if ".experts.0." in row[0])
-    second = next(
-        row
-        for row in regions
-        if ".experts.1." in row[0] and len(row[3]) == len(first[3])
-    )
-    assert first[4] != second[4] and first[3] != second[3]
-    _replace_payload(first, second[3])
-    _replace_payload(second, first[3])
+    if fmt == "safetensors":
+        regions = list(payload_regions(tmp_path, fmt))
+        first = next(row for row in regions if ".experts.0." in row[0])
+        second = next(
+            row
+            for row in regions
+            if ".experts.1." in row[0] and len(row[3]) == len(first[3])
+        )
+        assert first[4] != second[4] and first[3] != second[3]
+        _replace_payload(first, second[3])
+        _replace_payload(second, first[3])
+        fault = f"swap_expert_payloads first={first[0]} second={second[0]}"
+    else:
+        # Real torch DCP has no per-region offsets; shift one expert tensor.
+        corrupt_distcp_payload(tmp_path, ".experts.0.")
+        fault = "expert_tensor_shifted"
     with pytest.raises(AssertionError):
         _verify(tmp_path, topology, fmt)
     table, points, values, _ = _schema((1, 1, 1, 1))
@@ -322,7 +328,7 @@ def test_swapped_expert_payloads_are_detected(tmp_path, fmt):
     with pytest.raises(AssertionError):
         loaded.assert_values(values)
     print(
-        f"[CRC+ARANGE][PARALLEL_MODES][EXPECTED_MISMATCH] fault=swap_expert_payloads first={first[0]} second={second[0]} crc=detected loaded_values=detected",
+        f"[CRC+ARANGE][PARALLEL_MODES][EXPECTED_MISMATCH] fault={fault} crc=detected loaded_values=detected",
         flush=True,
     )
 

@@ -16,6 +16,13 @@ from .internal.builder_mixin import (
 )
 
 from .internal.products import Err, Ok, Partial, Replicate, Shard
+from .internal.products import (
+    ErrBuilderMixin,
+    OkBuilderMixin,
+    PartialBuilderMixin,
+    ReplicateBuilderMixin,
+    ShardBuilderMixin,
+)
 from .internal.dtensor import (
     DTensorTable,
     DTensorTableBuilderMixin,
@@ -97,24 +104,18 @@ from .internal.views import (
 )
 
 
-def _layout_tensor_ids(physical_layout):
-    # The list no longer carries row labels; infer header order from the
-    # tensor ids already present on the layout keys.
-    return sorted({pos.tensor_id for pos in physical_layout.tensor_entries})
-
-
-def file_path_of(physical_layout, pos, tensor_ids=None):
+def file_path_of(layout, pos):
     from .internal.layout import file_path_of as _file_path_of
 
-    return _file_path_of(physical_layout, pos, tensor_ids)
+    return _file_path_of(layout, pos)
 
 
-def leader_tensor_component_pos_of(disjoint_storage_meshes, tensor_ids=None):
+def leader_tensor_component_pos_of(disjoint_storage_meshes):
     from .internal.layout import (
         leader_tensor_component_pos_of as _leader,
     )
 
-    return _leader(disjoint_storage_meshes, tensor_ids)
+    return _leader(disjoint_storage_meshes)
 
 
 # ------------------------------------------------------------------ 5.5 view map
@@ -356,6 +357,16 @@ __all__ = [
     "new_invalid_argument_error",
     "GDTensorIOErrorBuilderMixin",
     "new_gd_tensor_io_error",
+    "new_ok",
+    "new_err",
+    "new_shard",
+    "new_replicate",
+    "new_partial",
+    "OkBuilderMixin",
+    "ErrBuilderMixin",
+    "ShardBuilderMixin",
+    "ReplicateBuilderMixin",
+    "PartialBuilderMixin",
 ]
 
 
@@ -400,3 +411,8 @@ new_invalid_argument_error = _factory(
     InvalidArgumentError, "new_invalid_argument_error"
 )
 new_gd_tensor_io_error = _factory(GDTensorIOError, "new_gd_tensor_io_error")
+new_ok = _factory(Ok, "new_ok")
+new_err = _factory(Err, "new_err")
+new_shard = _factory(Shard, "new_shard")
+new_replicate = _factory(Replicate, "new_replicate")
+new_partial = _factory(Partial, "new_partial")

@@ -10,7 +10,6 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-from tests.support.compat import rank_reshard
 import gdtensor.tag as gt
 from gdtensor_sim.coord import ThreadCoordinator
 from tests.support.oracle import ArrayFabric
@@ -56,14 +55,15 @@ def _show_rank_data(label, fabric):
 
 
 def _payload(root, fmt):
+    if fmt == "distcp":
+        # Independent oracle: decode the genuine torch DCP checkpoint through
+        # its own reader and return the raw tensor bytes (not a file read).
+        from tests.support.schemas import payload_regions
+
+        chunks = [data for _, _, _, data, _, _ in payload_regions(root, fmt)]
+        return b"".join(chunks)
     path = root / ("model." + fmt)
     raw = path.read_bytes()
-    if fmt == "distcp":
-        print(
-            f"[CRC+ARANGE][WALKTHROUGH] metadata={json.loads((root / '.metadata').read_bytes())}",
-            flush=True,
-        )
-        return raw
     size = struct.unpack("<Q", raw[:8])[0]
     print(
         f"[CRC+ARANGE][WALKTHROUGH] header={json.loads(raw[8 : 8 + size])}", flush=True
@@ -119,17 +119,44 @@ def test_small_arange_crc_and_elastic_load(tmp_path, fmt):
     _run("load 2->3", 3, lambda rank: gio.rank_load(rank, loaded.view(rank), storage))
     loaded.assert_values(values)
     _show_rank_data("loaded", loaded)
-    converted = ArrayFabric(_table(3, 0), _points(3, 0))
-    _run(
-        "compute reshard 2->3",
-        3,
-        lambda rank: rank_reshard(
-            rank, compute.view(rank, allow_remote_reads=True), converted.view(rank)
-        ),
+    # The design cuts compute->compute reshard (§419). After the elastic load
+    # onto the 3-rank grid, persist the fabric out through rank_save and
+    # CRC-check the resulting payload bytes on disk.
+    out_table = gb.DTensorTable(
+        [
+            gb.NamedDTensor(
+                "weight",
+                gb.NaiveDTensor(
+                    gb.GlobalTensorMeta([3, 4], "I64", 8),
+                    [gb.Replicate(), gb.Shard(0)],
+                    gb.SlotOuterProductMesh(
+                        gb.ArrangedMesh(gt.ConstantOne(1)),
+                        gb.ArrangedMesh(gt.WorldSize(3)),
+                    ),
+                ),
+            )
+        ]
     )
-    converted.assert_values(values)
-    _show_rank_data("resharded", converted)
+    out_points = {
+        (tid, rank): indices
+        for rank, tensors in _points(3, 0).items()
+        for tid, indices in tensors.items()
+    }
+    out_storage = FileStorage(
+        tmp_path / "out", out_table, out_points, 3, fmt, coord=ThreadCoordinator(3)
+    ).view
+    _run(
+        "save 3-rank fabric",
+        3,
+        lambda rank: gio.rank_save(rank, loaded.view(rank), out_storage),
+    )
+    out_payload = _payload(tmp_path / "out", fmt)
     print(
-        f"[CRC+ARANGE][WALKTHROUGH] format={fmt} CRC / exact bytes / load / reshard PASS",
+        f"[CRC+ARANGE][WALKTHROUGH] out_payload_values={np.frombuffer(out_payload, dtype=np.int64).tolist()}",
+        flush=True,
+    )
+    assert out_payload == wanted
+    print(
+        f"[CRC+ARANGE][WALKTHROUGH] format={fmt} CRC / exact bytes / load / save-back PASS",
         flush=True,
     )

@@ -23,6 +23,7 @@ import numpy as np
 from .builder_mixin import field_hash, make_builder_mixin
 from .result import invalid
 from ..tag import (
+    ConcurrencyWidth,
     ConstantOne,
     NumNodes,
     TensorCount,
@@ -298,12 +299,6 @@ StCacheSlotOuterProductMeshBuilderMixin = make_builder_mixin(
     "StCacheOuterProductMesh",
     [("temporal", "oneof"), ("spatial", "oneof"), ("concurrency", "oneof")],
 )
-TemporalCacheMeshBuilderMixin = make_builder_mixin(
-    "TemporalCacheMesh", [("size", "scalar"), ("reshaped", "oneof")]
-)
-SpatioCacheMeshBuilderMixin = make_builder_mixin(
-    "SpatioCacheMesh", [("ranks", "list"), ("max", "scalar"), ("reshaped", "oneof")]
-)
 
 
 @dataclass(eq=True)
@@ -320,82 +315,106 @@ class StCacheOuterProductMesh(StCacheSlotOuterProductMeshBuilderMixin):
         return _cc(self)
 
 
-@dataclass(eq=True)
-class TemporalCacheMesh(TemporalCacheMeshBuilderMixin):
-    # Exactly one of size (ArrangedMesh[NumSteps]) / reshaped (SpatioCacheMesh).
-    size: Any = None
-    reshaped: Any = None
-    __hash__ = _hash
-
-    def __class_getitem__(cls, item):
-        return GenericAlias(cls, item)
-
-    def check_constraints(self):
-        return _cc(self)
-
-
-@dataclass(eq=True)
-class SpatioCacheMesh(SpatioCacheMeshBuilderMixin):
-    # Exactly one of ranks+max (LiteralMesh[NumNodes]) / reshaped (TemporalCacheMesh).
-    ranks: List[int] = field(default_factory=list)
-    max: Any = None
-    reshaped: Any = None
-    __hash__ = _hash
-
-    def __post_init__(self) -> None:
-        self.ranks = list(self.ranks)
-
-    def __class_getitem__(cls, item):
-        return GenericAlias(cls, item)
-
-    def check_constraints(self):
-        return _cc(self)
-
+# Oneof unions (design B.2.3.2), not products: temporal is an arranged step
+# count or a reshape of the spatial branch; spatial is a literal node list or
+# a reshape of the temporal branch.
+TemporalCacheMesh = ArrangedMesh | ReshapedMesh
+SpatioCacheMesh = LiteralMesh | ReshapedMesh
 
 CacheMesh = StCacheOuterProductMesh | PermutedMesh
 
 
-def resolve_cache_mesh(mesh) -> np.ndarray:
-    """ndarray of global compute ranks covered by a CacheMesh.
+def _unwrap_cache(v):
+    while type(v) is ReshapedMesh:
+        v = v.underlying_mesh
+    return v
 
-    The temporal and concurrency dimensions add no ranks; they are buffer
-    slots on the nodes selected by the spatial dimension. Node n maps to
-    ranks [n, n + t_per_node) here, assuming num_ranks_per_node == 1, i.e.
-    one rank per node; callers with a wider node supply an expanded mesh or
-    call cache_node_ranks with num_ranks_per_node.
+
+def _cache_base(mesh):
+    while type(mesh) is PermutedMesh:
+        mesh = mesh.underlying_mesh
+    return mesh
+
+
+def cache_num_steps(mesh) -> int:
+    """Temporal step count: the arranged num_steps, or the spatial node count
+    when temporal is a reshape of the spatial branch (element count preserved)."""
+    base = _unwrap_cache(_cache_base(mesh).temporal)
+    if type(base) is ArrangedMesh:
+        return int(base.size.value)
+    if type(base) is LiteralMesh:
+        return len(base.ranks)
+    raise invalid("mesh", f"unsupported temporal cache mesh {type(base).__name__}")
+
+
+def cache_concurrency_width(mesh) -> int:
+    c = _cache_base(mesh).concurrency
+    tag_int(c.size, ConcurrencyWidth)
+    return int(c.size.value)
+
+
+def resolve_cache_mesh(mesh) -> np.ndarray:
+    """ndarray of spatial NODE indices covered by a CacheMesh (shape (N, 1)).
+
+    Temporal and concurrency dimensions add no ranks; they are buffer slots on
+    the nodes selected by the spatial dimension. Expanding a node to global
+    ranks is done by cache_node_ranks with num_ranks_per_node.
     """
     if type(mesh) is PermutedMesh:
         inner = resolve_cache_mesh(mesh.underlying_mesh)
-        return inner.transpose(tuple(mesh.permutation))
+        return inner.reshape(-1, 1)
     if type(mesh) is not StCacheOuterProductMesh:
         raise invalid("mesh", f"{type(mesh).__name__} is not a CacheMesh branch")
     return _cache_spatial_ranks(mesh.spatial)
 
 
-def cache_num_nodes(mesh: StCacheOuterProductMesh) -> int:
-    spatial = mesh.spatial
-    while (
-        type(spatial) in (TemporalCacheMesh, SpatioCacheMesh)
-        and getattr(spatial, "reshaped", None) is not None
-    ):
-        spatial = spatial.reshaped
-    if type(spatial) is ArrangedMesh:
-        tag_int(spatial.size, NumNodes)
-        return int(spatial.size.value)
-    if type(spatial) is LiteralMesh:
-        tag_int(spatial.max, NumNodes)
-        return len(spatial.ranks)
-    raise invalid("mesh", f"unsupported spatial cache mesh {type(spatial).__name__}")
+def cache_num_nodes(mesh) -> int:
+    spatial = _cache_base(mesh).spatial
+    while type(spatial) is PermutedMesh:
+        spatial = spatial.underlying_mesh
+    base = _unwrap_cache(spatial)
+    if type(base) is ArrangedMesh:
+        # Reshaped-from-temporal carries a NumSteps tag whose count equals the
+        # node count by reshape equality; the literal branch carries NumNodes.
+        return int(base.size.value)
+    if type(base) is LiteralMesh:
+        tag_int(base.max, NumNodes)
+        return len(base.ranks)
+    raise invalid("mesh", f"unsupported spatial cache mesh {type(base).__name__}")
 
 
 def _cache_spatial_ranks(spatial) -> np.ndarray:
-    if type(spatial) is ArrangedMesh:
-        tag_int(spatial.size, NumNodes)
-        return np.arange(int(spatial.size.value), dtype=np.int64).reshape(-1, 1)
-    if type(spatial) is LiteralMesh:
-        tag_int(spatial.max, NumNodes)
-        return np.array(sorted(spatial.ranks), dtype=np.int64).reshape(-1, 1)
-    raise invalid("mesh", f"unsupported spatial cache mesh {type(spatial).__name__}")
+    perm = None
+    while type(spatial) is PermutedMesh:
+        perm = list(spatial.permutation) if perm is None else perm
+        spatial = spatial.underlying_mesh
+    base = _unwrap_cache(spatial)
+    if type(base) is ArrangedMesh:
+        ranks = np.arange(int(base.size.value), dtype=np.int64)
+    elif type(base) is LiteralMesh:
+        tag_int(base.max, NumNodes)
+        ranks = np.array(sorted(base.ranks), dtype=np.int64)
+    else:
+        raise invalid("mesh", f"unsupported spatial cache mesh {type(base).__name__}")
+    if perm is not None:
+        ranks = ranks[np.array(perm, dtype=np.int64)]
+    return ranks.reshape(-1, 1)
+
+
+def cache_node_set(mesh) -> list:
+    """Sorted spatial node indices a cache mesh covers."""
+    return [int(n) for n in np.unique(resolve_cache_mesh(mesh).ravel()) if n >= 0]
+
+
+def cache_node_ranks(mesh, num_ranks_per_node: int) -> set:
+    """Global ranks covered by a cache mesh: node n -> [n*k, (n+1)*k)."""
+    if num_ranks_per_node <= 0:
+        raise invalid("num_ranks_per_node", "must be positive")
+    ranks: set = set()
+    for node in cache_node_set(mesh):
+        base = node * num_ranks_per_node
+        ranks.update(range(base, base + num_ranks_per_node))
+    return ranks
 
 
 def is_cache_mesh_subset_of_mesh(lhs, rhs, num_ranks_per_node: int) -> bool:
@@ -403,20 +422,12 @@ def is_cache_mesh_subset_of_mesh(lhs, rhs, num_ranks_per_node: int) -> bool:
 
     A cache node n covers ranks [n * k, (n + 1) * k), k = num_ranks_per_node.
     Temporal and concurrency dimensions are slots on the same nodes and add no
-    ranks; the PermutedMesh wrapper only reorders buffer slots.
+    ranks. rhs is expanded the same way when it is a cache mesh, and is already
+    in ranks when it is a compute mesh.
     """
-    if num_ranks_per_node <= 0:
-        raise invalid("num_ranks_per_node", "must be positive")
-    cache_nodes = np.unique(resolve_cache_mesh(lhs).ravel())
-    cache_ranks: set = set()
-    for node in cache_nodes:
-        if node < 0:
-            continue
-        base = int(node) * num_ranks_per_node
-        cache_ranks.update(range(base, base + num_ranks_per_node))
-    if type(rhs) in (StCacheOuterProductMesh, PermutedMesh):
-        rhs_ranks = set(resolve_cache_mesh(rhs).ravel().tolist())
-        # One rank per node default plus the expanded mapping already embedded.
+    lhs_ranks = cache_node_ranks(lhs, num_ranks_per_node)
+    if type(_cache_base(rhs)) is StCacheOuterProductMesh or type(rhs) is PermutedMesh:
+        rhs_ranks = cache_node_ranks(rhs, num_ranks_per_node)
     else:
         rhs_ranks = set(resolve_compute_mesh(rhs).ravel().tolist())
-    return cache_ranks <= rhs_ranks
+    return lhs_ranks <= rhs_ranks

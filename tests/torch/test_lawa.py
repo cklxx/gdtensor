@@ -1,6 +1,5 @@
 """LAWA through public IO and bridge functions on real torch ranks."""
 
-import json
 import multiprocessing as mp
 import os
 import time
@@ -61,24 +60,17 @@ def _check_output(torch, path, fmt, expected, world):
         for tid, value in expected.items():
             torch.testing.assert_close(torch.from_numpy(decoded[tid].copy()), value)
         return
-    doc = json.loads((path / ".metadata").read_bytes())
-    seen = {
-        tid: np.zeros(value.shape[0], dtype=np.int64) for tid, value in expected.items()
-    }
-    for chunk in doc["chunks"]:
-        value = expected[chunk["tensor_id"]]
-        rows = (value.shape[0] + world - 1) // world
-        start = chunk["slot"] * rows
-        want = value[start : start + rows]
-        raw = (path / chunk["file"]).read_bytes()
-        data = raw[chunk["offset"] : chunk["offset"] + chunk["size"]]
-        assert len(data) == want.numel() * want.element_size()
+    from tests.support.schemas import payload_regions
+
+    seen = set()
+    for tid, _slot, _info, data, _p, _lo in payload_regions(path, fmt):
+        assert tid not in seen, tid
+        seen.add(tid)
+        value = expected[tid]
         dtype = np.float64 if value.dtype == torch.float64 else np.float32
-        actual = np.frombuffer(data, dtype=dtype).copy().reshape(tuple(want.shape))
-        torch.testing.assert_close(torch.from_numpy(actual), want)
-        seen[chunk["tensor_id"]][start : start + rows] += 1
-    for counts in seen.values():
-        np.testing.assert_array_equal(counts, np.ones_like(counts))
+        actual = np.frombuffer(data, dtype=dtype).reshape(tuple(value.shape))
+        torch.testing.assert_close(torch.from_numpy(actual.copy()), value)
+    assert seen == set(expected)
 
 
 def _storage(root, values, fmt, coord, world):
