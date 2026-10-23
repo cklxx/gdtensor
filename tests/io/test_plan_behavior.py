@@ -7,6 +7,7 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
+from tests.support.compat import rank_reshard
 import gdtensor.tag as gt
 from tests.support.memory import Memory, compute_view, storage_view
 
@@ -30,7 +31,7 @@ def _compute_columns(memory):
     tensor = view.d_tensor_table.named_d_tensors[0].d_tensor
     tensor.set_global_tensor_meta(gb.GlobalTensorMeta([2, 5], "I16", 2))
     tensor.set_mesh(gb.LiteralMesh([2, 0, 3, 1], gt.WorldSize(4)))
-    tensor.set_placements([gt.Shard(1)])
+    tensor.set_placements([gb.Shard(1)])
     return view
 
 
@@ -39,18 +40,17 @@ def _storage_rows(memory, events):
     tensor = view.d_tensor_table.named_d_tensors[0].d_tensor
     tensor.set_global_tensor_meta(gb.GlobalTensorMeta([2, 5], "I16", 2))
     tensor.set_mesh(
-        gb.OuterProductMesh(
+        gb.SlotOuterProductMesh(
             gb.ArrangedMesh(gt.ConstantOne(1)), gb.ArrangedMesh(gt.WorldSize(3))
         )
     )
-    tensor.set_placements([gt.Replicate(), gt.Shard(0)])
+    tensor.set_placements([gb.Replicate(), gb.Shard(0)])
     group = gb.DisjointStorageMeshList(
         [
-            gb.OuterProductMesh(
+            gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(3))
             )
-        ],
-        ["w"],
+        ]
     )
     view.physical_layout.set_tensor_entries(
         {gb.TensorComponentPos("w", rank): group for rank in (0, 1)}
@@ -63,7 +63,7 @@ def _run(operation, rank, src, dst):
         return gio.rank_save(rank, src, dst)
     if operation == "load":
         return gio.rank_load(rank, dst, src)
-    return gio.rank_reshard(rank, src, dst)
+    return rank_reshard(rank, src, dst)
 
 
 def _expected_bytes(operation, rank):
@@ -104,7 +104,7 @@ def test_permuted_mesh_changes_owners_without_changing_tensor_bytes(operation, r
             gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(4)), [2, 2]), [1, 0]
         )
     )
-    tensor.set_placements([gt.Shard(0), gt.Shard(1)])
+    tensor.set_placements([gb.Shard(0), gb.Shard(1)])
     # Mesh [[0, 2], [1, 3]]; row chunks have 1 row, column chunks have 3 columns.
     expected = {
         0: list(range(6)),
@@ -112,9 +112,9 @@ def test_permuted_mesh_changes_owners_without_changing_tensor_bytes(operation, r
         2: list(range(6, 10)),
         3: list(range(16, 20)),
     }[rank]
-    assert type(src.check_constraints()) is type(dst.check_constraints()) is gt.Ok
+    assert type(src.check_constraints()) is type(dst.check_constraints()) is gb.Ok
     result = _run(operation, rank, src, dst)
-    assert type(result) is gt.Ok, result
+    assert type(result) is gb.Ok, result
     assert (
         sorted(_accessed_bytes(source)) == sorted(_accessed_bytes(target)) == expected
     )
@@ -138,8 +138,8 @@ def test_sliced_mesh_step_preserves_save_and_load_ownership(selection, owners):
     cv, sv = compute_view(source), storage_view(saved, events)
     tensor = cv.d_tensor_table.named_d_tensors[0].d_tensor
     tensor.set_mesh(gb.SlicedMesh(gb.ArrangedMesh(gt.WorldSize(4)), [selection]))
-    tensor.set_placements([gt.Shard(0)])
-    assert type(cv.check_constraints()) is gt.Ok
+    tensor.set_placements([gb.Shard(0)])
+    assert type(cv.check_constraints()) is gb.Ok
     chunk = 8 // len(owners)
     for rank in range(4):
         expected = (
@@ -150,7 +150,7 @@ def test_sliced_mesh_step_preserves_save_and_load_ownership(selection, owners):
         source.ranges.clear()
         saved.ranges.clear()
         result = gio.rank_save(rank, cv, sv)
-        assert type(result) is gt.Ok, result
+        assert type(result) is gb.Ok, result
         assert (
             sorted(_accessed_bytes(source))
             == sorted(_accessed_bytes(saved))
@@ -159,7 +159,7 @@ def test_sliced_mesh_step_preserves_save_and_load_ownership(selection, owners):
         target = TraceMemory([0xA5] * 8)
         loaded = gb.ComputeDTensorsView(cv.tensor_ids, cv.d_tensor_table, target)
         result = gio.rank_load(rank, loaded, sv)
-        assert type(result) is gt.Ok, result
+        assert type(result) is gb.Ok, result
         assert sorted(_accessed_bytes(target)) == expected
         wanted = np.full(8, 0xA5, dtype=np.uint8)
         wanted[expected] = np.array(expected, dtype=np.uint8)
@@ -187,10 +187,10 @@ def test_public_io_plans_discontiguous_bytes_and_empty_ranks(operation, rank):
         else _compute_columns(target)
     )
     schema = copy.deepcopy((src.d_tensor_table, dst.d_tensor_table))
-    assert type(src.check_constraints()) is gt.Ok
-    assert type(dst.check_constraints()) is gt.Ok
+    assert type(src.check_constraints()) is gb.Ok
+    assert type(dst.check_constraints()) is gb.Ok
     result = _run(operation, rank, src, dst)
-    assert type(result) is gt.Ok, result
+    assert type(result) is gb.Ok, result
     expected = _expected_bytes(operation, rank)
     assert sorted(_accessed_bytes(source)) == expected
     assert sorted(_accessed_bytes(target)) == expected
@@ -220,7 +220,7 @@ def test_source_gap_fails_in_plan_before_any_session_or_access(operation):
     group.set_disjoint_storage_mesh_list([gb.SlicedMesh(base, [None, gb.Slice(0, 1)])])
     del src.physical_layout.tensor_entries[gb.TensorComponentPos("w", 1)]
     result = _run(operation, 1 if operation == "ss" else 2, src, dst)
-    assert type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
+    assert type(result) is gb.Err and type(result.value) is gb.InvalidArgumentError
     assert (
         result.value.argument_name == "src_view"
         and "no source covers" in result.value.msg
@@ -245,17 +245,17 @@ def test_packed_storage_offsets_differ_from_global_offsets(operation, rank):
     cv, sv = _compute_columns(compute), _storage_rows(storage, events)
     tensor = sv.d_tensor_table.named_d_tensors[0].d_tensor
     tensor.mesh.content_slots.set_size(gt.WorldSize(4))
-    tensor.set_placements([gt.Replicate(), gt.Shard(1)])
+    tensor.set_placements([gb.Replicate(), gb.Shard(1)])
     group = next(iter(sv.physical_layout.tensor_entries.values()))
     group.disjoint_storage_mesh_list[0].content_slots.set_size(gt.WorldSize(4))
     sv.physical_layout.tensor_entries[gb.TensorComponentPos("w", 2)] = group
-    assert type(sv.check_constraints()) is gt.Ok
+    assert type(sv.check_constraints()) is gb.Ok
     result = (
         gio.rank_save(rank, cv, sv)
         if operation == "save"
         else gio.rank_load(rank, cv, sv)
     )
-    assert type(result) is gt.Ok, result
+    assert type(result) is gb.Ok, result
     global_bytes = _expected_bytes(operation, rank)
     storage_bytes = sorted(packed.index(byte) for byte in global_bytes)
     assert sorted(_accessed_bytes(compute)) == global_bytes
@@ -283,24 +283,23 @@ def test_replicated_save_writes_each_tensor_once_in_table_order():
     compute_table, storage_table, entries = [], [], {}
     group = gb.DisjointStorageMeshList(
         [
-            gb.OuterProductMesh(
+            gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(5)), gb.ArrangedMesh(gt.WorldSize(1))
             )
-        ],
-        ids,
+        ]
     )
     for size, tid in enumerate(ids, 1):
         meta = gb.GlobalTensorMeta([size], "U8", 1)
         compute_mesh = gb.LiteralMesh([4, 1, 6], gt.WorldSize(7))
         compute_table.append(
-            gb.NamedDTensor(tid, gb.NaiveDTensor(meta, [gt.Replicate()], compute_mesh))
+            gb.NamedDTensor(tid, gb.NaiveDTensor(meta, [gb.Replicate()], compute_mesh))
         )
         storage_table.append(
             gb.NamedDTensor(
                 tid,
                 gb.NaiveDTensor(
                     meta,
-                    [gt.Replicate()] * 2,
+                    [gb.Replicate()] * 2,
                     sv.d_tensor_table.named_d_tensors[0].d_tensor.mesh,
                 ),
             )
@@ -312,10 +311,10 @@ def test_replicated_save_writes_each_tensor_once_in_table_order():
     sv.set_d_tensor_table(gb.DTensorTable(storage_table))
     sv.physical_layout.set_tensor_entries(dict(reversed(list(entries.items()))))
     sv.physical_layout.set_file_paths({gb.TensorComponentPos(ids[0], 0): "memory"})
-    assert type(cv.check_constraints()) is type(sv.check_constraints()) is gt.Ok
+    assert type(cv.check_constraints()) is type(sv.check_constraints()) is gb.Ok
     for rank in (6, 0, 4, 1):
         result = gio.rank_save(rank, cv, sv)
-        assert type(result) is gt.Ok, result
+        assert type(result) is gb.Ok, result
     assert sorted(source.ranges) == sorted(
         ("compute", tid, 0, size) for size, tid in enumerate(ids, 1)
     )

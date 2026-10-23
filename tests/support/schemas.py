@@ -28,7 +28,7 @@ LAYOUTS = [
 def run_ranks(world, fn):
     with ThreadPoolExecutor(max_workers=world) as ex:
         results = list(ex.map(fn, range(world)))
-    assert all(type(r) is gt.Ok for r in results), results
+    assert all(type(r) is gb.Ok for r in results), results
 
 
 def tensor_schema(p, column=False, tensor_count=8):
@@ -37,22 +37,22 @@ def tensor_schema(p, column=False, tensor_count=8):
             "matrix",
             (19, 37),
             "<i8",
-            (gt.Replicate(), gt.Replicate(), gt.Shard(1 if column else 0)),
+            (gb.Replicate(), gb.Replicate(), gb.Shard(1 if column else 0)),
             False,
         ),
         (
             "cube",
             (3, 17, 11),
             "<f8",
-            (gt.Replicate(), gt.Shard(1), gt.Shard(2 if column else 0)),
+            (gb.Replicate(), gb.Shard(1), gb.Shard(2 if column else 0)),
             False,
         ),
-        ("nested", (5, 3), "<i8", (gt.Replicate(), gt.Shard(0), gt.Shard(0)), False),
-        ("flat", (3, 97), "<f4", (gt.Replicate(), gt.Shard(0), gt.Shard(0)), True),
-        ("half", (5, 7), "<f2", (gt.Replicate(), gt.Replicate(), gt.Shard(1)), False),
-        ("tiny", (1,), "<i8", (gt.Replicate(), gt.Replicate(), gt.Shard(0)), False),
-        ("singleton", (1,), "<f8", (gt.Replicate(),) * 3, False),
-        ("empty", (0, 5), "<i8", (gt.Replicate(),) * 3, False),
+        ("nested", (5, 3), "<i8", (gb.Replicate(), gb.Shard(0), gb.Shard(0)), False),
+        ("flat", (3, 97), "<f4", (gb.Replicate(), gb.Shard(0), gb.Shard(0)), True),
+        ("half", (5, 7), "<f2", (gb.Replicate(), gb.Replicate(), gb.Shard(1)), False),
+        ("tiny", (1,), "<i8", (gb.Replicate(), gb.Replicate(), gb.Shard(0)), False),
+        ("singleton", (1,), "<f8", (gb.Replicate(),) * 3, False),
+        ("empty", (0, 5), "<i8", (gb.Replicate(),) * 3, False),
     ]
     for i in range(tensor_count - len(specs)):
         _, shape, dtype, placements, flat = specs[i % 4]
@@ -101,7 +101,7 @@ def storage_view(root, ct, p, kind, mode, fmt, *, save=False):
         slices = _storage_slices(dt, p, order)
         mesh = gb.SlicedMesh(
             gb.ReshapedMesh(
-                gb.OuterProductMesh(
+                gb.SlotOuterProductMesh(
                     gb.ArrangedMesh(gt.ConstantOne(1)),
                     gb.ArrangedMesh(gt.WorldSize(world)),
                 ),
@@ -110,7 +110,7 @@ def storage_view(root, ct, p, kind, mode, fmt, *, save=False):
             slices,
         )
         placements = [
-            gt.Shard(0) if mode == "hf" and type(pl) is gt.Shard else pl
+            gb.Shard(0) if mode == "hf" and type(pl) is gb.Shard else pl
             for pl in dt.placements
         ]
         stored = gb.NaiveDTensor(dt.global_tensor_meta, placements, mesh)
@@ -132,7 +132,7 @@ def storage_view(root, ct, p, kind, mode, fmt, *, save=False):
 def _storage_slices(tensor, parallel, order):
     slices = [gb.Slice(order % parallel[0], order % parallel[0] + 1), None, None]
     for dim in (1, 2):
-        if type(tensor.placements[dim]) is gt.Replicate:
+        if type(tensor.placements[dim]) is gb.Replicate:
             slices[dim] = gb.Slice(order % parallel[dim], order % parallel[dim] + 1)
     return slices
 
@@ -144,7 +144,7 @@ def storage_points(ct, p, mode):
         if type(dt) is gb.ReshapedDTensor:
             dt = dt.underlying_d_tensor
         placements = [
-            gt.Shard(0) if mode == "hf" and type(pl) is gt.Shard else pl
+            gb.Shard(0) if mode == "hf" and type(pl) is gb.Shard else pl
             for pl in dt.placements
         ]
         for rank in range(int(np.prod(p))):

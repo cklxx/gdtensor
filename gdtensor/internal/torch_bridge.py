@@ -14,7 +14,8 @@ from .mesh import (
 )
 from .result import catch, invalid
 from .views import ComputeDTensorsView
-from ..tag import Partial, Replicate, Shard, WorldSize
+from ..tag import WorldSize
+from .products import Partial, Replicate, Shard
 
 _DTYPE_NAMES = {
     "torch.float32": "F32",

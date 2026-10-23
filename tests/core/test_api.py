@@ -28,70 +28,75 @@ def test_result_and_error_are_type_aliases():
     assert typing.get_origin(gdtensor.Result[int]) is gdtensor.Result
     assert typing.get_args(gdtensor.Result[int]) == (int,)
     assert typing.get_args(gdtensor.Result.__value__) == (
-        gt.Ok[gdtensor.Result.__type_params__[0]],
-        gt.Err[gdtensor.Error],
+        gb.Ok[gdtensor.Result.__type_params__[0]],
+        gb.Err[gdtensor.Error],
     )
     assert isinstance(gb.NotFoundError(msg="missing"), gdtensor.Error)
-    assert not hasattr(gt.Ok, "unwrap") and not hasattr(gt.Ok, "ok")
-    assert not hasattr(gt.Err, "error")
+    assert not hasattr(gb.Ok, "unwrap") and not hasattr(gb.Ok, "ok")
+    assert not hasattr(gb.Err, "error")
 
 
-def test_tags_are_distinct_boxes_and_support_annotations():
+def test_scalar_tags_are_distinct_boxes_and_products_are_dataclasses():
     Foo, Bar = gt.make_box_subclass("Foo"), gt.make_box_subclass("Bar")
     assert issubclass(Foo, gt.Box)
     assert Foo(1) == Foo(1) and Foo(1) != Bar(1)
     assert hash(Foo(1)) == hash(Foo(1))
     assert repr(gt.WorldSize(2)) == "WorldSize(2)"
-    assert typing.get_origin(gt.Ok[int]) is gt.Ok
-    for tag in (
-        gt.Ok,
-        gt.Err,
-        gt.Replicate,
-        gt.Partial,
-        gt.Shard,
-        gt.ConstantOne,
-        gt.TensorCount,
-        gt.WorldSize,
-    ):
+    for tag in (gt.ConstantOne, gt.TensorCount, gt.WorldSize):
         assert issubclass(tag, gt.Box)
-    assert gt.Replicate().value is None
+    # Result / placement products are not tags.
+    assert not issubclass(gb.Ok, gt.Box)
+    assert not issubclass(gb.Shard, gt.Box)
+    assert not issubclass(gb.Replicate, gt.Box)
+    assert not issubclass(gb.Partial, gt.Box)
+    assert typing.get_origin(gb.Ok[int]) is gb.Ok
+    assert gb.Shard(2).axis == 2 and gb.Shard(2) == gb.Shard(2)
+    assert gb.Replicate() == gb.Replicate() and gb.Replicate() != gb.Partial()
+    assert hash(gb.Replicate()) == hash(gb.Replicate())
+    assert not hasattr(gb.Replicate(), "value")
 
 
 def test_tensor_lookup_helpers_and_missing_id():
     table = gb.DTensorTable([gb.NamedDTensor("b"), gb.NamedDTensor("a")])
-    assert gb.tensor_order_value_of(table, "a") == gt.Ok(1)
+    assert gb.tensor_order_value_of(table, "a") == gb.Ok(1)
     missing = gb.tensor_order_value_of(table, "missing")
-    assert type(missing) is gt.Err and type(missing.value) is gb.NotFoundError
+    assert type(missing) is gb.Err and type(missing.value) is gb.NotFoundError
 
 
 def test_file_path_and_leader_helpers():
     group = gb.DisjointStorageMeshList(
         [
-            gb.OuterProductMesh(
+            gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(2)), gb.ArrangedMesh(gt.WorldSize(2))
             )
-        ],
-        ["b", "a"],
+        ]
     )
-    leader = gb.leader_tensor_component_pos_of(group)
+    # Row labels follow the layout table order. The leader is the smallest
+    # (row, column) cell; the caller supplies the table row labels.
+    leader = gb.leader_tensor_component_pos_of(group, ["b", "a"])
     assert leader == gb.TensorComponentPos("b", 0)
     pos = gb.TensorComponentPos("a", 1)
+    # A valid layout carries an entry for the queried component, and the
+    # public helper derives row labels from that layout.
+    a0 = gb.TensorComponentPos("a", 0)
     layout = gb.PhysicalLayoutTable(
-        "safetensors", {pos: group}, {leader: "model.safetensors"}
+        "safetensors",
+        {a0: group, pos: group},
+        {a0: "model.safetensors"},
     )
-    assert gb.file_path_of(layout, pos) == gt.Ok("model.safetensors")
+    assert gb.file_path_of(layout, pos) == gb.Ok("model.safetensors")
     missing = gb.file_path_of(layout, gb.TensorComponentPos("missing", 0))
-    assert type(missing) is gt.Err and type(missing.value) is gb.NotFoundError
+    assert type(missing) is gb.Err and type(missing.value) is gb.NotFoundError
 
 
 def test_meshes_and_type_aliases():
     mesh = gb.PermutedMesh(
         gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(4)), [2, 2]), [1, 0]
     )
-    assert type(mesh.check_constraints()) is gt.Ok
+    assert type(mesh.check_constraints()) is gb.Ok
     literal = gb.LiteralMesh([3, 1], gt.WorldSize(4))
     assert literal.get_ranks() == [3, 1]
-    assert type(literal.check_constraints()) is gt.Ok
+    assert type(literal.check_constraints()) is gb.Ok
     assert gb.ContainerFormat is str
     for alias in (
         gb.DTensorsView,
@@ -144,7 +149,7 @@ def test_session_and_accessor_interfaces_are_abstract():
 def test_bridge_plain_values_and_result_lookup():
     gd = gb.NaiveDTensor(
         gb.GlobalTensorMeta([2], "F32", 4),
-        [gt.Replicate()],
+        [gb.Replicate()],
         gb.ArrangedMesh(gt.WorldSize(1)),
     )
     view = gb.ComputeDTensorsView(
@@ -156,7 +161,7 @@ def test_bridge_plain_values_and_result_lookup():
     assert view.tensor_ids == ["w"]
     assert gdtensor.get_d_tensor(gd) is None
     result = gdtensor.get_gd_tensor(view, "w")
-    assert type(result) is gt.Ok and result.value is gd
+    assert type(result) is gb.Ok and result.value is gd
 
 
 def test_oneof_fields_can_be_cleared():
@@ -205,7 +210,7 @@ def test_compute_bridge_rejects_storage_views_and_tensors():
     with pytest.raises(ValueError, match="ComputeDTensorsView"):
         gdtensor.get_tensor_ids(view)
     result = gdtensor.get_gd_tensor(view, "w")
-    assert type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
+    assert type(result) is gb.Err and type(result.value) is gb.InvalidArgumentError
     tensor = view.d_tensor_table.named_d_tensors[0].d_tensor
     for value in (tensor, gb.ReshapedDTensor(tensor, [2, 4])):
         with pytest.raises(ValueError, match="ComputeMesh"):
@@ -218,13 +223,13 @@ def test_file_path_missing_leader_returns_the_documented_error():
     view = storage_view(Memory(range(8)), [])
     view.physical_layout.mutable_file_paths().clear()
     result = gb.file_path_of(view.physical_layout, gb.TensorComponentPos("w", 0))
-    assert type(result) is gt.Err and type(result.value) is gb.NotFoundError
+    assert type(result) is gb.Err and type(result.value) is gb.NotFoundError
     assert result.value.key_name == "file_paths" and result.value.msg
 
 
 def test_top_level_tensor_lookup_reports_missing_id_without_torch():
     result = gdtensor.get_gd_tensor(compute_view(Memory(range(8))), "missing")
-    assert type(result) is gt.Err and type(result.value) is gb.NotFoundError
+    assert type(result) is gb.Err and type(result.value) is gb.NotFoundError
     assert result.value.key_name == "tensor_id" and result.value.key == "missing"
 
 
@@ -240,7 +245,7 @@ def test_top_level_tensor_lookup_reports_missing_id_without_torch():
         "ReshapedMesh",
         "PermutedMesh",
         "SlicedMesh",
-        "OuterProductMesh",
+        "SlotOuterProductMesh",
     ],
 )
 def test_parameterized_products_preserve_annotation_arguments(name):

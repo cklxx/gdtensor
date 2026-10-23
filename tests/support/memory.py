@@ -15,7 +15,7 @@ class Memory(ga.DTensorDataAccessor):
 
     def _call(self, rng, callback):
         if self.error is not None:
-            return gt.Err(self.error)
+            return gb.Err(self.error)
         offset = (
             rng.global_tensor_offset
             if hasattr(rng, "global_tensor_offset")
@@ -39,19 +39,19 @@ class Save(gs.StorageSaveSession):
         self.init_error, self.commit_error = init_error, commit_error
 
     def get_file_offset(self, pos):
-        return gt.Ok(0)
+        return gb.Ok(0)
 
     def init_data_accessor(self):
         self.events.append("init_save")
-        return gt.Err(self.init_error) if self.init_error else gt.Ok(self.memory)
+        return gb.Err(self.init_error) if self.init_error else gb.Ok(self.memory)
 
     def commit(self):
         self.events.append("commit")
-        return gt.Err(self.commit_error) if self.commit_error else gt.Ok(None)
+        return gb.Err(self.commit_error) if self.commit_error else gb.Ok(None)
 
     def abort(self):
         self.events.append("abort")
-        return gt.Ok(None)
+        return gb.Ok(None)
 
 
 class Load(gs.StorageLoadSession):
@@ -60,21 +60,21 @@ class Load(gs.StorageLoadSession):
         self.init_error, self.finish_error = init_error, finish_error
 
     def get_file_offset(self, pos):
-        return gt.Ok(0)
+        return gb.Ok(0)
 
     def init_data_accessor(self):
         self.events.append("init_load")
-        return gt.Err(self.init_error) if self.init_error else gt.Ok(self.memory)
+        return gb.Err(self.init_error) if self.init_error else gb.Ok(self.memory)
 
     def finish(self):
         self.events.append("finish")
-        return gt.Err(self.finish_error) if self.finish_error else gt.Ok(None)
+        return gb.Err(self.finish_error) if self.finish_error else gb.Ok(None)
 
 
 def compute_view(memory):
     dt = gb.NaiveDTensor(
         gb.GlobalTensorMeta([8], "U8", 1),
-        [gt.Replicate()],
+        [gb.Replicate()],
         gb.ArrangedMesh(gt.WorldSize(1)),
     )
     return gb.ComputeDTensorsView(
@@ -85,28 +85,27 @@ def compute_view(memory):
 def storage_view(
     memory, events, *, init_error=None, commit_error=None, finish_error=None
 ):
-    mesh = gb.OuterProductMesh(
+    mesh = gb.SlotOuterProductMesh(
         gb.ArrangedMesh(gt.ConstantOne(1)), gb.ArrangedMesh(gt.WorldSize(1))
     )
-    dt = gb.NaiveDTensor(gb.GlobalTensorMeta([8], "U8", 1), [gt.Replicate()] * 2, mesh)
+    dt = gb.NaiveDTensor(gb.GlobalTensorMeta([8], "U8", 1), [gb.Replicate()] * 2, mesh)
     group = gb.DisjointStorageMeshList(
         [
-            gb.OuterProductMesh(
+            gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(1))
             )
-        ],
-        ["w"],
+        ]
     )
     pos = gb.TensorComponentPos("w", 0)
     layout = gb.PhysicalLayoutTable("safetensors", {pos: group}, {pos: "memory"})
 
     def begin_save(view, rank):
         events.append("begin_save")
-        return gt.Ok(Save(memory, events, init_error, commit_error))
+        return gb.Ok(Save(memory, events, init_error, commit_error))
 
     def begin_load(view, rank):
         events.append("begin_load")
-        return gt.Ok(Load(memory, events, init_error, finish_error))
+        return gb.Ok(Load(memory, events, init_error, finish_error))
 
     # Executors must use the accessor returned by the session.
     decoy = Memory([0] * 8, gb.GDTensorIOError(operation="decoy", msg="wrong accessor"))

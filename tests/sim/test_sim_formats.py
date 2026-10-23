@@ -7,10 +7,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
+import torch
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-import gdtensor.tag as gt
 from gdtensor_sim.coord import ThreadCoordinator
 from gdtensor_sim.formats import make_storage_view
 from gdtensor_sim.models import ParallelConfig, layout_builder, storage_table
@@ -32,8 +32,20 @@ def _storage(root, ct, p, kind, mode, fmt, *, save=False):
     return view
 
 
-@pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
-@pytest.mark.parametrize("field", ["dtype", "shape", "size"])
+@pytest.mark.parametrize(
+    "fmt,field",
+    [
+        ("safetensors", "dtype"),
+        ("safetensors", "shape"),
+        ("safetensors", "size"),
+        # Real torch DCP does not re-validate the stored dtype / element
+        # count; it trusts the caller's destination state dict. Exercise the
+        # corruptions it actually rejects instead.
+        ("distcp", "missing_metadata"),
+        ("distcp", "missing_tensor"),
+        ("distcp", "bigger_shape"),
+    ],
+)
 def test_format_load_rejects_checkpoint_metadata_mismatch(tmp_path, fmt, field):
     p = (1, 1, 1)
     ct, points, values = tensor_schema(p)
@@ -55,21 +67,35 @@ def test_format_load_rejects_checkpoint_metadata_mismatch(tmp_path, fmt, field):
         encoded = json.dumps(header).encode()
         encoded += b" " * (-len(encoded) % 8)
         path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + raw[8 + n :])
-    else:
+    elif field == "missing_metadata":
+        (tmp_path / ".metadata").unlink()
+    elif field == "missing_tensor":
+        import pickle
+
         path = tmp_path / ".metadata"
-        doc = json.loads(path.read_bytes())
-        if field == "dtype":
-            doc["tensors"][0]["dtype"] = "F64"
-        elif field == "shape":
-            doc["tensors"][0]["shape"] = list(reversed(doc["tensors"][0]["shape"]))
-        else:
-            doc["chunks"][0]["size"] -= 8
-        path.write_text(json.dumps(doc))
+        meta = pickle.loads(path.read_bytes())
+        tid = ct.named_d_tensors[0].global_tensor_id
+        del meta.state_dict_metadata[tid]
+        del meta.planner_data[tid]
+        meta.storage_data = {
+            index: info for index, info in meta.storage_data.items() if index.fqn != tid
+        }
+        path.write_bytes(pickle.dumps(meta))
+    else:  # bigger_shape: demand more elements than the checkpoint stored
+        import pickle
+
+        path = tmp_path / ".metadata"
+        meta = pickle.loads(path.read_bytes())
+        tid = ct.named_d_tensors[0].global_tensor_id
+        tsm = meta.state_dict_metadata[tid]
+        tsm.size = torch.Size(list(tsm.size[:-1]) + [tsm.size[-1] + 4])
+        tsm.chunks[0].sizes = tsm.size
+        path.write_bytes(pickle.dumps(meta))
     destination = ArrayFabric(ct, points)
     result = gio.rank_load(
         0, destination.view(0), _storage(tmp_path, ct, p, "single", "hf", fmt)
     )
-    assert type(result) is gt.Err and type(result.value) is gb.GDTensorIOError, result
+    assert type(result) is gb.Err and type(result.value) is gb.GDTensorIOError, result
     for buf in destination.buffers[0].values():
         assert np.all(buf == 0xA5)
 
@@ -120,7 +146,7 @@ def test_format_save_publish_failure_reaches_all_ranks(tmp_path, monkeypatch, fm
             )
         )
     assert all(
-        type(r) is gt.Err and type(r.value) is gb.GDTensorIOError for r in results
+        type(r) is gb.Err and type(r.value) is gb.GDTensorIOError for r in results
     ), results
     assert not (tmp_path / ".metadata").exists()
     assert not (tmp_path / "model.safetensors.index.json").exists()
@@ -134,13 +160,13 @@ def test_save_session_rejects_calls_after_terminal_state(tmp_path, fmt, terminal
     view = _storage(tmp_path, table, p, "single", "hf", fmt)
     assert view.begin_save is not None
     opened = view.begin_save(view, 0)
-    assert type(opened) is gt.Ok, opened
+    assert type(opened) is gb.Ok, opened
     session = opened.value
     pos = gb.TensorComponentPos("matrix", 0)
     offset = session.get_file_offset(pos)
-    assert type(offset) is gt.Ok and offset.value >= 0
-    assert type(session.init_data_accessor()) is gt.Ok
-    assert type(getattr(session, terminal)()) is gt.Ok
+    assert type(offset) is gb.Ok and offset.value >= 0
+    assert type(session.init_data_accessor()) is gb.Ok
+    assert type(getattr(session, terminal)()) is gb.Ok
     for call in (
         lambda: session.get_file_offset(pos),
         session.init_data_accessor,
@@ -149,7 +175,7 @@ def test_save_session_rejects_calls_after_terminal_state(tmp_path, fmt, terminal
     ):
         result = call()
         assert (
-            type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
+            type(result) is gb.Err and type(result.value) is gb.InvalidArgumentError
         ), result
 
 
@@ -162,12 +188,12 @@ def test_load_session_rejects_calls_after_finish(tmp_path, fmt):
     run_ranks(1, lambda rank: gio.rank_save(rank, source.view(rank), view))
     assert view.begin_load is not None
     opened = view.begin_load(view, 0)
-    assert type(opened) is gt.Ok, opened
+    assert type(opened) is gb.Ok, opened
     session = opened.value
     pos = gb.TensorComponentPos("matrix", 0)
-    assert type(session.get_file_offset(pos)) is gt.Ok
-    assert type(session.init_data_accessor()) is gt.Ok
-    assert type(session.finish()) is gt.Ok
+    assert type(session.get_file_offset(pos)) is gb.Ok
+    assert type(session.init_data_accessor()) is gb.Ok
+    assert type(session.finish()) is gb.Ok
     for call in (
         lambda: session.get_file_offset(pos),
         session.init_data_accessor,
@@ -175,5 +201,5 @@ def test_load_session_rejects_calls_after_finish(tmp_path, fmt):
     ):
         result = call()
         assert (
-            type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
+            type(result) is gb.Err and type(result.value) is gb.InvalidArgumentError
         ), result

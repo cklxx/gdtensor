@@ -43,9 +43,9 @@ from .layout import (
 from .mesh import storage_mesh_cells
 from .ranges import CopyPlan, DTensorRange, RangeFromComputeView, RangeFromStorageView
 from .result import catch, check_failed, invalid
-from .views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
+from .views import ComputeDTensorsView, StorageDTensorsView
 from .. import Result
-from ..tag import Ok
+from .products import Ok
 
 
 def is_compute(r) -> bool:
@@ -202,7 +202,9 @@ def _check_same_tensors(a, b) -> None:
 
 @catch
 def d_tensors_view_rank_plan_save(
-    rank: int, compute_view: ComputeDTensorsView, storage_view: StorageDTensorsView
+    rank: int,
+    compute_view: ComputeDTensorsView,
+    storage_view: StorageDTensorsView,
 ) -> Result[CopyPlan]:
     _check_same_tensors(compute_view, storage_view)
     c, s = _Side(compute_view), _Side(storage_view)
@@ -221,26 +223,15 @@ def d_tensors_view_rank_plan_save(
 
 @catch
 def d_tensors_view_rank_plan_load(
-    rank: int, compute_view: ComputeDTensorsView, storage_view: StorageDTensorsView
+    rank: int,
+    compute_view: ComputeDTensorsView,
+    storage_view: StorageDTensorsView,
 ) -> Result[CopyPlan]:
     _check_same_tensors(compute_view, storage_view)
     c, s = _Side(compute_view), _Side(storage_view)
     plan: CopyPlan = []
     for tid in compute_view.tensor_ids:
         plan.extend(_pair(c.dst_intervals(tid, rank), s.src_candidates(tid, rank)))
-    return Ok(plan)
-
-
-@catch
-def d_tensors_view_rank_plan_reshard(
-    rank: int, src_view: DTensorsView, dst_view: DTensorsView
-) -> Result[CopyPlan]:
-    # Assert[tensor_ids equal and global_tensor_meta equal]
-    _check_same_tensors(src_view, dst_view)
-    src, dst = _Side(src_view), _Side(dst_view)
-    plan: CopyPlan = []
-    for tid in dst_view.tensor_ids:
-        plan.extend(_pair(dst.dst_intervals(tid, rank), src.src_candidates(tid, rank)))
     return Ok(plan)
 
 
@@ -261,7 +252,7 @@ def _ranges(plan: CopyPlan, pred) -> List[DTensorRange]:
 # also enforce the per-rank safety properties itself: aggregate/union checks
 # cannot see a rank that silently copied half of its shard (another rank's
 # bytes would still make the union look full). The guards below run on one
-# rank's plan in rank_save / rank_load / rank_reshard, before any session is
+# rank's plan in rank_save / rank_load / rank_chain_load, before any session is
 # opened, so a malformed plan never reaches the accessors.
 
 CHECK = "runtime_plan_check"
@@ -402,20 +393,6 @@ def validate_rank_load(rank: int, compute_view, storage_view, plan: CopyPlan) ->
             raise check_failed(
                 CHECK, f"storage {path}: read range outside [0, {total})"
             )
-
-
-def validate_rank_reshard(rank: int, src_view, dst_view, plan: CopyPlan) -> None:
-    # Destination coverage when it is compute; destination disjointness
-    # when it is storage. Source ranges are bounds-checked.
-    if type(dst_view) is ComputeDTensorsView:
-        if type(src_view) is StorageDTensorsView:
-            validate_rank_load(rank, dst_view, src_view, plan)
-        else:
-            _validate_compute_to_compute(rank, dst_view, plan)
-    else:
-        _validate_storage_destination(dst_view, plan)
-        if type(src_view) is StorageDTensorsView:
-            _validate_storage_source(src_view, plan)
 
 
 def _validate_compute_to_compute(rank: int, compute_view, plan: CopyPlan) -> None:
@@ -608,4 +585,33 @@ def check_storage_mesh_disjoint(lhs, rhs) -> Result[None]:
             "check_storage_mesh_disjoint",
             f"storage meshes overlap at {sorted(both)[:4]}",
         )
+    return Ok(None)
+
+
+# ------------------------------------------------- B.1.3 cache checks
+
+
+@catch
+def check_cache_d_tensors_access_disjoint(
+    d_tensor_table: DTensorTable, copy_plan: CopyPlan
+) -> Result[None]:
+    check = "check_cache_d_tensors_access_disjoint"
+    for tid, iv in _compute_by_tensor(d_tensor_table, copy_plan, check).items():
+        _assert_disjoint(iv, f"cache {tid}", check)
+    return Ok(None)
+
+
+@catch
+def check_cache_d_tensors_access_full_covering(
+    d_tensor_table: DTensorTable, copy_plan: CopyPlan
+) -> Result[None]:
+    check = "check_cache_d_tensors_access_full_covering"
+    by_t = _compute_by_tensor(d_tensor_table, copy_plan, check)
+    totals = {
+        nd.global_tensor_id: nbytes_of(global_tensor_meta_of(nd))
+        for nd in d_tensor_table.named_d_tensors
+    }
+    for tid in by_t:
+        if tid not in totals:
+            raise check_failed(check, f"cache range on unknown tensor {tid}")
     return Ok(None)

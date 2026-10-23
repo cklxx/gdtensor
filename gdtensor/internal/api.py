@@ -8,17 +8,15 @@ import logging
 
 from .plan import (
     d_tensors_view_rank_plan_load,
-    d_tensors_view_rank_plan_reshard,
     d_tensors_view_rank_plan_save,
     validate_rank_load,
-    validate_rank_reshard,
     validate_rank_save,
 )
 from .ranges import CopyPlan
 from .result import catch, invalid, must_ok
-from .views import ComputeDTensorsView, DTensorsView, StorageDTensorsView
+from .views import ComputeDTensorsView, StorageDTensorsView
 from .. import Result
-from ..tag import Ok
+from .products import Ok
 
 
 _LOG = logging.getLogger(__name__)
@@ -140,38 +138,106 @@ def d_tensors_view_rank_load(
     _LOG.info("load rank=%d phase=finished", rank)
 
 
+# ---------------------------------------------------------------- B.1.1 chain load
+
+
+def _finish_chain_sessions(opened):
+    """finish load sessions; keep and return the first error."""
+    primary = None
+    for session in reversed(opened):
+        primary = _finish_one_session(session, primary)
+    return primary
+
+
+def _finish_one_session(session, primary):
+    try:
+        must_ok(session.finish())
+    except BaseException as exc:
+        if primary is None:
+            return exc
+    return primary
+
+
+def _collect_concrete_chains(read_chain, plan_chain, legs_for):
+    """(read chain, plan chain, legs) tuples in data-flow order."""
+    from .chain import (
+        DirectDTensorsReadChain,
+        MixedDTensorsReadChain,
+        OneLayerCachedDTensorsReadChain,
+        TwoLayerCachedDTensorsReadChain,
+    )
+
+    t = type(read_chain)
+    if t in (
+        DirectDTensorsReadChain,
+        OneLayerCachedDTensorsReadChain,
+        TwoLayerCachedDTensorsReadChain,
+    ):
+        return [(read_chain, plan_chain, legs_for(read_chain))]
+    if t is MixedDTensorsReadChain:
+        return [
+            (seg.read_chain, seg_pc, legs_for(seg.read_chain))
+            for seg, seg_pc in zip(
+                read_chain.disjoint_tensor_ids_and_read_chain_list,
+                plan_chain.disjoint_tensor_ids_and_copy_plan_chain_list,
+            )
+        ]
+    raise invalid("read_chain", f"unknown read chain type {t.__name__}")
+
+
+def _run_concrete_chain(rank, chain, pc, legs) -> None:
+    """Open the src storage session once and execute every leg in order."""
+    storage = chain.src
+    assert type(storage) is StorageDTensorsView
+    _LOG.info("chain_load rank=%d phase=begin", rank)
+    session = must_ok(storage.begin_load(storage, rank))
+    storage_session_view = _session_view(storage, session)
+    try:
+        _execute_chain_legs(pc, legs, storage, storage_session_view)
+    except BaseException:
+        primary = _finish_chain_sessions([session])
+        if primary is not None:
+            raise primary from None
+        raise
+    primary = _finish_chain_sessions([session])
+    if primary is not None:
+        raise primary
+    _LOG.info("chain_load rank=%d phase=finished", rank)
+
+
+def _execute_chain_legs(pc, legs, storage, storage_session_view) -> None:
+    leg_plans = _chain_plans(pc)
+    for (src, dst), plan in zip(legs, leg_plans):
+        eff_src = storage_session_view if src is storage else src
+        _copy(plan, eff_src, dst)
+
+
 @catch
-def d_tensors_view_rank_reshard(
-    rank: int, src_view: DTensorsView, dst_view: DTensorsView
-) -> Result[None]:
-    if type(src_view) not in (ComputeDTensorsView, StorageDTensorsView) or type(
-        dst_view
-    ) not in (ComputeDTensorsView, StorageDTensorsView):
-        raise invalid("views", "rank_reshard requires two DTensorsView values")
-    plan = must_ok(d_tensors_view_rank_plan_reshard(rank, src_view, dst_view))
-    validate_rank_reshard(rank, src_view, dst_view, plan)
-    _log_plan("reshard", rank, plan)
-    src_session = dst_session = None
-    try:
-        if type(src_view) is StorageDTensorsView:
-            assert src_view.begin_load is not None
-            src_session = must_ok(src_view.begin_load(src_view, rank))
-            src_view = _session_view(src_view, src_session)
-        if type(dst_view) is StorageDTensorsView:
-            assert dst_view.begin_save is not None
-            dst_session = must_ok(dst_view.begin_save(dst_view, rank))
-            dst_view = _session_view(dst_view, dst_session)
-        _copy(plan, src_view, dst_view)
-    except BaseException:
-        _cleanup(dst_session, "abort")
-        _cleanup(src_session, "finish")
-        raise
-    try:
-        if dst_session is not None:
-            must_ok(dst_session.commit())
-    except BaseException:
-        _cleanup(src_session, "finish")
-        raise
-    if src_session is not None:
-        must_ok(src_session.finish())
-    _LOG.info("reshard rank=%d phase=finished", rank)
+def d_tensors_view_rank_chain_load(rank: int, read_chain) -> Result[None]:
+    from .chain import d_tensors_view_rank_plan_chain_load, legs_of
+
+    plan_chain = must_ok(d_tensors_view_rank_plan_chain_load(rank, read_chain))
+    chains = _collect_concrete_chains(read_chain, plan_chain, legs_of)
+    for chain, pc, legs in chains:
+        _run_concrete_chain(rank, chain, pc, legs)
+
+
+def _chain_plans(plan_chain):
+    from .chain import (
+        DirectCopyPlanChain,
+        OneLayerCachedCopyPlanChain,
+        TwoLayerCachedCopyPlanChain,
+    )
+
+    t = type(plan_chain)
+    if t is DirectCopyPlanChain:
+        return [plan_chain.src_to_dst]
+    if t is OneLayerCachedCopyPlanChain:
+        return [plan_chain.src_to_cache, plan_chain.cache_to_dst]
+    if t is TwoLayerCachedCopyPlanChain:
+        return [
+            plan_chain.src_to_small_cache,
+            plan_chain.small_cache_to_big_cache,
+            plan_chain.big_cache_to_dst,
+        ]
+    raise invalid("copy_plan_chain", f"unknown plan chain type {t.__name__}")

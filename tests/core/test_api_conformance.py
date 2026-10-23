@@ -28,6 +28,7 @@ PRODUCT_FIELDS = {
     "DTensorsViewMapCore": (
         "convert_each_compute_view",
         "convert_each_storage_view",
+        "convert_each_cache_view",
         "convert_each_storage_load_session",
         "convert_each_storage_save_session",
     ),
@@ -36,7 +37,7 @@ PRODUCT_FIELDS = {
     "NaiveDTensor": ("global_tensor_meta", "placements", "mesh", "torch_d_tensor"),
     "ReshapedDTensor": ("underlying_d_tensor", "shape"),
     "GlobalTensorMeta": ("global_shape", "dtype", "itemsize"),
-    "OuterProductMesh": ("tensor_slots", "content_slots"),
+    "SlotOuterProductMesh": ("tensor_slots", "content_slots"),
     "LiteralMesh": ("ranks", "max"),
     "ArrangedMesh": ("size",),
     "ReshapedMesh": ("underlying_mesh", "shape"),
@@ -44,7 +45,7 @@ PRODUCT_FIELDS = {
     "SlicedMesh": ("underlying_mesh", "slices"),
     "Slice": ("start", "stop", "step"),
     "PhysicalLayoutTable": ("container_format", "tensor_entries", "file_paths"),
-    "DisjointStorageMeshList": ("disjoint_storage_mesh_list", "tensor_ids"),
+    "DisjointStorageMeshList": ("disjoint_storage_mesh_list",),
     "TensorComponentPos": ("tensor_id", "rank"),
     "ConstraintViolationError": ("type_name", "constraint_name", "msg"),
     "CheckFailedError": ("check_name", "msg"),
@@ -153,14 +154,30 @@ def test_products_mixins_and_factories(name, fields):
         ("gdtensor.reset_d_tensor", ["gd_tensor", "d_tensor"]),
         ("gdtensor.io.rank_save", ["rank", "compute_view", "storage_view"]),
         ("gdtensor.io.rank_load", ["rank", "compute_view", "storage_view"]),
-        ("gdtensor.io.rank_reshard", ["rank", "src_view", "dst_view"]),
+        ("gdtensor.io.chain_load", ["rank", "read_chain"]),
+        (
+            "gdtensor.io.chain_stat_mem_overhead",
+            ["read_chain"],
+        ),
+        (
+            "gdtensor.io.chain_stat_outbound_traffic",
+            ["read_chain"],
+        ),
+        (
+            "gdtensor.io.chain_stat_inbound_traffic",
+            ["read_chain"],
+        ),
+        ("gdtensor.get_chain_tensor_ids", ["read_chain"]),
         ("gdtensor.builder.d_tensors_view_map", ["origin", "map_core"]),
         ("gdtensor.builder.global_tensor_meta_of", ["named_d_tensor"]),
         ("gdtensor.builder.tensor_order_value_of", ["d_tensor_table", "tensor_id"]),
-        ("gdtensor.builder.file_path_of", ["physical_layout", "pos"]),
+        (
+            "gdtensor.builder.file_path_of",
+            ["physical_layout", "pos", "tensor_ids"],
+        ),
         (
             "gdtensor.builder.leader_tensor_component_pos_of",
-            ["disjoint_storage_meshes"],
+            ["disjoint_storage_meshes", "tensor_ids"],
         ),
     ],
 )
@@ -182,14 +199,18 @@ def test_internal_plan_and_check_declarations_match_design_without_importing_the
         name: (re.findall(r"^  <- \$(\w+) ", args, re.MULTILINE), result)
         for name, result, args in declarations
     }
-    tree = ast.parse((ROOT / "gdtensor" / "internal" / "plan.py").read_text())
-    functions = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name.startswith(("d_tensors_view_rank_plan_", "check_"))
-    }
-    assert len(expected) == 8 and functions.keys() == expected.keys()
+    functions = {}
+    for rel in ("gdtensor/internal/plan.py", "gdtensor/internal/chain.py"):
+        tree = ast.parse((ROOT / rel).read_text())
+        functions.update(
+            {
+                node.name: node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name.startswith(("d_tensors_view_rank_plan_", "check_"))
+            }
+        )
+    assert len(expected) == 10 and functions.keys() == expected.keys()
     for name, node in functions.items():
         parameters, result = expected[name]
         assert [arg.arg for arg in node.args.args] == parameters
@@ -205,13 +226,27 @@ def test_type_aliases_and_namespace_separation():
         "ComputeMesh",
         "StorageMesh",
         "ContentSlotsMesh",
+        "CacheMesh",
+        "ConcreteDTensorsReadChain",
     ):
         assert isinstance(getattr(builder, name), types.UnionType)
         assert not hasattr(builder, name + "BuilderMixin")
     assert isinstance(gdtensor.Error, types.UnionType)
     assert not hasattr(builder, "Error")
-    for name in ("Ok", "Err"):
-        assert hasattr(tag, name) and not hasattr(gdtensor, name)
+    # B.2.4.7 / B.3.4: Ok / Err / Shard / Replicate / Partial are concrete
+    # products in gdtensor.builder; tag only keeps the six scalar markers.
+    for name in ("Ok", "Err", "Shard", "Replicate", "Partial"):
+        assert hasattr(builder, name) and not hasattr(gdtensor, name)
+        assert not hasattr(tag, name)
+    for name in (
+        "ConstantOne",
+        "TensorCount",
+        "WorldSize",
+        "NumSteps",
+        "NumNodes",
+        "ConcurrencyWidth",
+    ):
+        assert hasattr(tag, name) and not hasattr(builder, name)
     for name in (
         "get_tensor_ids",
         "get_gd_tensor",

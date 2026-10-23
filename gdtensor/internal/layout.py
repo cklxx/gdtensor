@@ -42,7 +42,7 @@ TensorComponentPosBuilderMixin = make_builder_mixin(
 )
 DisjointStorageMeshListBuilderMixin = make_builder_mixin(
     "DisjointStorageMeshList",
-    [("disjoint_storage_mesh_list", "list"), ("tensor_ids", "list")],
+    [("disjoint_storage_mesh_list", "list")],
 )
 PhysicalLayoutTableBuilderMixin = make_builder_mixin(
     "PhysicalLayoutTable",
@@ -71,13 +71,10 @@ def pos_key(pos: TensorComponentPos) -> Tuple[str, int]:
 @dataclass(eq=True)
 class DisjointStorageMeshList(DisjointStorageMeshListBuilderMixin):
     disjoint_storage_mesh_list: List[Any] = field(default_factory=list)
-    # Row labels supplied by the business constructor in table order.
-    tensor_ids: List[str] = field(default_factory=list)
     __hash__ = field_hash
 
     def __post_init__(self) -> None:
         self.disjoint_storage_mesh_list = list(self.disjoint_storage_mesh_list)
-        self.tensor_ids = list(self.tensor_ids)
 
     def check_constraints(self):
         return _cc(self)
@@ -102,15 +99,22 @@ def list_cells(lst: DisjointStorageMeshList) -> List[Tuple[int, int]]:
 
 def leader_tensor_component_pos_of(
     disjoint_storage_meshes: DisjointStorageMeshList,
+    tensor_ids: List[str] | None = None,
 ) -> TensorComponentPos:
-    """Canonical key: the smallest (row, column) cell."""
+    """Canonical key: the smallest (row, column) cell.
+
+    ``tensor_ids`` maps tensor-slot rows to tensor ids in header order.
+    Without it positional row labels are used; internal plan layers always
+    supply the table ids so layouts are validated lazily per file.
+    """
     cells = list_cells(disjoint_storage_meshes)
     if not cells:
         raise invalid(
             "disjoint_storage_meshes", "empty DisjointStorageMeshList has no leader"
         )
     t, w = cells[0]
-    return TensorComponentPos(disjoint_storage_meshes.tensor_ids[t], w)
+    label = tensor_ids[t] if tensor_ids is not None else f"tensor_{t}"
+    return TensorComponentPos(label, w)
 
 
 @dataclass(eq=True)
@@ -127,19 +131,43 @@ class PhysicalLayoutTable(PhysicalLayoutTableBuilderMixin):
 
 
 @catch
-def file_path_of(physical_layout: PhysicalLayoutTable, pos: TensorComponentPos) -> str:
-    """tensor_entries[pos] -> list -> leader -> file_paths."""
+def file_path_of(
+    physical_layout: PhysicalLayoutTable,
+    pos: TensorComponentPos,
+    tensor_ids: List[str] | None = None,
+) -> str:
+    """tensor_entries[pos] -> list -> that list's unique file path.
+
+    Each physical list has exactly one ``file_paths`` key sitting on one of
+    its own component positions. Resolving by list identity avoids remapping
+    positional tensor rows to ids, which needs DTensorTable header order that
+    the layout alone does not carry.
+    """
     lst = physical_layout.tensor_entries.get(pos)
     if lst is None:
         raise not_found(
             "tensor_entries", pos_key(pos), f"{pos_key(pos)} has no physical file"
         )
-    leader = leader_tensor_component_pos_of(lst)
-    if leader not in physical_layout.file_paths:
-        raise not_found(
-            "file_paths", pos_key(leader), f"leader {pos_key(leader)} has no file path"
-        )
-    return physical_layout.file_paths[leader]
+    for key, path in physical_layout.file_paths.items():
+        if physical_layout.tensor_entries.get(key) is lst:
+            return path
+    raise not_found(
+        "file_paths", pos_key(pos), f"{pos_key(pos)} list has no file path"
+    )
+
+
+def _layout_tensor_ids(layout: PhysicalLayoutTable) -> List[str]:
+    """Header-order tensor ids: first-appearance order in tensor_entries.
+
+    Business code populates ``tensor_entries`` in DTensorTable (header) order,
+    so the layout alone recovers the positional row labels without sorting
+    alphabetically or taking a tensor_ids argument.
+    """
+    ids: List[str] = []
+    for pos in layout.tensor_entries:
+        if pos.tensor_id not in ids:
+            ids.append(pos.tensor_id)
+    return ids
 
 
 # ------------------------------------------------------------- payload maps (internal)
@@ -188,15 +216,17 @@ def nonempty_columns(nd: NamedDTensor) -> Dict[int, np.ndarray]:
 
 def unique_lists(
     layout: PhysicalLayoutTable,
+    tensor_ids: List[str] | None = None,
 ) -> Dict[TensorComponentPos, DisjointStorageMeshList]:
     """leader -> list, in a deterministic order."""
     lists: Dict[TensorComponentPos, DisjointStorageMeshList] = {}
     seen = set()
+    labels = tensor_ids if tensor_ids is not None else _layout_tensor_ids(layout)
     for lst in layout.tensor_entries.values():
         if id(lst) in seen:
             continue
         seen.add(id(lst))
-        leader = leader_tensor_component_pos_of(lst)
+        leader = leader_tensor_component_pos_of(lst, labels)
         if leader in lists and lists[leader] != lst:
             raise invalid("tensor_entries", "different physical lists share a leader")
         lists.setdefault(leader, lst)
@@ -216,13 +246,8 @@ def build_payload_index(
     files: Dict[str, FilePayload] = {}
     slots: Dict[TensorComponentPos, Tuple[str, SlotPayload]] = {}
     cols_by_row = [nonempty_columns(nd) for nd in table.named_d_tensors]
-    expected_ids = tensor_ids_of(table)
-    for meshes in layout.tensor_entries.values():
-        if meshes.tensor_ids != expected_ids:
-            raise invalid(
-                "tensor_ids", "physical list row labels differ from table order"
-            )
-    lists = unique_lists(layout)
+    table_ids = tensor_ids_of(table)
+    lists = unique_lists(layout, table_ids)
     for leader, lst in sorted(
         lists.items(), key=lambda kv: layout.file_paths.get(kv[0], "")
     ):

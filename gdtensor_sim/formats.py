@@ -535,9 +535,15 @@ def make_storage_view(
     root: str,
     io: Optional[FileIO] = None,
     coord=None,
+    dcp_mode: str = "thread",
 ):
-    """Business constructor: a StorageDTensorsView over files in ``root``."""
+    """Business constructor: a StorageDTensorsView over files in ``root``.
+
+    ``dcp_mode`` selects the real-DCP simulation backend: "thread" assembles
+    in shared process memory; "process" uses per-slot files under a stage dir.
+    """
     from .access import StorageDataAccessor
+    from .dcp_backend import DcpLoadSession, DcpSaveSession
     from gdtensor.builder import StorageDTensorsView
 
     io = io or FileIO()
@@ -545,30 +551,44 @@ def make_storage_view(
     fmt = layout.container_format
     if fmt not in ("safetensors", "distcp"):
         raise invalid("container_format", f"unknown container_format {fmt!r}")
-    save_cls = {"safetensors": SafeTensorsSaveSession, "distcp": DcpSaveSession}[fmt]
-    load_cls = {"safetensors": SafeTensorsLoadSession, "distcp": DcpLoadSession}[fmt]
+    save_cls = {"safetensors": SafeTensorsSaveSession}
+    load_cls = {"safetensors": SafeTensorsLoadSession}
 
-    @catch
-    def begin_save(view, rank: int):
-        return save_cls(
-            rank,
-            root,
-            view.d_tensor_table,
-            view.physical_layout,
-            index,
-            io,
-            coord=coord,
-        )
-
-    @catch
-    def begin_load(view, rank: int):
+    def _open_session(cls, view, rank, **kwargs):
         try:
-            return load_cls(
-                rank, root, view.d_tensor_table, view.physical_layout, index, io
+            return cls(
+                rank,
+                root,
+                view.d_tensor_table,
+                view.physical_layout,
+                index,
+                io,
+                **kwargs,
             )
         except BaseException:
             io.fds.close_rank(rank, root)
             raise
+
+    @catch
+    def begin_save(view, rank: int):
+        if fmt == "distcp":
+            return DcpSaveSession(
+                rank,
+                root,
+                view.d_tensor_table,
+                view.physical_layout,
+                index,
+                io=io,
+                coord=coord,
+                mode=dcp_mode,
+            )
+        return _open_session(save_cls["safetensors"], view, rank, coord=coord)
+
+    @catch
+    def begin_load(view, rank: int):
+        if fmt == "distcp":
+            return _open_session(DcpLoadSession, view, rank)
+        return _open_session(load_cls["safetensors"], view, rank)
 
     accessor = StorageDataAccessor(index=index, io=io)
     return StorageDTensorsView(

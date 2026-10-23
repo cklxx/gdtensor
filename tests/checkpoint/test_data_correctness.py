@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import gdtensor.io as gio
+from tests.support.compat import rank_reshard
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import (
     DST,
@@ -45,7 +46,7 @@ def test_io_arange_crc_elastic_and_reshard(tmp_path, fmt, kind, mode):
         )
         run_ranks(
             int(np.prod(DST)),
-            lambda r: gio.rank_reshard(r, src(r), destination.view(r)),
+            lambda r: rank_reshard(r, src(r), destination.view(r)),
         )
         destination.assert_values(values)
 
@@ -61,7 +62,7 @@ def test_io_arange_crc_elastic_and_reshard(tmp_path, fmt, kind, mode):
             if branch == "compute"
             else read_view
         )
-        run_ranks(int(np.prod(DST)), lambda r: gio.rank_reshard(r, src(r), dst))
+        run_ranks(int(np.prod(DST)), lambda r: rank_reshard(r, src(r), dst))
         verify_crc(out, output_fmt, target, DST, "mirror", values)
         back = ArrayFabric(ct, points)
         output = storage_view(out, target, DST, "per_rank", "mirror", output_fmt)
@@ -121,7 +122,7 @@ def test_many_ranks_many_tensors(tmp_path, fmt, src_p, dst_p, tensor_count, kind
     resharded = ArrayFabric(target, target_points)
     run_ranks(
         int(np.prod(dst_p)),
-        lambda r: gio.rank_reshard(
+        lambda r: rank_reshard(
             r, source.view(r, allow_remote_reads=True), resharded.view(r)
         ),
     )

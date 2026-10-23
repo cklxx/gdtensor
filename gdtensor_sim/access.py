@@ -5,7 +5,7 @@ import numpy as np
 from gdtensor.access import DTensorDataAccessor
 from ._layout import PayloadIndex
 from ._result import Fail, catch, invalid, io_error
-from gdtensor.tag import Err, Ok
+from gdtensor.builder import Err, Ok
 from .iobackend import FileIO
 
 

@@ -1,7 +1,10 @@
-"""gdtensor.tag: tag classes (design C.2 / C.3).
+"""gdtensor.tag: named scalar tags (design C.2).
 
-Each tag is a Box subclass made by make_box_subclass, one line per tag. The
-payload is ``value``. Discriminate with ``type(x) is tag.Shard``.
+Only ``tagged[...]`` scalar markers live here:
+``ConstantOne``, ``TensorCount``, ``WorldSize``, ``NumSteps``, ``NumNodes``,
+``ConcurrencyWidth``. Mesh oneof branches carry no tag, so the branch product
+types (``Shard`` / ``Replicate`` / ``Partial``) and the Result branches
+(``Ok`` / ``Err``) are products in ``gdtensor.builder``, not tags.
 """
 
 import types as _types
@@ -10,19 +13,17 @@ from typing import Any as _Any
 __all__ = [
     "Box",
     "make_box_subclass",
-    "Ok",
-    "Err",
-    "Shard",
-    "Replicate",
-    "Partial",
     "ConstantOne",
     "TensorCount",
     "WorldSize",
+    "NumSteps",
+    "NumNodes",
+    "ConcurrencyWidth",
 ]
 
 
 class Box:
-    # A tag: the tag is the class itself, the payload hangs on value.
+    # A named scalar tag: the tag is the class itself, the payload is value.
     __slots__ = ("value",)
     __match_args__ = ("value",)
 
@@ -33,8 +34,6 @@ class Box:
         args = item if isinstance(item, tuple) else (item,)
         return _types.GenericAlias(cls, args)
 
-    # Product types compare and hash by field (C.2), and a field may hold a
-    # tag, so a tag compares and hashes by (class, value).
     def __eq__(self, other):
         return type(self) is type(other) and self.value == other.value
 
@@ -49,11 +48,10 @@ def make_box_subclass(name) -> _Any:
     return type(name, (Box,), {"__module__": __name__, "__slots__": ()})
 
 
-Ok = make_box_subclass("Ok")
-Err = make_box_subclass("Err")
-Shard = make_box_subclass("Shard")
-Replicate = make_box_subclass("Replicate")
-Partial = make_box_subclass("Partial")
 ConstantOne = make_box_subclass("ConstantOne")
 TensorCount = make_box_subclass("TensorCount")
 WorldSize = make_box_subclass("WorldSize")
+
+NumSteps = make_box_subclass("NumSteps")
+NumNodes = make_box_subclass("NumNodes")
+ConcurrencyWidth = make_box_subclass("ConcurrencyWidth")

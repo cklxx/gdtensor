@@ -25,7 +25,7 @@ import numpy as np
 from .builder_mixin import field_hash, make_builder_mixin
 from .mesh import mesh_coords, resolve_compute_mesh, resolve_storage_mesh
 from .result import Fail, catch, invalid, not_found
-from ..tag import Partial, Replicate, Shard
+from .products import Partial, Replicate, Shard
 
 
 def _cc(self):
@@ -356,7 +356,7 @@ def box_of(
             raise invalid("placements", "Partial placement is not persistable")
         if type(p) is not Shard:
             continue
-        axis = p.value
+        axis = p.axis
         if not 0 <= axis < len(shape):
             raise invalid(
                 "placements", f"Shard axis {axis} out of range for shape {shape}"

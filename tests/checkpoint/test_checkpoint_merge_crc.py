@@ -23,7 +23,7 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-import gdtensor.tag as gt
+from tests.support.compat import rank_reshard
 from tests.support.checkpoint import file_bytes, small_schema
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import payload_regions, run_ranks, storage_view, verify_crc
@@ -74,7 +74,7 @@ def _assert_rank_multifile(view):
     by_rank, by_tensor = {}, {}
     for pos in view.physical_layout.tensor_entries:
         result = gb.file_path_of(view.physical_layout, pos)
-        assert type(result) is gt.Ok, result
+        assert type(result) is gb.Ok, result
         by_rank.setdefault(pos.rank, set()).add(result.value)
         by_tensor.setdefault(pos.tensor_id, set()).add(result.value)
     assert any(len(paths) > 1 for paths in by_rank.values())
@@ -88,7 +88,7 @@ def _load_repacked(root, fmt, source, table, points, parallel, values):
     )
     destination = storage_view(root, table, parallel, "hf", "hf", fmt, save=True)
     run_ranks(
-        int(np.prod(parallel)), lambda rank: gio.rank_reshard(rank, source, destination)
+        int(np.prod(parallel)), lambda rank: rank_reshard(rank, source, destination)
     )
     _check_files("REPACK_CHECKPOINT", root, fmt, table, parallel, "hf", values)
     loaded = ArrayFabric(table, points)
@@ -145,9 +145,7 @@ def _consolidate(root, fmt, source, parallel, table, points, values):
         flush=True,
     )
     target = storage_view(root, table, parallel, "single", "hf", fmt, save=True)
-    run_ranks(
-        int(np.prod(parallel)), lambda rank: gio.rank_reshard(rank, source, target)
-    )
+    run_ranks(int(np.prod(parallel)), lambda rank: rank_reshard(rank, source, target))
     _check_files(
         "CONSOLIDATE_FILES",
         root,

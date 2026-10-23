@@ -74,4 +74,29 @@ class StorageDTensorsView(StorageDTensorsViewBuilderMixin):
         return check_constraints(self)
 
 
-DTensorsView = ComputeDTensorsView | StorageDTensorsView
+# ===================================================================== cache
+
+
+CacheDTensorsViewBuilderMixin = make_builder_mixin(
+    "CacheDTensorsView",
+    [("tensor_ids", "list"), ("d_tensor_table", "object"), ("data_accessor", "scalar")],
+)
+
+
+@dataclass(eq=True)
+class CacheDTensorsView(CacheDTensorsViewBuilderMixin):
+    tensor_ids: List[str] = field(default_factory=list)
+    d_tensor_table: DTensorTable = field(default_factory=DTensorTable)
+    data_accessor: Any = None
+    __hash__ = field_hash
+
+    def __post_init__(self) -> None:
+        self.tensor_ids = list(self.tensor_ids)
+
+    def check_constraints(self):
+        from .constraints import check_constraints
+
+        return check_constraints(self)
+
+
+DTensorsView = ComputeDTensorsView | StorageDTensorsView | CacheDTensorsView

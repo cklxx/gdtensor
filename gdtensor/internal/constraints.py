@@ -14,7 +14,8 @@ import dataclasses
 from typing import Any
 
 from .result import ConstraintViolationError, ERROR_TYPES
-from ..tag import Box, Err, Ok
+from ..tag import Box
+from .products import Err, Ok
 
 
 def _err(obj, constraint: str, msg: str):
@@ -92,13 +93,8 @@ def _storage_view(o):
                 "layout_tensor_in_table",
                 f"layout tensor {pos.tensor_id} not in d_tensor_table",
             )
-    for meshes in entries.values():
-        if meshes.tensor_ids != list(o.tensor_ids):
-            return _err(
-                o,
-                "tensor_ids_match_table",
-                "physical list row labels differ from table order",
-            )
+    # Row labels live on the meshes and table order; the list carries no
+    # tensor_ids field. build_payload_index validates row count separately.
     if o.data_accessor is None or o.begin_save is None or o.begin_load is None:
         return _err(
             o,
@@ -129,7 +125,7 @@ def _named(o):
 
 def _naive(o):
     from .mesh import mesh_shape
-    from ..tag import Shard
+    from .products import Shard
 
     try:
         shape = mesh_shape(o.mesh)
@@ -143,11 +139,11 @@ def _naive(o):
         )
     nd = len(o.global_tensor_meta.global_shape)
     for p in o.placements:
-        if type(p) is Shard and not 0 <= p.value < nd:
+        if type(p) is Shard and not 0 <= p.axis < nd:
             return _err(
                 o,
                 "placements_match_meta",
-                f"Shard axis {p.value} out of range for ndim {nd}",
+                f"Shard axis {p.axis} out of range for ndim {nd}",
             )
     return None
 
@@ -163,7 +159,7 @@ def _meta(o):
 
 
 def _layout(o):
-    from .layout import leader_tensor_component_pos_of, list_cells, pos_key
+    from .layout import list_cells
 
     if o.container_format not in ("safetensors", "distcp"):
         return _err(
@@ -171,29 +167,42 @@ def _layout(o):
             "container_format_unique",
             f"unknown container_format {o.container_format!r}",
         )
-    leaders, seen_cells = {}, set()
+    # Structural invariants that hold without the DTensorTable header order:
+    # each distinct physical list has exactly one file_paths key sitting on a
+    # component position of that list, and distinct files never share a cell.
+    lists: dict[int, object] = {}
     for lst in o.tensor_entries.values():
+        lists.setdefault(id(lst), lst)
+    error = _check_file_path_keys(o, lists)
+    if error is not None:
+        return error
+    seen_cells = set()
+    for lst in lists.values():
         try:
-            leader = leader_tensor_component_pos_of(lst)
             cells = set(list_cells(lst))
         except Exception as exc:  # noqa: BLE001
             return _err(o, "meshes_disjoint", str(exc))
-        if leader in leaders and leaders[leader] != lst:
-            return _err(o, "meshes_disjoint", "different physical lists share a leader")
-        if leader in leaders:
-            continue
-        leaders[leader] = lst
-        if leader not in o.file_paths:
-            return _err(
-                o, "leader_in_file_paths", f"leader {pos_key(leader)} has no path"
-            )
         if seen_cells & cells:
             return _err(o, "meshes_disjoint", "a slot is covered by two files")
         seen_cells |= cells
-    if o.file_paths.keys() != leaders.keys():
-        return _err(
-            o, "file_paths_keys_are_leaders", "file_paths keys must be list leaders"
-        )
+    return None
+
+
+def _check_file_path_keys(o, lists):
+    for pos in o.file_paths:
+        if pos not in o.tensor_entries:
+            msg = f"file_paths key {pos.tensor_id},{pos.rank} is not a tensor entry"
+            return _err(o, "file_paths_keys_are_leaders", msg)
+    for lst in lists.values():
+        keys = [pos for pos in o.file_paths if o.tensor_entries.get(pos) is lst]
+        if not keys:
+            return _err(o, "list_has_file_path", "a physical list has no file path")
+        if len(keys) > 1:
+            return _err(
+                o,
+                "file_paths_keys_are_leaders",
+                "a physical list has more than one file path key",
+            )
     return None
 
 
@@ -223,14 +232,11 @@ def _list_row_labels(value):
 
     for mesh in value.disjoint_storage_mesh_list:
         tensor_count = storage_mesh_base(mesh).tensor_slots.size
-        if (
-            type(tensor_count) is not TensorCount
-            or len(value.tensor_ids) != tensor_count.value
-        ):
+        if type(tensor_count) is not TensorCount:
             return _err(
                 value,
-                "tensor_ids_match_tensor_count",
-                "row label count differs from mesh tensor_count",
+                "tensor_slots_tagged",
+                "mesh tensor slots must be tagged TensorCount",
             )
     return None
 
@@ -285,9 +291,130 @@ _DATA_TYPES = set(_EXTRA) | {
     "PermutedMesh",
     "SlicedMesh",
     "Slice",
-    "OuterProductMesh",
+    "SlotOuterProductMesh",
     "TensorComponentPos",
     "DTensorsViewMapCore",
     "RangeFromComputeView",
     "RangeFromStorageView",
 }
+
+
+# ---------------------------------------------------------------- B.2.3 / B.3.2
+
+
+def _cache_view(o):
+    from .dtensor import tensor_ids_of
+
+    if tensor_ids_of(o.d_tensor_table) != list(o.tensor_ids):
+        return _err(
+            o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table"
+        )
+    if o.data_accessor is None:
+        return _err(o, "data_accessor_non_nil", "data_accessor is nil")
+    return None
+
+
+def _st_cache_mesh(o):
+    from .mesh import (
+        TemporalCacheMesh,
+        SpatioCacheMesh,
+        ArrangedMesh,
+    )
+
+    t, s, c = o.temporal, o.spatial, o.concurrency
+    if type(t) is TemporalCacheMesh:
+        if t.size is None or t.reshaped is not None:
+            return _err(o, "temporal_one_branch", "temporal must set one branch")
+    elif type(s) is SpatioCacheMesh and t.reshaped is s:
+        pass
+    else:
+        return _err(o, "temporal_branch", "temporal must be arranged or reshaped")
+    if type(s) is SpatioCacheMesh:
+        if (s.ranks is None or s.max is None) or s.reshaped is not None:
+            return _err(o, "spatial_one_branch", "spatial must set one branch")
+    elif type(t) is TemporalCacheMesh and s.reshaped is t:
+        pass
+    else:
+        return _err(o, "spatial_branch", "spatial must be literal or reshaped")
+    if type(c) is not ArrangedMesh:
+        return _err(o, "concurrency_arranged", "concurrency must be ArrangedMesh")
+    # Placements fixed by dimension: temporal/concurrency shard, spatial replicate.
+    # Placements live on the NaiveDTensor whose mesh is this CacheMesh; the mesh
+    # constraint only fixes shape validity.
+    return None
+
+
+def _direct_chain(o):
+    if list(o.src.tensor_ids) != list(o.dst.tensor_ids):
+        return _err(o, "tensor_ids_match", "src and dst tensor_ids differ")
+    return None
+
+
+def _one_layer_chain(o):
+    ids = [list(v.tensor_ids) for v in (o.src, o.cache, o.dst)]
+    if any(ids[0] != x for x in ids[1:]):
+        return _err(o, "tensor_ids_match", "src/cache/dst tensor_ids differ")
+    return _cache_subset(o, o.cache, o.dst, o.num_ranks_per_node)
+
+
+def _two_layer_chain(o):
+    ids = [list(v.tensor_ids) for v in (o.src, o.small_cache, o.big_cache, o.dst)]
+    if any(ids[0] != x for x in ids[1:]):
+        return _err(o, "tensor_ids_match", "all legs tensor_ids differ")
+    r1 = _cache_subset(o, o.small_cache, o.big_cache, o.num_ranks_per_node)
+    if r1 is not None:
+        return r1
+    return _cache_subset(o, o.big_cache, o.dst, o.num_ranks_per_node)
+
+
+def _cache_subset(o, cache, dst, num_ranks_per_node: int):
+    from .mesh import is_cache_mesh_subset_of_mesh
+
+    if num_ranks_per_node <= 0:
+        return _err(o, "num_ranks_per_node_positive", "must be positive")
+    cache_mesh = cache.d_tensor_table.named_d_tensors[0].d_tensor.mesh
+    dst_mesh = dst.d_tensor_table.named_d_tensors[0].d_tensor.mesh
+    if not is_cache_mesh_subset_of_mesh(cache_mesh, dst_mesh, num_ranks_per_node):
+        return _err(o, "cache_subset", "cache ranks are not a subset of dst ranks")
+    return None
+
+
+def _mixed_chain(o):
+    ids = [
+        x for seg in o.disjoint_tensor_ids_and_read_chain_list for x in seg.tensor_ids
+    ]
+    if len(ids) != len(set(ids)):
+        return _err(o, "tensor_ids_disjoint", "segment tensor_ids overlap")
+    return None
+
+
+def _disjoint_chain(o):
+    from .chain import get_tensor_ids_of_read_chain
+
+    if list(o.tensor_ids) != list(get_tensor_ids_of_read_chain(o.read_chain)):
+        return _err(
+            o, "tensor_ids_match_chain", "tensor_ids must equal chain tensor ids"
+        )
+    return None
+
+
+_EXTRA["CacheDTensorsView"] = _cache_view
+_EXTRA["StCacheOuterProductMesh"] = _st_cache_mesh
+_EXTRA["DirectDTensorsReadChain"] = _direct_chain
+_EXTRA["OneLayerCachedDTensorsReadChain"] = _one_layer_chain
+_EXTRA["TwoLayerCachedDTensorsReadChain"] = _two_layer_chain
+_EXTRA["MixedDTensorsReadChain"] = _mixed_chain
+_EXTRA["DisjointTensorIdsAndReadChain"] = _disjoint_chain
+_DATA_TYPES.update(
+    {
+        "CacheMesh",
+        "TemporalCacheMesh",
+        "SpatioCacheMesh",
+        "StCacheOuterProductMesh",
+        "DirectDTensorsReadChain",
+        "OneLayerCachedDTensorsReadChain",
+        "TwoLayerCachedDTensorsReadChain",
+        "MixedDTensorsReadChain",
+        "DisjointTensorIdsAndReadChain",
+    }
+)

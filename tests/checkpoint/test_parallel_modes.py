@@ -14,6 +14,7 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
+from tests.support.compat import rank_reshard
 import gdtensor.tag as gt
 from gdtensor_sim.coord import ThreadCoordinator
 from tests.support.checkpoint import file_bytes
@@ -76,17 +77,17 @@ SPECS = (
 def _placements(kind, shape, transpose):
     axis = (int(kind == "row") + int(transpose)) % len(shape)
     return [
-        gt.Replicate(),
-        gt.Shard(0) if kind == "optimizer" else gt.Replicate(),
-        gt.Replicate(),
-        gt.Replicate() if kind == "replicate" else gt.Shard(axis),
+        gb.Replicate(),
+        gb.Shard(0) if kind == "optimizer" else gb.Replicate(),
+        gb.Replicate(),
+        gb.Replicate() if kind == "replicate" else gb.Shard(axis),
     ]
 
 
 def _mesh(topology, stage, expert, placements, order, storage):
     world = int(np.prod(topology))
     base = (
-        gb.OuterProductMesh(
+        gb.SlotOuterProductMesh(
             gb.ArrangedMesh(gt.ConstantOne(1)), gb.ArrangedMesh(gt.WorldSize(world))
         )
         if storage
@@ -97,7 +98,7 @@ def _mesh(topology, stage, expert, placements, order, storage):
         owner = expert % topology[2]
         slices[2] = gb.Slice(owner, owner + 1)
     for axis in (1, 2, 3):
-        if storage and slices[axis] is None and type(placements[axis]) is gt.Replicate:
+        if storage and slices[axis] is None and type(placements[axis]) is gb.Replicate:
             owner = order % topology[axis]
             slices[axis] = gb.Slice(owner, owner + 1)
     return gb.SlicedMesh(gb.ReshapedMesh(base, list(topology)), slices)
@@ -112,10 +113,10 @@ def _dense_points(shape, topology, rank, stage, expert, placements, order, stora
         fixed = axis == 2 and expert is not None
         size, coord = (1, 0) if fixed else (topology[axis], coords[axis])
         placement = placements[axis]
-        if type(placement) is gt.Replicate and storage and coord != order % size:
+        if type(placement) is gb.Replicate and storage and coord != order % size:
             return np.array([], dtype=np.int64)
-        if type(placement) is gt.Shard:
-            points = _dense_chunk(points, placement.value, size, coord)
+        if type(placement) is gb.Shard:
+            points = _dense_chunk(points, placement.axis, size, coord)
     return points.ravel()
 
 
@@ -206,7 +207,7 @@ def _save(root, topology, fmt, kind, *, transpose=False):
     assert (
         type(source.view(0).check_constraints())
         is type(view.check_constraints())
-        is gt.Ok
+        is gb.Ok
     )
     run_ranks(
         int(np.prod(topology)),
@@ -247,7 +248,7 @@ def test_parallel_mode_checkpoint_repartition_matches_serial(
     reshaped = ArrayFabric(table, points)
     run_ranks(
         int(np.prod(dst_p)),
-        lambda rank: gio.rank_reshard(
+        lambda rank: rank_reshard(
             rank, source.view(rank, allow_remote_reads=True), reshaped.view(rank)
         ),
     )
@@ -256,7 +257,7 @@ def test_parallel_mode_checkpoint_repartition_matches_serial(
     output = _storage(
         tmp_path / "repartitioned", dst_p, other, "single", save=True, transpose=True
     )
-    run_ranks(int(np.prod(dst_p)), lambda rank: gio.rank_reshard(rank, stored, output))
+    run_ranks(int(np.prod(dst_p)), lambda rank: rank_reshard(rank, stored, output))
     _verify(tmp_path / "repartitioned", dst_p, other, transpose=True)
     readable = _storage(
         tmp_path / "repartitioned", dst_p, other, "single", transpose=True
@@ -277,7 +278,7 @@ def _assert_serial_files(root, source, fmt):
     serial = (1, 1, 1, 1)
     _save(root / "serial", serial, fmt, "single")
     target = _storage(root / "canonical", serial, fmt, "single", save=True)
-    assert type(gio.rank_reshard(0, source, target)) is gt.Ok
+    assert type(rank_reshard(0, source, target)) is gb.Ok
     assert file_bytes(root / "canonical") == file_bytes(root / "serial")
     assert file_bytes(root / "repartitioned") == before
 
@@ -317,7 +318,7 @@ def test_swapped_expert_payloads_are_detected(tmp_path, fmt):
         _verify(tmp_path, topology, fmt)
     table, points, values, _ = _schema((1, 1, 1, 1))
     loaded = ArrayFabric(table, points)
-    assert type(gio.rank_load(0, loaded.view(0), stored)) is gt.Ok
+    assert type(gio.rank_load(0, loaded.view(0), stored)) is gb.Ok
     with pytest.raises(AssertionError):
         loaded.assert_values(values)
     print(

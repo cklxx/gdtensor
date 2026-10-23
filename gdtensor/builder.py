@@ -15,6 +15,7 @@ from .internal.builder_mixin import (
     make_builder_mixin as _make_builder_mixin,
 )
 
+from .internal.products import Err, Ok, Partial, Replicate, Shard
 from .internal.dtensor import (
     DTensorTable,
     DTensorTableBuilderMixin,
@@ -39,18 +40,27 @@ from .internal.layout import (
     PhysicalLayoutTableBuilderMixin,
     TensorComponentPos,
     TensorComponentPosBuilderMixin,
-    file_path_of,
-    leader_tensor_component_pos_of,
+)
+from .internal.chain import (
+    ConcreteDTensorsReadChain,
+    DTensorsReadChain,
+    DirectDTensorsReadChain,
+    DisjointTensorIdsAndReadChain,
+    MixedDTensorsReadChain,
+    OneLayerCachedDTensorsReadChain,
+    TwoLayerCachedDTensorsReadChain,
+    legs_of,
 )
 from .internal.mesh import (
     ArrangedMesh,
     ArrangedMeshBuilderMixin,
+    CacheMesh,
     ComputeMesh,
     ContentSlotsMesh,
     LiteralMesh,
     LiteralMeshBuilderMixin,
-    OuterProductMesh,
-    OuterProductMeshBuilderMixin,
+    SlotOuterProductMesh,
+    SlotOuterProductMeshBuilderMixin,
     PermutedMesh,
     PermutedMeshBuilderMixin,
     ReshapedMesh,
@@ -59,8 +69,13 @@ from .internal.mesh import (
     SliceBuilderMixin,
     SlicedMesh,
     SlicedMeshBuilderMixin,
+    SpatioCacheMesh,
+    StCacheOuterProductMesh,
     StorageMesh,
+    TemporalCacheMesh,
+    is_cache_mesh_subset_of_mesh,
 )
+from .internal.views import CacheDTensorsView
 from .internal.result import (
     CheckFailedError,
     CheckFailedErrorBuilderMixin,
@@ -82,6 +97,26 @@ from .internal.views import (
 )
 
 
+def _layout_tensor_ids(physical_layout):
+    # The list no longer carries row labels; infer header order from the
+    # tensor ids already present on the layout keys.
+    return sorted({pos.tensor_id for pos in physical_layout.tensor_entries})
+
+
+def file_path_of(physical_layout, pos, tensor_ids=None):
+    from .internal.layout import file_path_of as _file_path_of
+
+    return _file_path_of(physical_layout, pos, tensor_ids)
+
+
+def leader_tensor_component_pos_of(disjoint_storage_meshes, tensor_ids=None):
+    from .internal.layout import (
+        leader_tensor_component_pos_of as _leader,
+    )
+
+    return _leader(disjoint_storage_meshes, tensor_ids)
+
+
 # ------------------------------------------------------------------ 5.5 view map
 
 
@@ -90,6 +125,7 @@ DTensorsViewMapCoreBuilderMixin = _make_builder_mixin(
     [
         ("convert_each_compute_view", "nullable"),
         ("convert_each_storage_view", "nullable"),
+        ("convert_each_cache_view", "nullable"),
         ("convert_each_storage_load_session", "nullable"),
         ("convert_each_storage_save_session", "nullable"),
     ],
@@ -100,6 +136,7 @@ DTensorsViewMapCoreBuilderMixin = _make_builder_mixin(
 class DTensorsViewMapCore(DTensorsViewMapCoreBuilderMixin):
     convert_each_compute_view: _Optional[_Callable] = None
     convert_each_storage_view: _Optional[_Callable] = None
+    convert_each_cache_view: _Optional[_Callable] = None
     convert_each_storage_load_session: _Optional[_Callable] = None
     convert_each_storage_save_session: _Optional[_Callable] = None
     __hash__ = _field_hash
@@ -111,7 +148,6 @@ class DTensorsViewMapCore(DTensorsViewMapCoreBuilderMixin):
 
 
 def _result_of(value):
-    from .tag import Ok, Err
 
     if type(value) in (Ok, Err):
         return value
@@ -123,7 +159,6 @@ def _result_of(value):
 
 
 def _map_table(table, convert):
-    from .tag import Ok, Err
 
     if convert is None:
         return Ok(table)
@@ -144,7 +179,6 @@ def _close_failed_conversion(session, close):
 
 
 def _map_begin(begin, convert, close):
-    from .tag import Err
 
     if convert is None:
         return begin
@@ -167,8 +201,19 @@ def _map_begin(begin, convert, close):
 
 
 def d_tensors_view_map(origin, map_core: DTensorsViewMapCore):
-    from .tag import Ok, Err
 
+    from .internal.views import CacheDTensorsView
+
+    if type(origin) is CacheDTensorsView:
+        convert = map_core.convert_each_cache_view
+        if convert is None:
+            return Ok(origin)
+        table = _map_table(origin.d_tensor_table, convert)
+        if type(table) is Err:
+            return table
+        return Ok(
+            CacheDTensorsView(origin.tensor_ids, table.value, origin.data_accessor)
+        )
     if type(origin) not in (ComputeDTensorsView, StorageDTensorsView):
         return Err(
             InvalidArgumentError(
@@ -222,8 +267,22 @@ __all__ = [
     "Placement",
     "ComputeMesh",
     "StorageMesh",
-    "OuterProductMesh",
+    "SlotOuterProductMesh",
     "ContentSlotsMesh",
+    "CacheMesh",
+    "StCacheOuterProductMesh",
+    "TemporalCacheMesh",
+    "SpatioCacheMesh",
+    "CacheDTensorsView",
+    "DTensorsReadChain",
+    "ConcreteDTensorsReadChain",
+    "DirectDTensorsReadChain",
+    "OneLayerCachedDTensorsReadChain",
+    "TwoLayerCachedDTensorsReadChain",
+    "MixedDTensorsReadChain",
+    "DisjointTensorIdsAndReadChain",
+    "is_cache_mesh_subset_of_mesh",
+    "legs_of",
     "LiteralMesh",
     "ArrangedMesh",
     "ReshapedMesh",
@@ -234,6 +293,12 @@ __all__ = [
     "DisjointStorageMeshList",
     "ContainerFormat",
     "TensorComponentPos",
+    # result / placement products (B.2.4.7 / B.3.4)
+    "Ok",
+    "Err",
+    "Shard",
+    "Replicate",
+    "Partial",
     # errors
     "ConstraintViolationError",
     "CheckFailedError",
@@ -248,6 +313,7 @@ __all__ = [
     "ComputeDTensorsViewBuilderMixin",
     "new_compute_d_tensors_view",
     "StorageDTensorsViewBuilderMixin",
+    "new_slot_outer_product_mesh",
     "new_storage_d_tensors_view",
     "DTensorsViewMapCoreBuilderMixin",
     "new_d_tensors_view_map_core",
@@ -261,8 +327,7 @@ __all__ = [
     "new_reshaped_d_tensor",
     "GlobalTensorMetaBuilderMixin",
     "new_global_tensor_meta",
-    "OuterProductMeshBuilderMixin",
-    "new_outer_product_mesh",
+    "SlotOuterProductMeshBuilderMixin",
     "LiteralMeshBuilderMixin",
     "new_literal_mesh",
     "ArrangedMeshBuilderMixin",
@@ -312,7 +377,9 @@ new_named_d_tensor = _factory(NamedDTensor, "new_named_d_tensor")
 new_naive_d_tensor = _factory(NaiveDTensor, "new_naive_d_tensor")
 new_reshaped_d_tensor = _factory(ReshapedDTensor, "new_reshaped_d_tensor")
 new_global_tensor_meta = _factory(GlobalTensorMeta, "new_global_tensor_meta")
-new_outer_product_mesh = _factory(OuterProductMesh, "new_outer_product_mesh")
+new_slot_outer_product_mesh = _factory(
+    SlotOuterProductMesh, "new_slot_outer_product_mesh"
+)
 new_literal_mesh = _factory(LiteralMesh, "new_literal_mesh")
 new_arranged_mesh = _factory(ArrangedMesh, "new_arranged_mesh")
 new_reshaped_mesh = _factory(ReshapedMesh, "new_reshaped_mesh")

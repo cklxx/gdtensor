@@ -8,13 +8,13 @@ import numpy as np
 from gdtensor.builder import (
     ArrangedMesh,
     LiteralMesh,
-    OuterProductMesh,
+    SlotOuterProductMesh,
     PermutedMesh,
     ReshapedDTensor,
     ReshapedMesh,
     SlicedMesh,
 )
-from gdtensor.tag import Partial, Shard
+from gdtensor.builder import Partial, Shard
 from ._result import invalid
 
 
@@ -44,7 +44,7 @@ def _mesh(mesh):
         return np.arange(mesh.size.value, dtype=np.int64)
     if type(mesh) is LiteralMesh:
         return np.asarray(mesh.ranks, dtype=np.int64)
-    if type(mesh) is OuterProductMesh:
+    if type(mesh) is SlotOuterProductMesh:
         content = mesh.content_slots
         width = (
             content.max.value if type(content) is LiteralMesh else content.size.value
@@ -87,7 +87,7 @@ def owned_box(nd, side, participant):
         if type(placement) is Partial:
             raise invalid("placements", "Partial cannot be saved")
         if type(placement) is Shard:
-            axis = placement.value
+            axis = placement.axis
             chunk = -(-(hi[axis] - lo[axis]) // size)
             start = min(hi[axis], lo[axis] + int(coordinate) * chunk)
             lo[axis], hi[axis] = start, min(hi[axis], start + chunk)

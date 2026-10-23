@@ -50,16 +50,16 @@ def test_make_preserves_torch_metadata_and_identity(torch_mesh, dtype, name, siz
     gd = gdtensor.make_gd_tensor(dt)
     assert type(gd) is gb.NaiveDTensor
     assert gd.global_tensor_meta == gb.GlobalTensorMeta([3, 5], name, size)
-    assert gd.placements == [gt.Shard(1)]
+    assert gd.placements == [gb.Shard(1)]
     assert gd.mesh.shape == [1] and gd.mesh.underlying_mesh.ranks == [0]
     assert gdtensor.get_d_tensor(gd) is dt
-    assert type(gd.check_constraints()) is gt.Ok
+    assert type(gd.check_constraints()) is gb.Ok
 
 
 def test_bridge_ids_lookup_and_metadata_only_values():
     gd = gb.NaiveDTensor(
         gb.GlobalTensorMeta([3], "F32", 4),
-        [gt.Replicate()],
+        [gb.Replicate()],
         gb.ArrangedMesh(gt.WorldSize(1)),
     )
     cv = gb.ComputeDTensorsView(
@@ -72,9 +72,9 @@ def test_bridge_ids_lookup_and_metadata_only_values():
     ids.clear()
     assert cv.tensor_ids == ["b", "a"]
     result = gdtensor.get_gd_tensor(cv, "b")
-    assert type(result) is gt.Ok and result.value is gd
+    assert type(result) is gb.Ok and result.value is gd
     result = gdtensor.get_gd_tensor(cv, "missing")
-    assert type(result) is gt.Err and type(result.value) is gb.NotFoundError
+    assert type(result) is gb.Err and type(result.value) is gb.NotFoundError
     assert gdtensor.get_d_tensor(gd) is None
 
 

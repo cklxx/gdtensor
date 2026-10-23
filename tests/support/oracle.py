@@ -4,7 +4,6 @@ import numpy as np
 
 import gdtensor.access as ga
 import gdtensor.builder as gb
-import gdtensor.tag as gt
 
 
 def slice_points(shape, p, placements, stage, rank, *, storage=False, order=0):
@@ -15,11 +14,11 @@ def slice_points(shape, p, placements, stage, rank, *, storage=False, order=0):
         return np.array([], dtype=np.int64)
     points = np.arange(int(np.prod(shape)), dtype=np.int64).reshape(shape)
     for size, coord, placement in zip((1, dp, tp), (0, *coords[1:]), placements):
-        if type(placement) is gt.Replicate and storage and coord != order % size:
+        if type(placement) is gb.Replicate and storage and coord != order % size:
             return np.array([], dtype=np.int64)
-        if type(placement) is gt.Replicate:
+        if type(placement) is gb.Replicate:
             continue
-        axis = placement.value
+        axis = placement.axis
         chunk = (points.shape[axis] + size - 1) // size
         index = [slice(None)] * points.ndim
         index[axis] = slice(coord * chunk, (coord + 1) * chunk)
@@ -107,7 +106,7 @@ class _ArrayAccessor(ga.DTensorDataAccessor):
         buf, local = hit
         data = np.empty(global_range.size, dtype=np.uint8)
         result = write_from_buffer(data.ctypes.data, data.nbytes)
-        if type(result) is gt.Ok:
+        if type(result) is gb.Ok:
             buf[local] = data.reshape(-1, buf.shape[1])
         return result
 
@@ -132,7 +131,7 @@ class TorchAccessor(ga.DTensorDataAccessor):
         import gdtensor
 
         gd = gdtensor.get_gd_tensor(self.view, rng.global_tensor_id)
-        assert type(gd) is gt.Ok
+        assert type(gd) is gb.Ok
         dt = gdtensor.get_d_tensor(gd.value)
         local = dt.to_local()
         assert local.is_contiguous()

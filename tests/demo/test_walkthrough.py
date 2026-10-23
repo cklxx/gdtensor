@@ -10,6 +10,7 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
+from tests.support.compat import rank_reshard
 import gdtensor.tag as gt
 from gdtensor_sim.coord import ThreadCoordinator
 from tests.support.oracle import ArrayFabric
@@ -19,7 +20,7 @@ from tests.support.storage import FileStorage
 def _table(world, axis):
     tensor = gb.NaiveDTensor(
         gb.GlobalTensorMeta([3, 4], "I64", 8),
-        [gt.Shard(axis)],
+        [gb.Shard(axis)],
         gb.ArrangedMesh(gt.WorldSize(world)),
     )
     return gb.DTensorTable([gb.NamedDTensor("weight", tensor)])
@@ -41,7 +42,7 @@ def _run(label, world, action):
     with ThreadPoolExecutor(max_workers=world) as pool:
         results = list(pool.map(action, range(world)))
     for rank, result in enumerate(results):
-        assert type(result) is gt.Ok, result
+        assert type(result) is gb.Ok, result
         print(f"[CRC+ARANGE][WALKTHROUGH] {label} rank={rank} result=Ok", flush=True)
 
 
@@ -85,8 +86,8 @@ def test_small_arange_crc_and_elastic_load(tmp_path, fmt):
                 "weight",
                 gb.NaiveDTensor(
                     gb.GlobalTensorMeta([3, 4], "I64", 8),
-                    [gt.Replicate(), gt.Shard(0)],
-                    gb.OuterProductMesh(
+                    [gb.Replicate(), gb.Shard(0)],
+                    gb.SlotOuterProductMesh(
                         gb.ArrangedMesh(gt.ConstantOne(1)),
                         gb.ArrangedMesh(gt.WorldSize(2)),
                     ),
@@ -122,7 +123,7 @@ def test_small_arange_crc_and_elastic_load(tmp_path, fmt):
     _run(
         "compute reshard 2->3",
         3,
-        lambda rank: gio.rank_reshard(
+        lambda rank: rank_reshard(
             rank, compute.view(rank, allow_remote_reads=True), converted.view(rank)
         ),
     )

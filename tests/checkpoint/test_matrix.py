@@ -8,7 +8,7 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-import gdtensor.tag as gt
+from tests.support.compat import rank_reshard
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import run_ranks, storage_view, tensor_schema, verify_crc
 
@@ -43,7 +43,7 @@ def test_io_world_layout_matrix(tmp_path, p, kind, mode, fmt):
     converted = ArrayFabric(target, target_points)
     run_ranks(
         world,
-        lambda rank: gio.rank_reshard(
+        lambda rank: rank_reshard(
             rank, source.view(rank, allow_remote_reads=True), converted.view(rank)
         ),
     )
@@ -59,7 +59,7 @@ def test_compute_reshard_is_idempotent(world):
     for _ in range(2):
         run_ranks(
             world,
-            lambda rank: gio.rank_reshard(rank, fabric.view(rank), fabric.view(rank)),
+            lambda rank: rank_reshard(rank, fabric.view(rank), fabric.view(rank)),
         )
         fabric.assert_values(values)
 
@@ -71,7 +71,7 @@ def test_storage_fixture_reshard_to_same_view(tmp_path, fmt):
     fabric = ArrayFabric(ct, points, values)
     sv = storage_view(tmp_path, ct, p, "single", "hf", fmt, save=True)
     run_ranks(4, lambda rank: gio.rank_save(rank, fabric.view(rank), sv))
-    run_ranks(4, lambda rank: gio.rank_reshard(rank, sv, sv))
+    run_ranks(4, lambda rank: rank_reshard(rank, sv, sv))
     verify_crc(tmp_path, fmt, ct, p, "hf", values)
 
 
@@ -91,7 +91,7 @@ def test_rank_start_order_does_not_change_checkpoint(tmp_path, reverse):
                     lambda rank: gio.rank_save(rank, source.view(rank), view), ranks
                 )
             )
-        assert all(type(r) is gt.Ok for r in results), results
+        assert all(type(r) is gb.Ok for r in results), results
         outputs.append({f.name: f.read_bytes() for f in root.iterdir()})
     assert outputs[0] == outputs[1]
 
@@ -108,7 +108,7 @@ def test_empty_tensor_moves_no_bytes(tmp_path):
     dest = ArrayFabric(ct, points)
     run_ranks(
         2,
-        lambda rank: gio.rank_reshard(
+        lambda rank: rank_reshard(
             rank, source.view(rank, allow_remote_reads=True), dest.view(rank)
         ),
     )

@@ -10,7 +10,7 @@ from gdtensor.builder import (
     global_tensor_meta_of,
     leader_tensor_component_pos_of,
 )
-from gdtensor.tag import Err
+from gdtensor.builder import Err
 from ._geometry import iv_total, nonempty_columns, tensor_ids_of
 from ._result import Fail, invalid
 
@@ -50,13 +50,11 @@ class PayloadIndex:
 
 
 def _file_payload(layout, pos, ids, files):
-    path = file_path_of(layout, pos)
+    path = file_path_of(layout, pos, ids)
     if type(path) is Err:
         raise Fail(path.value)
     group = layout.tensor_entries[pos]
-    if group.tensor_ids != ids:
-        raise invalid("tensor_ids", "physical list row labels differ from table order")
-    leader = leader_tensor_component_pos_of(group)
+    leader = leader_tensor_component_pos_of(group, ids)
     fp = files.setdefault(path.value, FilePayload(path.value, leader))
     if fp.leader != leader:
         raise invalid("file_paths", "two physical lists use one path")

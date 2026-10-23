@@ -5,7 +5,7 @@ import multiprocessing as mp
 import numpy as np
 import pytest
 
-import gdtensor.tag as gt
+import gdtensor.builder as gb
 from gdtensor.builder import global_tensor_meta_of
 from gdtensor_sim.fabric import ComputeFabric
 from gdtensor_sim.models import (
@@ -48,13 +48,13 @@ def test_sim_elastic_io_matches_independent_dense_oracle(tmp_path, fmt, layout, 
     st = storage_table(ct, p, mode)
     physical = layout_builder(layout, st, p, fmt, 3)
     results, _ = save_threads(ct, st, physical, str(tmp_path), source, p.world)
-    assert all(type(result) is gt.Ok for result in results.values()), results
+    assert all(type(result) is gb.Ok for result in results.values()), results
     loaded_ct, loaded_points, _ = tensor_schema(DST, column=True)
     loaded = ComputeFabric(loaded_ct).allocate()
     results, _ = load_threads(
         loaded_ct, st, physical, str(tmp_path), loaded, int(np.prod(DST))
     )
-    assert all(type(result) is gt.Ok for result in results.values()), results
+    assert all(type(result) is gb.Ok for result in results.values()), results
     _assert_fabric(loaded, ArrayFabric(loaded_ct, loaded_points, values))
 
 
@@ -69,7 +69,7 @@ def test_sim_process_runner_finishes_and_loads_exact_bytes(tmp_path, fmt):
         "save", ct, st, physical, str(tmp_path), p.world, fill_pattern
     )
     loaded, _, buffers = run_processes("load", ct, st, physical, str(tmp_path), p.world)
-    assert all(type(result) is gt.Ok for result in [*saved.values(), *loaded.values()])
+    assert all(type(result) is gb.Ok for result in [*saved.values(), *loaded.values()])
     assert {process.pid for process in mp.active_children()} == before
     _assert_process_buffers(ct, points, buffers)
 
@@ -98,7 +98,7 @@ def test_sim_process_runner_reaps_failed_workers(tmp_path):
     results, _, _ = run_processes(
         "save", ct, st, physical, str(tmp_path), p.world, _fail_fill
     )
-    assert all(type(result) is gt.Err for result in results.values())
+    assert all(type(result) is gb.Err for result in results.values())
     assert all(
         "injected worker failure" in result.value.msg for result in results.values()
     )

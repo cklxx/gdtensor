@@ -26,38 +26,37 @@ def _two_rank_shard():
     cv, sv = compute_view(src), storage_view(saved, events)
     ct = cv.d_tensor_table.named_d_tensors[0].d_tensor
     ct.set_mesh(gb.ArrangedMesh(gt.WorldSize(2)))
-    ct.set_placements([gt.Shard(0)])
+    ct.set_placements([gb.Shard(0)])
     st = sv.d_tensor_table.named_d_tensors[0].d_tensor
     st.set_mesh(
-        gb.OuterProductMesh(
+        gb.SlotOuterProductMesh(
             gb.ArrangedMesh(gt.ConstantOne(1)), gb.ArrangedMesh(gt.WorldSize(2))
         )
     )
-    st.set_placements([gt.Replicate(), gt.Shard(0)])
+    st.set_placements([gb.Replicate(), gb.Shard(0)])
     group = gb.DisjointStorageMeshList(
         [
-            gb.OuterProductMesh(
+            gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(2))
             )
-        ],
-        ["w"],
+        ]
     )
     sv.physical_layout.set_tensor_entries(
         {gb.TensorComponentPos("w", rank): group for rank in (0, 1)}
     )
-    assert type(cv.check_constraints()) is type(sv.check_constraints()) is gt.Ok
+    assert type(cv.check_constraints()) is type(sv.check_constraints()) is gb.Ok
     return cv, sv, saved, events
 
 
 def test_each_rank_saves_and_reloads_exactly_its_owned_shard():
     cv, sv, saved, events = _two_rank_shard()
     for rank in range(2):
-        assert type(gio.rank_save(rank, cv, sv)) is gt.Ok
+        assert type(gio.rank_save(rank, cv, sv)) is gb.Ok
     np.testing.assert_array_equal(saved.data, np.arange(8, dtype=np.uint8))
     for rank in range(2):
         out = Memory([0xA5] * 8)
         loaded = gb.ComputeDTensorsView(cv.tensor_ids, cv.d_tensor_table, out)
-        assert type(gio.rank_load(rank, loaded, sv)) is gt.Ok
+        assert type(gio.rank_load(rank, loaded, sv)) is gb.Ok
         want = np.full(8, 0xA5, dtype=np.uint8)
         want[4 * rank : 4 * (rank + 1)] = np.arange(
             4 * rank, 4 * (rank + 1), dtype=np.uint8
@@ -71,28 +70,28 @@ def test_missing_storage_column_is_rejected_before_any_session():
     cv = compute_view(Memory(range(8)))
     tensor = cv.d_tensor_table.named_d_tensors[0].d_tensor
     tensor.set_mesh(gb.ArrangedMesh(gt.WorldSize(2)))
-    tensor.set_placements([gt.Shard(0)])
+    tensor.set_placements([gb.Shard(0)])
     events = []
     sv = storage_view(Memory([0] * 8), events)
     dt = sv.d_tensor_table.named_d_tensors[0].d_tensor
     dt.set_mesh(
-        gb.OuterProductMesh(
+        gb.SlotOuterProductMesh(
             gb.ArrangedMesh(gt.ConstantOne(1)), gb.ArrangedMesh(gt.WorldSize(2))
         )
     )
-    dt.set_placements([gt.Replicate(), gt.Shard(0)])
-    base = gb.OuterProductMesh(
+    dt.set_placements([gb.Replicate(), gb.Shard(0)])
+    base = gb.SlotOuterProductMesh(
         gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(2))
     )
     group = gb.DisjointStorageMeshList(
-        [gb.SlicedMesh(base, [None, gb.Slice(0, 1)])], ["w"]
+        [gb.SlicedMesh(base, [None, gb.Slice(0, 1)])],
     )
     sv.physical_layout.tensor_entries = {gb.TensorComponentPos("w", 0): group}
     first = gio.rank_save(0, cv, sv)
-    assert type(first) is gt.Ok, first
+    assert type(first) is gb.Ok, first
     events.clear()
     result = gio.rank_save(1, cv, sv)
-    assert type(result) is gt.Err
+    assert type(result) is gb.Err
     assert not events, "rank 1 opened a session for an uncovered plan"
 
 
@@ -102,25 +101,25 @@ def test_rank_load_without_its_column_is_rejected_before_any_session():
     cv = compute_view(Memory([0xA5] * 8))
     tensor = cv.d_tensor_table.named_d_tensors[0].d_tensor
     tensor.set_mesh(gb.ArrangedMesh(gt.WorldSize(2)))
-    tensor.set_placements([gt.Shard(0)])
+    tensor.set_placements([gb.Shard(0)])
     events = []
     sv = storage_view(Memory(range(8)), events)
     dt = sv.d_tensor_table.named_d_tensors[0].d_tensor
     dt.set_mesh(
-        gb.OuterProductMesh(
+        gb.SlotOuterProductMesh(
             gb.ArrangedMesh(gt.ConstantOne(1)), gb.ArrangedMesh(gt.WorldSize(2))
         )
     )
-    dt.set_placements([gt.Replicate(), gt.Shard(0)])
-    base = gb.OuterProductMesh(
+    dt.set_placements([gb.Replicate(), gb.Shard(0)])
+    base = gb.SlotOuterProductMesh(
         gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(2))
     )
     group = gb.DisjointStorageMeshList(
-        [gb.SlicedMesh(base, [None, gb.Slice(0, 1)])], ["w"]
+        [gb.SlicedMesh(base, [None, gb.Slice(0, 1)])],
     )
     sv.physical_layout.tensor_entries = {gb.TensorComponentPos("w", 0): group}
     result = gio.rank_load(1, cv, sv)
-    assert type(result) is gt.Err
+    assert type(result) is gb.Err
     assert not events, "rank 1 opened a load session with no source shard"
 
 
@@ -140,7 +139,7 @@ def test_every_replica_independently_loads_the_full_tensor():
                         "w",
                         gb.NaiveDTensor(
                             gb.GlobalTensorMeta([8], "U8", 1),
-                            [gt.Replicate()],
+                            [gb.Replicate()],
                             cv_mesh,
                         ),
                     )
@@ -149,5 +148,5 @@ def test_every_replica_independently_loads_the_full_tensor():
             out,
         )
         result = gio.rank_load(rank, cv, sv)
-        assert type(result) is gt.Ok, result
+        assert type(result) is gb.Ok, result
         np.testing.assert_array_equal(out.data, np.arange(8, dtype=np.uint8))

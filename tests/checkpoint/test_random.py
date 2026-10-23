@@ -21,7 +21,7 @@ def _random_table(seed):
     for order in range(5):
         shape = tuple(int(x) for x in rng.integers(1, 10, size=int(rng.integers(1, 4))))
         axis = int(rng.integers(len(shape)))
-        placements = [gt.Replicate(), gt.Replicate(), gt.Shard(axis)]
+        placements = [gb.Replicate(), gb.Replicate(), gb.Shard(axis)]
         tid = f"tensor{order}"
         dt = gb.NaiveDTensor(
             gb.GlobalTensorMeta(list(shape), "I64", 8),

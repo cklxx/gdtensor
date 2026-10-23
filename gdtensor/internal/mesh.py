@@ -22,7 +22,12 @@ import numpy as np
 
 from .builder_mixin import field_hash, make_builder_mixin
 from .result import invalid
-from ..tag import ConstantOne, TensorCount, WorldSize
+from ..tag import (
+    ConstantOne,
+    NumNodes,
+    TensorCount,
+    WorldSize,
+)
 
 
 def _cc(self):
@@ -49,8 +54,8 @@ SlicedMeshBuilderMixin = make_builder_mixin(
 SliceBuilderMixin = make_builder_mixin(
     "Slice", [("start", "nullable"), ("stop", "nullable"), ("step", "nullable")]
 )
-OuterProductMeshBuilderMixin = make_builder_mixin(
-    "OuterProductMesh", [("tensor_slots", "object"), ("content_slots", "oneof")]
+SlotOuterProductMeshBuilderMixin = make_builder_mixin(
+    "SlotOuterProductMesh", [("tensor_slots", "object"), ("content_slots", "oneof")]
 )
 
 
@@ -148,7 +153,7 @@ class SlicedMesh(SlicedMeshBuilderMixin):
 
 
 @dataclass(eq=True)
-class OuterProductMesh(OuterProductMeshBuilderMixin):
+class SlotOuterProductMesh(SlotOuterProductMeshBuilderMixin):
     tensor_slots: Any = None  # ArrangedMesh[ConstantOne] | ArrangedMesh[TensorCount]
     content_slots: Any = None  # ContentSlotsMesh
     __hash__ = _hash
@@ -161,7 +166,7 @@ class OuterProductMesh(OuterProductMeshBuilderMixin):
 
 
 ComputeMesh = LiteralMesh | ArrangedMesh | ReshapedMesh | PermutedMesh | SlicedMesh
-StorageMesh = OuterProductMesh | ReshapedMesh | SlicedMesh
+StorageMesh = SlotOuterProductMesh | ReshapedMesh | SlicedMesh
 ContentSlotsMesh = LiteralMesh | ArrangedMesh
 
 
@@ -214,8 +219,8 @@ def resolve_compute_mesh(mesh) -> np.ndarray:
     return _apply_transform(mesh, resolve_compute_mesh(mesh.underlying_mesh))
 
 
-def storage_mesh_base(mesh) -> OuterProductMesh:
-    while type(mesh) is not OuterProductMesh:
+def storage_mesh_base(mesh) -> SlotOuterProductMesh:
+    while type(mesh) is not SlotOuterProductMesh:
         if type(mesh) not in (ReshapedMesh, SlicedMesh):
             raise invalid("mesh", f"{type(mesh).__name__} is not a StorageMesh branch")
         mesh = mesh.underlying_mesh
@@ -233,7 +238,7 @@ def _content_slots(cs) -> Tuple[int, List[int]]:
 
 def resolve_storage_mesh(mesh) -> Tuple[np.ndarray, int]:
     """(ndarray of slot ids ``t*W+w`` or -1, W)."""
-    if type(mesh) is not OuterProductMesh:
+    if type(mesh) is not SlotOuterProductMesh:
         if type(mesh) not in (ReshapedMesh, SlicedMesh):
             raise invalid("mesh", f"{type(mesh).__name__} is not a StorageMesh branch")
         inner, w_size = resolve_storage_mesh(mesh.underlying_mesh)
@@ -265,7 +270,7 @@ def storage_mesh_cells(mesh) -> set:
 
 def mesh_shape(mesh) -> Tuple[int, ...]:
     """Shape of a compute or storage mesh."""
-    if type(storage_root(mesh)) is OuterProductMesh:
+    if type(storage_root(mesh)) is SlotOuterProductMesh:
         return tuple(resolve_storage_mesh(mesh)[0].shape)
     return tuple(resolve_compute_mesh(mesh).shape)
 
@@ -285,3 +290,133 @@ def mesh_coords(cells: np.ndarray, value: int) -> Optional[Tuple[int, ...]]:
             "mesh", f"participant {value} appears {hit.shape[0]} times in mesh"
         )
     return tuple(int(x) for x in hit[0])
+
+
+# ---------------------------------------------------------------- B.2.3.2
+
+StCacheSlotOuterProductMeshBuilderMixin = make_builder_mixin(
+    "StCacheOuterProductMesh",
+    [("temporal", "oneof"), ("spatial", "oneof"), ("concurrency", "oneof")],
+)
+TemporalCacheMeshBuilderMixin = make_builder_mixin(
+    "TemporalCacheMesh", [("size", "scalar"), ("reshaped", "oneof")]
+)
+SpatioCacheMeshBuilderMixin = make_builder_mixin(
+    "SpatioCacheMesh", [("ranks", "list"), ("max", "scalar"), ("reshaped", "oneof")]
+)
+
+
+@dataclass(eq=True)
+class StCacheOuterProductMesh(StCacheSlotOuterProductMeshBuilderMixin):
+    temporal: Any = None  # TemporalCacheMesh
+    spatial: Any = None  # SpatioCacheMesh
+    concurrency: Any = None  # ArrangedMesh[ConcurrencyWidth]
+    __hash__ = _hash
+
+    def __class_getitem__(cls, item):
+        return GenericAlias(cls, item)
+
+    def check_constraints(self):
+        return _cc(self)
+
+
+@dataclass(eq=True)
+class TemporalCacheMesh(TemporalCacheMeshBuilderMixin):
+    # Exactly one of size (ArrangedMesh[NumSteps]) / reshaped (SpatioCacheMesh).
+    size: Any = None
+    reshaped: Any = None
+    __hash__ = _hash
+
+    def __class_getitem__(cls, item):
+        return GenericAlias(cls, item)
+
+    def check_constraints(self):
+        return _cc(self)
+
+
+@dataclass(eq=True)
+class SpatioCacheMesh(SpatioCacheMeshBuilderMixin):
+    # Exactly one of ranks+max (LiteralMesh[NumNodes]) / reshaped (TemporalCacheMesh).
+    ranks: List[int] = field(default_factory=list)
+    max: Any = None
+    reshaped: Any = None
+    __hash__ = _hash
+
+    def __post_init__(self) -> None:
+        self.ranks = list(self.ranks)
+
+    def __class_getitem__(cls, item):
+        return GenericAlias(cls, item)
+
+    def check_constraints(self):
+        return _cc(self)
+
+
+CacheMesh = StCacheOuterProductMesh | PermutedMesh
+
+
+def resolve_cache_mesh(mesh) -> np.ndarray:
+    """ndarray of global compute ranks covered by a CacheMesh.
+
+    The temporal and concurrency dimensions add no ranks; they are buffer
+    slots on the nodes selected by the spatial dimension. Node n maps to
+    ranks [n, n + t_per_node) here, assuming num_ranks_per_node == 1, i.e.
+    one rank per node; callers with a wider node supply an expanded mesh or
+    call cache_node_ranks with num_ranks_per_node.
+    """
+    if type(mesh) is PermutedMesh:
+        inner = resolve_cache_mesh(mesh.underlying_mesh)
+        return inner.transpose(tuple(mesh.permutation))
+    if type(mesh) is not StCacheOuterProductMesh:
+        raise invalid("mesh", f"{type(mesh).__name__} is not a CacheMesh branch")
+    return _cache_spatial_ranks(mesh.spatial)
+
+
+def cache_num_nodes(mesh: StCacheOuterProductMesh) -> int:
+    spatial = mesh.spatial
+    while (
+        type(spatial) in (TemporalCacheMesh, SpatioCacheMesh)
+        and getattr(spatial, "reshaped", None) is not None
+    ):
+        spatial = spatial.reshaped
+    if type(spatial) is ArrangedMesh:
+        tag_int(spatial.size, NumNodes)
+        return int(spatial.size.value)
+    if type(spatial) is LiteralMesh:
+        tag_int(spatial.max, NumNodes)
+        return len(spatial.ranks)
+    raise invalid("mesh", f"unsupported spatial cache mesh {type(spatial).__name__}")
+
+
+def _cache_spatial_ranks(spatial) -> np.ndarray:
+    if type(spatial) is ArrangedMesh:
+        tag_int(spatial.size, NumNodes)
+        return np.arange(int(spatial.size.value), dtype=np.int64).reshape(-1, 1)
+    if type(spatial) is LiteralMesh:
+        tag_int(spatial.max, NumNodes)
+        return np.array(sorted(spatial.ranks), dtype=np.int64).reshape(-1, 1)
+    raise invalid("mesh", f"unsupported spatial cache mesh {type(spatial).__name__}")
+
+
+def is_cache_mesh_subset_of_mesh(lhs, rhs, num_ranks_per_node: int) -> bool:
+    """Every compute rank covered by the cache mesh is also covered by rhs.
+
+    A cache node n covers ranks [n * k, (n + 1) * k), k = num_ranks_per_node.
+    Temporal and concurrency dimensions are slots on the same nodes and add no
+    ranks; the PermutedMesh wrapper only reorders buffer slots.
+    """
+    if num_ranks_per_node <= 0:
+        raise invalid("num_ranks_per_node", "must be positive")
+    cache_nodes = np.unique(resolve_cache_mesh(lhs).ravel())
+    cache_ranks: set = set()
+    for node in cache_nodes:
+        if node < 0:
+            continue
+        base = int(node) * num_ranks_per_node
+        cache_ranks.update(range(base, base + num_ranks_per_node))
+    if type(rhs) in (StCacheOuterProductMesh, PermutedMesh):
+        rhs_ranks = set(resolve_cache_mesh(rhs).ravel().tolist())
+        # One rank per node default plus the expanded mapping already embedded.
+    else:
+        rhs_ranks = set(resolve_compute_mesh(rhs).ravel().tolist())
+    return cache_ranks <= rhs_ranks

@@ -18,7 +18,8 @@ import numpy as np
 import pytest
 
 import gdtensor.io as gio
-import gdtensor.tag as gt
+from tests.support.compat import rank_reshard
+import gdtensor.builder as gb
 from gdtensor_sim.coord import ThreadCoordinator
 from tests.support import axes
 from tests.support.checkpoint import file_bytes
@@ -84,7 +85,7 @@ def _save(root, topology, fmt, values):
 
 def _repack_and_load(root, stored, topology, fmt, values):
     target = _storage(root, topology, fmt, "per_stage", save=True)
-    run_ranks(int(np.prod(topology)), lambda r: gio.rank_reshard(r, stored, target))
+    run_ranks(int(np.prod(topology)), lambda r: rank_reshard(r, stored, target))
     _verify("REPACK", root, topology, fmt, values)
     table, points, _, _ = axes.schema(topology)
     loaded = ArrayFabric(table, points)
@@ -171,7 +172,7 @@ def test_axes_checkpoint_merge_crc(tmp_path, fmt, weights, shift, label, src, mi
     final_root = tmp_path / "final"
     target = _storage(final_root, dst, other, "single", save=True)
     readable = _storage(out, mid, fmt, "rank_multi")
-    run_ranks(int(np.prod(dst)), lambda r: gio.rank_reshard(r, readable, target))
+    run_ranks(int(np.prod(dst)), lambda r: rank_reshard(r, readable, target))
     _verify("CONSOLIDATE", final_root, dst, other, expected, files=1)
     final_table, final_points, _, _ = axes.schema(dst)
     final = ArrayFabric(final_table, final_points)
@@ -205,7 +206,7 @@ def test_axes_swapped_expert_payloads_fail_crc_and_values(tmp_path, fmt):
         _verify("CORRUPT", tmp_path, topology, fmt, values)
     table, points, _, _ = axes.schema((1, 1, 1, 1))
     loaded = ArrayFabric(table, points)
-    assert type(gio.rank_load(0, loaded.view(0), stored)) is gt.Ok
+    assert type(gio.rank_load(0, loaded.view(0), stored)) is gb.Ok
     with pytest.raises(AssertionError):
         loaded.assert_values(values)
     print(

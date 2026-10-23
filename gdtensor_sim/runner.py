@@ -14,12 +14,13 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Optional
 
 from gdtensor import Result
-from gdtensor.io import rank_load, rank_reshard, rank_save
+from gdtensor.io import rank_load, rank_save
+from tests.support.compat import rank_reshard
 from .coord import ProcessCoordinator, ThreadCoordinator
 from gdtensor.builder import ComputeDTensorsView, DTensorTable, GDTensorIOError
 from .formats import make_storage_view
 from .iobackend import FileIO
-from gdtensor.tag import Err, Ok
+from gdtensor.builder import Err, Ok
 from gdtensor_sim.fabric import ComputeDataAccessor, ComputeFabric
 
 
@@ -109,6 +110,7 @@ def _proc_main(rank, op, table, storage_table, layout, root, coord, fill, q):
             root,
             io,
             coord,
+            dcp_mode="process" if layout.container_format == "distcp" else "thread",
         )
         cv = compute_view(table, fabric, rank)
         if op == "save":

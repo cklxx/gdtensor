@@ -71,10 +71,10 @@ def placements(kind, shape, transpose=False):
     """Placements over (PP, DP, EP, TP) for one tensor kind."""
     axis = (int(kind == "row") + int(transpose)) % len(shape)
     return [
-        gt.Replicate(),
-        gt.Shard(0) if kind == "optimizer" else gt.Replicate(),
-        gt.Replicate(),
-        gt.Replicate() if kind == "replicate" else gt.Shard(axis),
+        gb.Replicate(),
+        gb.Shard(0) if kind == "optimizer" else gb.Replicate(),
+        gb.Replicate(),
+        gb.Replicate() if kind == "replicate" else gb.Shard(axis),
     ]
 
 
@@ -99,7 +99,7 @@ def mesh_slices(topology, stage, expert, places, order, storage):
     if not storage:
         return slices
     for axis in (1, 2, 3):
-        if slices[axis] is None and type(places[axis]) is gt.Replicate:
+        if slices[axis] is None and type(places[axis]) is gb.Replicate:
             slices[axis] = gb.Slice(order % topology[axis], order % topology[axis] + 1)
     return slices
 
@@ -107,7 +107,7 @@ def mesh_slices(topology, stage, expert, places, order, storage):
 def gd_mesh(topology, stage, expert, places, order, storage):
     world = int(np.prod(topology))
     base = (
-        gb.OuterProductMesh(
+        gb.SlotOuterProductMesh(
             gb.ArrangedMesh(gt.ConstantOne(1)), gb.ArrangedMesh(gt.WorldSize(world))
         )
         if storage
@@ -129,10 +129,10 @@ def dense_points(shape, topology, rank, stage, expert, places, order, storage):
         fixed = axis == 2 and expert is not None
         size, coord = (1, 0) if fixed else (topology[axis], coords[axis])
         place = places[axis]
-        if type(place) is gt.Replicate and storage and coord != order % size:
+        if type(place) is gb.Replicate and storage and coord != order % size:
             return np.array([], dtype=np.int64)
-        if type(place) is gt.Shard:
-            points = _chunk(points, place.value, size, coord)
+        if type(place) is gb.Shard:
+            points = _chunk(points, place.axis, size, coord)
     return points.ravel()
 
 

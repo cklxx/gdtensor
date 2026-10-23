@@ -28,7 +28,6 @@ import pytest
 import gdtensor
 import gdtensor.builder as gb
 import gdtensor.io as gio
-import gdtensor.tag as gt
 from gdtensor_sim.coord import ProcessCoordinator
 from tests.support import axes
 from tests.support.oracle import TorchAccessor
@@ -74,7 +73,7 @@ def expected_mean(k):
 
 
 def _ok(result):
-    assert type(result) is gt.Ok, result
+    assert type(result) is gb.Ok, result
     return result.value
 
 
@@ -120,7 +119,7 @@ def _torch_mesh(torch, topology, stage, expert):
 def _torch_placements(places):
     from torch.distributed.tensor import Replicate, Shard
 
-    return [Shard(p.value) if type(p) is gt.Shard else Replicate() for p in places]
+    return [Shard(p.axis) if type(p) is gb.Shard else Replicate() for p in places]
 
 
 def compute_view(torch, topology, rank, values):
@@ -166,7 +165,7 @@ def _local_shape(flat, topology, rank, stage, expert, places):
         return (0,)
     shape = list(flat)
     for axis in (1, 2, 3):
-        if type(places[axis]) is gt.Shard:
+        if type(places[axis]) is gb.Shard:
             size = 1 if axis == 2 and expert is not None else topology[axis]
             coord = 0 if axis == 2 and expert is not None else coords[axis]
             dim = places[axis].value

@@ -30,12 +30,13 @@ from gdtensor.builder import (
     leader_tensor_component_pos_of,
     TensorComponentPos,
     ArrangedMesh,
-    OuterProductMesh,
+    SlotOuterProductMesh,
     ReshapedMesh,
     Slice,
     SlicedMesh,
 )
-from gdtensor.tag import ConstantOne, WorldSize, Replicate, Shard
+from gdtensor.tag import ConstantOne, WorldSize
+from gdtensor.builder import Replicate, Shard
 from ._geometry import naive_of, tensor_ids_of, nbytes_of, numel_of, nonempty_columns
 from ._result import invalid
 
@@ -181,7 +182,7 @@ def compute_mesh(
 
 
 def storage_mesh(p_world: int, shape, slices):
-    base = OuterProductMesh(
+    base = SlotOuterProductMesh(
         ArrangedMesh(ConstantOne(1)), ArrangedMesh(WorldSize(p_world))
     )
     return SlicedMesh(ReshapedMesh(base, shape), slices)
@@ -389,10 +390,10 @@ def _cells_to_meshes(
 ) -> List[Any]:
     """Cover a cell set with disjoint rectangles: per row, contiguous column
     runs; identical runs on consecutive rows merge into one rectangle."""
-    from gdtensor.builder import ArrangedMesh, OuterProductMesh, Slice, SlicedMesh
+    from gdtensor.builder import ArrangedMesh, SlotOuterProductMesh, Slice, SlicedMesh
     from gdtensor.tag import TensorCount, WorldSize
 
-    base = OuterProductMesh(
+    base = SlotOuterProductMesh(
         ArrangedMesh(TensorCount(n_tensors)), ArrangedMesh(WorldSize(world))
     )
     by_row: Dict[int, List[int]] = {}
@@ -456,10 +457,8 @@ def build_layout(
     file_paths: Dict[TensorComponentPos, str] = {}
     for path in sorted(groups):
         cells = groups[path]
-        lst = DisjointStorageMeshList(
-            _cells_to_meshes(cells, len(ids), world_size), ids
-        )
-        file_paths[leader_tensor_component_pos_of(lst)] = path
+        lst = DisjointStorageMeshList(_cells_to_meshes(cells, len(ids), world_size))
+        file_paths[leader_tensor_component_pos_of(lst, ids)] = path
         for t, w in cells:
             tensor_entries[TensorComponentPos(ids[t], w)] = lst
     return PhysicalLayoutTable(container_format, tensor_entries, file_paths)

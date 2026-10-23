@@ -14,7 +14,7 @@ import functools
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from ..tag import Err, Ok
+from .products import Err, Ok
 from .builder_mixin import field_hash, make_builder_mixin
 
 

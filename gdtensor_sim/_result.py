@@ -3,7 +3,7 @@
 from functools import wraps
 
 from gdtensor.builder import GDTensorIOError, InvalidArgumentError, NotFoundError
-from gdtensor.tag import Err, Ok
+from gdtensor.builder import Err, Ok
 
 
 class Fail(Exception):

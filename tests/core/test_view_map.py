@@ -24,7 +24,7 @@ def test_view_map_selects_its_domain_and_keeps_origin_unchanged(branch):
 
     def convert(tensor):
         calls.append(tensor)
-        return gt.Ok(replacement)
+        return gb.Ok(replacement)
 
     def wrong_domain(tensor):
         pytest.fail("view map invoked the other domain's converter")
@@ -34,7 +34,7 @@ def test_view_map_selects_its_domain_and_keeps_origin_unchanged(branch):
         convert_each_storage_view=convert if branch == "storage" else wrong_domain,
     )
     result = gb.d_tensors_view_map(origin, core)
-    assert type(result) is gt.Ok and calls == [original] and not events
+    assert type(result) is gb.Ok and calls == [original] and not events
     mapped = result.value
     assert mapped.d_tensor_table.named_d_tensors[0].d_tensor is replacement
     assert origin.d_tensor_table.named_d_tensors[0].d_tensor is original
@@ -54,24 +54,24 @@ def test_view_map_converts_sessions_when_opened(convert_tensors):
 
     def convert_save(session):
         events.append("convert_save")
-        return gt.Ok(session)
+        return gb.Ok(session)
 
     def convert_load(session):
         events.append("convert_load")
-        return gt.Ok(session)
+        return gb.Ok(session)
 
     result = gb.d_tensors_view_map(
         origin,
         gb.DTensorsViewMapCore(
-            convert_each_storage_view=(lambda t: gt.Ok(t)) if convert_tensors else None,
+            convert_each_storage_view=(lambda t: gb.Ok(t)) if convert_tensors else None,
             convert_each_storage_save_session=convert_save,
             convert_each_storage_load_session=convert_load,
         ),
     )
-    assert type(result) is gt.Ok and not events
+    assert type(result) is gb.Ok and not events
     mapped = result.value
-    assert type(gio.rank_save(0, compute_view(Memory(range(8))), mapped)) is gt.Ok
-    assert type(gio.rank_load(0, compute_view(Memory([0] * 8)), mapped)) is gt.Ok
+    assert type(gio.rank_save(0, compute_view(Memory(range(8))), mapped)) is gb.Ok
+    assert type(gio.rank_load(0, compute_view(Memory([0] * 8)), mapped)) is gb.Ok
     assert events == [
         "begin_save",
         "convert_save",
@@ -88,7 +88,7 @@ def test_view_map_preserves_begin_error_without_calling_converter():
     events = []
     error = gb.GDTensorIOError(operation="open", msg="open failed")
     origin = storage_view(Memory(range(8)), events)
-    origin.begin_load = lambda view, rank: gt.Err(error)
+    origin.begin_load = lambda view, rank: gb.Err(error)
     mapped = gb.d_tensors_view_map(
         origin,
         gb.DTensorsViewMapCore(
@@ -96,7 +96,7 @@ def test_view_map_preserves_begin_error_without_calling_converter():
         ),
     ).value
     result = gio.rank_load(0, compute_view(Memory([0] * 8)), mapped)
-    assert type(result) is gt.Err and result.value is error
+    assert type(result) is gb.Err and result.value is error
     assert not events
 
 
@@ -107,7 +107,7 @@ def test_view_map_closes_session_on_conversion_error(operation):
     origin = storage_view(Memory(range(8)), events)
     core = gb.DTensorsViewMapCore(
         **{
-            "convert_each_storage_" + operation + "_session": lambda session: gt.Err(
+            "convert_each_storage_" + operation + "_session": lambda session: gb.Err(
                 error
             )
         }
@@ -119,7 +119,7 @@ def test_view_map_closes_session_on_conversion_error(operation):
         if operation == "save"
         else gio.rank_load(0, cv, mapped)
     )
-    assert type(result) is gt.Err and result.value is error
+    assert type(result) is gb.Err and result.value is error
     assert events == [
         "begin_" + operation,
         "abort" if operation == "save" else "finish",
@@ -141,7 +141,7 @@ def test_view_map_uses_the_replacement_session(operation):
             else Load(replacement_memory, events)
         )
         replacements.append(replacement)
-        return gt.Ok(replacement)
+        return gb.Ok(replacement)
 
     core = gb.DTensorsViewMapCore(
         **{"convert_each_storage_" + operation + "_session": convert}
@@ -150,7 +150,7 @@ def test_view_map_uses_the_replacement_session(operation):
     assert not events and not replacements
     compute_memory = Memory(range(8)) if operation == "save" else Memory([0] * 8)
     result = getattr(gio, "rank_" + operation)(0, compute_view(compute_memory), mapped)
-    assert type(result) is gt.Ok and len(replacements) == 1
+    assert type(result) is gb.Ok and len(replacements) == 1
     assert events == [
         "begin_" + operation,
         "convert_" + operation,
@@ -183,16 +183,16 @@ def test_view_map_conversion_failure_survives_cleanup_failure(
         events.append(close)
         if cleanup_failure == "exception":
             raise RuntimeError("secondary error")
-        return gt.Err(cleanup_error)
+        return gb.Err(cleanup_error)
 
     def convert(opened):
         assert opened is session
         if failure == "exception":
             raise RuntimeError("primary conversion error")
-        return gt.Err(error) if failure == "err" else None
+        return gb.Err(error) if failure == "err" else None
 
     setattr(session, close, cleanup)
-    setattr(origin, "begin_" + operation, lambda view, rank: gt.Ok(session))
+    setattr(origin, "begin_" + operation, lambda view, rank: gb.Ok(session))
     core = gb.DTensorsViewMapCore(
         **{"convert_each_storage_" + operation + "_session": convert}
     )
@@ -201,7 +201,7 @@ def test_view_map_conversion_failure_survives_cleanup_failure(
     result = getattr(gio, "rank_" + operation)(
         0, compute_view(Memory(range(8))), mapped
     )
-    assert type(result) is gt.Err and result.value is not cleanup_error
+    assert type(result) is gb.Err and result.value is not cleanup_error
     if failure == "err":
         assert result.value is error
     elif failure == "exception":
@@ -233,12 +233,12 @@ def test_view_map_stops_at_first_tensor_error_and_preserves_ids_and_aliases():
 
     def convert(dt):
         calls.append(dt)
-        return gt.Err(error)
+        return gb.Err(error)
 
     core = gb.DTensorsViewMapCore(convert_each_compute_view=convert)
     result = gb.d_tensors_view_map(origin, core)
-    assert result == gt.Err(error) and len(calls) == 1
-    core.convert_each_compute_view = lambda dt: gt.Ok(dt)
+    assert result == gb.Err(error) and len(calls) == 1
+    core.convert_each_compute_view = lambda dt: gb.Ok(dt)
     mapped = gb.d_tensors_view_map(origin, core).value
     assert mapped.tensor_ids == ["w", "second"]
     assert [nd.alias for nd in mapped.d_tensor_table.named_d_tensors] == [
@@ -250,13 +250,13 @@ def test_view_map_stops_at_first_tensor_error_and_preserves_ids_and_aliases():
 
 def test_view_map_rejects_unknown_origin():
     result = gb.d_tensors_view_map(object(), gb.DTensorsViewMapCore())
-    assert type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
+    assert type(result) is gb.Err and type(result.value) is gb.InvalidArgumentError
 
 
 def test_view_map_requires_result_callbacks():
     gd = gb.NaiveDTensor(
         gb.GlobalTensorMeta([2], "F32", 4),
-        [gt.Replicate()],
+        [gb.Replicate()],
         gb.ArrangedMesh(gt.WorldSize(1)),
     )
     view = gb.ComputeDTensorsView(
@@ -265,4 +265,4 @@ def test_view_map_requires_result_callbacks():
     result = gb.d_tensors_view_map(
         view, gb.DTensorsViewMapCore(convert_each_compute_view=lambda tensor: tensor)
     )
-    assert type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
+    assert type(result) is gb.Err and type(result.value) is gb.InvalidArgumentError

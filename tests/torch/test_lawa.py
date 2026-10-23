@@ -20,7 +20,7 @@ from tests.support.storage import FileStorage
 
 
 def _ok(result):
-    assert type(result) is gt.Ok, result
+    assert type(result) is gb.Ok, result
     return result.value
 
 
@@ -82,7 +82,7 @@ def _check_output(torch, path, fmt, expected, world):
 
 
 def _storage(root, values, fmt, coord, world):
-    mesh = gb.OuterProductMesh(
+    mesh = gb.SlotOuterProductMesh(
         gb.ArrangedMesh(gt.ConstantOne(1)), gb.ArrangedMesh(gt.WorldSize(world))
     )
     table = gb.DTensorTable(
@@ -95,7 +95,7 @@ def _storage(root, values, fmt, coord, world):
                         "F64" if value.element_size() == 8 else "F32",
                         value.element_size(),
                     ),
-                    [gt.Replicate(), gt.Shard(0)],
+                    [gb.Replicate(), gb.Shard(0)],
                     mesh,
                 ),
             )

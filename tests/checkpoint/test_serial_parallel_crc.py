@@ -19,7 +19,8 @@ import numpy as np
 import pytest
 
 import gdtensor.io as gio
-import gdtensor.tag as gt
+from tests.support.compat import rank_reshard
+import gdtensor.builder as gb
 from tests.support.checkpoint import file_bytes, small_schema
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import payload_regions, storage_points, storage_view
@@ -36,7 +37,7 @@ ONE = (1, 1, 1)
 
 
 def _ok(result):
-    assert type(result) is gt.Ok, result
+    assert type(result) is gb.Ok, result
 
 
 def _concurrent(world, action):
@@ -126,7 +127,7 @@ def _read_schedules(table, points, storage, baseline, world):
 
 def _canonicalize(root, fmt, source, serial_table):
     destination = storage_view(root, serial_table, ONE, "single", "hf", fmt, save=True)
-    _ok(gio.rank_reshard(0, source, destination))
+    _ok(rank_reshard(0, source, destination))
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])

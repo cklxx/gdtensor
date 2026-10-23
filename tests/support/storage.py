@@ -20,9 +20,9 @@ def _result(fn):
     def call(*args, **kwargs):
         try:
             value = fn(*args, **kwargs)
-            return value if type(value) in (gt.Ok, gt.Err) else gt.Ok(value)
+            return value if type(value) in (gb.Ok, gb.Err) else gb.Ok(value)
         except Exception as exc:
-            return gt.Err(gb.GDTensorIOError(operation=fn.__name__, msg=str(exc)))
+            return gb.Err(gb.GDTensorIOError(operation=fn.__name__, msg=str(exc)))
 
     return call
 
@@ -116,14 +116,14 @@ def _file_header(table, slots):
 
 def _file_layout(storage, points, kind, stages):
     groups = _group_cells(storage, points, kind, stages)
-    base = gb.OuterProductMesh(
+    base = gb.SlotOuterProductMesh(
         gb.ArrangedMesh(gt.TensorCount(len(storage.ids))),
         gb.ArrangedMesh(gt.WorldSize(storage.world)),
     )
     entries, paths = {}, {}
     for path, cells in groups.items():
-        group = gb.DisjointStorageMeshList(_group_meshes(base, cells), storage.ids)
-        leader = gb.leader_tensor_component_pos_of(group)
+        group = gb.DisjointStorageMeshList(_group_meshes(base, cells))
+        leader = gb.leader_tensor_component_pos_of(group, storage.ids)
         paths[leader] = path
         slots, size = _file_slots(storage, cells, points, path, group, entries)
         header = _file_header(storage.table, slots)
@@ -264,7 +264,7 @@ class _FileAccessor(ga.DTensorDataAccessor):
         path, offset = self._address(rng)
         data = np.empty(rng.size, dtype=np.uint8)
         result = callback(data.ctypes.data, data.nbytes)
-        if type(result) is gt.Err:
+        if type(result) is gb.Err:
             return result
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -279,16 +279,16 @@ class _Save(gs.StorageSaveSession):
 
     def get_file_offset(self, pos):
         path, offset = self.storage.offsets[pos]
-        return gt.Ok(len(self.storage.files[path][2]) + offset)
+        return gb.Ok(len(self.storage.files[path][2]) + offset)
 
     def init_data_accessor(self):
-        return gt.Ok(_FileAccessor(self.storage, True))
+        return gb.Ok(_FileAccessor(self.storage, True))
 
     @_result
     def commit(self):
         storage = self.storage
         if storage.coord is not None and not storage.coord.vote(True):
-            return gt.Err(
+            return gb.Err(
                 gb.GDTensorIOError(operation="commit", msg="another rank aborted")
             )
         for path in _leader_paths(storage, self.rank):
@@ -313,10 +313,10 @@ class _Load(gs.StorageLoadSession):
 
     def get_file_offset(self, pos):
         path, offset = self.storage.offsets[pos]
-        return gt.Ok(len(self.storage.files[path][2]) + offset)
+        return gb.Ok(len(self.storage.files[path][2]) + offset)
 
     def init_data_accessor(self):
-        return gt.Ok(_FileAccessor(self.storage, False))
+        return gb.Ok(_FileAccessor(self.storage, False))
 
     def finish(self):
-        return gt.Ok(None)
+        return gb.Ok(None)
