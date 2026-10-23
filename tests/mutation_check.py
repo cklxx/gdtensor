@@ -72,6 +72,12 @@ MUTATIONS = [
         "    Error, ConstraintViolationError,\n",
         "tests/core/test_api_conformance.py::test_exports_are_exactly_the_design",
     ),
+    # No mutation entries for the per-rank runtime guards: through the public
+    # builders every malformed plan is already rejected at plan generation, so
+    # planner and runtime guard enforce the same observable Err. A mutation
+    # that disables one layer is masked by the other by construction. The
+    # guards are defense in depth; tests/io/test_runtime_invariants.py pins
+    # the contract (exact per-rank bytes, no session on rejection).
 ]
 
 

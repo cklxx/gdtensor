@@ -255,6 +255,200 @@ def _ranges(plan: CopyPlan, pred) -> List[DTensorRange]:
     return [r for pair in plan for r in pair if pred(r)]
 
 
+# ------------------------------------------------- runtime validation
+#
+# B.1.3 check_* are callable externally, but a correct rank executor must
+# also enforce the per-rank safety properties itself: aggregate/union checks
+# cannot see a rank that silently copied half of its shard (another rank's
+# bytes would still make the union look full). The guards below run on one
+# rank's plan in rank_save / rank_load / rank_reshard, before any session is
+# opened, so a malformed plan never reaches the accessors.
+
+CHECK = "runtime_plan_check"
+
+
+def _dst_compute_pairs(plan: CopyPlan, tid: str):
+    return [
+        (dst.global_tensor_offset, dst.size)
+        for _, dst in plan
+        if is_compute(dst) and dst.global_tensor_id == tid
+    ]
+
+
+def _compute_sources(plan: CopyPlan) -> Dict[str, np.ndarray]:
+    out: Dict[str, list] = {}
+    for src, _ in plan:
+        if is_compute(src):
+            out.setdefault(src.global_tensor_id, []).append(
+                (src.global_tensor_offset, src.size)
+            )
+    return {tid: _byte_iv(pairs) for tid, pairs in out.items()}
+
+
+def _storage_side_within(view, plan: CopyPlan, which: str):
+    """Bounds-check storage ranges on one copy side (src or dst) and return
+    payload index plus file -> byte intervals. Each side is inspected alone
+    so an ss reshard reading and writing the same file is not counted twice."""
+    ranges = [src for src, _ in plan] if which == "src" else [dst for _, dst in plan]
+    by_raw: Dict[str, list] = {}
+    for r in ranges:
+        if is_storage(r):
+            by_raw.setdefault(r.file_path, []).append(
+                (r.contiguous_payload_offset, r.size)
+            )
+    index = _Side(view).index
+    by_f = {
+        path: _check_bounds(
+            pairs, index.files[path].payload_size, f"storage {path}", CHECK
+        )
+        for path, pairs in by_raw.items()
+    }
+    return index, by_f
+
+
+def validate_rank_save(rank: int, compute_view, storage_view, plan: CopyPlan) -> None:
+    """One rank reads exactly the compute elements it is designated to write,
+    no more and no less, and writes disjoint bytes into storage.
+
+    Coverage is per rank. The union of all ranks' plans looking complete
+    cannot hide one rank that persisted only half of its shard.
+    """
+    for nd in compute_view.d_tensor_table.named_d_tensors:
+        tid = nd.global_tensor_id
+        pairs = [
+            (src.global_tensor_offset, src.size)
+            for src, _ in plan
+            if is_compute(src) and src.global_tensor_id == tid
+        ]
+        designated = is_designated_writer(
+            nd, rank, order_of(compute_view.d_tensor_table, tid)
+        )
+        owns = iv_total(owned_intervals(nd, "compute", rank)) > 0
+        if designated and owns:
+            _covers_owned(nd, rank, pairs, CHECK)
+        elif pairs:
+            raise check_failed(
+                CHECK, f"rank {rank}: plan reads tensor {tid} it does not write"
+            )
+    _, by_f = _storage_side_within(storage_view, plan, "dst")
+    for path, iv in by_f.items():
+        _assert_disjoint(iv, f"storage {path}", CHECK)
+
+
+def _aligned_byte_iv(nd, pairs, check: str) -> np.ndarray:
+    itemsize = global_tensor_meta_of(nd).itemsize
+    for offset, size in pairs:
+        if offset < 0 or size < 0:
+            raise check_failed(check, f"{nd.global_tensor_id}: negative range")
+        if offset % itemsize or size % itemsize:
+            raise check_failed(
+                check,
+                f"{nd.global_tensor_id}: range offset={offset} size={size} "
+                f"is not aligned to itemsize {itemsize}",
+            )
+    return _byte_iv(pairs)
+
+
+def _covers_owned(nd, rank: int, pairs, check: str) -> None:
+    """Plan byte ranges on a compute tensor must equal the rank's owned
+    elements exactly: no overlap, no gap, no extra byte. Owned elements are
+    compared in element space because a shard on a non-leading axis yields
+    several disjoint byte blocks, not one [0, nbytes) interval."""
+    itemsize = global_tensor_meta_of(nd).itemsize
+    byte_iv = _aligned_byte_iv(nd, pairs, check) if pairs else EMPTY
+    _assert_disjoint(byte_iv, f"compute {nd.global_tensor_id}", check)
+    got = iv_normalize((byte_iv // itemsize).astype(np.int64)) if pairs else EMPTY
+    want = iv_normalize(owned_intervals(nd, "compute", rank))
+    if not (got.shape == want.shape and bool(np.array_equal(got, want))):
+        raise check_failed(
+            check,
+            f"rank {rank} compute {nd.global_tensor_id}: plan covers "
+            f"{iv_total(got)} of {iv_total(want)} elements",
+        )
+
+
+def _check_rank_writes_only_owned(rank: int, tid: str, pairs, owns: bool) -> None:
+    if not owns and pairs:
+        raise check_failed(
+            CHECK, f"rank {rank}: plan writes tensor {tid} it does not own"
+        )
+
+
+def validate_rank_load(rank: int, compute_view, storage_view, plan: CopyPlan) -> None:
+    """One rank must fill every element it owns on the compute side, and
+    its reads of one storage file must stay within that file's payload.
+
+    Coverage is checked per rank, not over the union of all ranks: a
+    replicated tensor must arrive in full at every replica, so another
+    replica reading the missing bytes cannot hide this rank's gap.
+    """
+    nd_by_id = {
+        nd.global_tensor_id: nd for nd in compute_view.d_tensor_table.named_d_tensors
+    }
+    got_ids = {dst.global_tensor_id for _, dst in plan if is_compute(dst)}
+    extra = got_ids - set(nd_by_id)
+    if extra:
+        raise check_failed(CHECK, f"compute range on unknown tensor {sorted(extra)}")
+    for tid, nd in nd_by_id.items():
+        pairs = _dst_compute_pairs(plan, tid)
+        owns = iv_total(owned_intervals(nd, "compute", rank)) > 0
+        _check_rank_writes_only_owned(rank, tid, pairs, owns)
+        if owns:
+            _covers_owned(nd, rank, pairs, CHECK)
+    index, by_f = _storage_side_within(storage_view, plan, "src")
+    for path, iv in by_f.items():
+        total = index.files[path].payload_size
+        if iv.size and (int(iv[:, 0].min()) < 0 or int(iv[:, 1].max()) > total):
+            raise check_failed(
+                CHECK, f"storage {path}: read range outside [0, {total})"
+            )
+
+
+def validate_rank_reshard(rank: int, src_view, dst_view, plan: CopyPlan) -> None:
+    # Destination coverage when it is compute; destination disjointness
+    # when it is storage. Source ranges are bounds-checked.
+    if type(dst_view) is ComputeDTensorsView:
+        if type(src_view) is StorageDTensorsView:
+            validate_rank_load(rank, dst_view, src_view, plan)
+        else:
+            _validate_compute_to_compute(rank, dst_view, plan)
+    else:
+        _validate_storage_destination(dst_view, plan)
+        if type(src_view) is StorageDTensorsView:
+            _validate_storage_source(src_view, plan)
+
+
+def _validate_compute_to_compute(rank: int, compute_view, plan: CopyPlan) -> None:
+    for nd in compute_view.d_tensor_table.named_d_tensors:
+        tid = nd.global_tensor_id
+        pairs = _dst_compute_pairs(plan, tid)
+        owns = iv_total(owned_intervals(nd, "compute", rank)) > 0
+        _check_rank_writes_only_owned(rank, tid, pairs, owns)
+        if owns:
+            _covers_owned(nd, rank, pairs, CHECK)
+    for tid, iv in _compute_sources(plan).items():
+        _assert_disjoint(iv, f"compute {tid}", CHECK)
+
+
+def _validate_storage_destination(storage_view, plan: CopyPlan) -> None:
+    _, by_f = _storage_side_within(storage_view, plan, "dst")
+    for path, iv in by_f.items():
+        _assert_disjoint(iv, f"storage {path}", CHECK)
+
+
+def _validate_storage_source(storage_view, plan: CopyPlan) -> None:
+    _, by_f = _storage_side_within(storage_view, plan, "src")
+    for path, iv in by_f.items():
+        total = _Side(storage_view).index.files[path].payload_size
+        if iv.size and int(iv[:, 1].max()) > total:
+            raise check_failed(
+                CHECK, f"storage {path}: read range outside [0, {total})"
+            )
+
+
+# ------------------------------------------------------------------ B.1.3 public checks
+
+
 def _byte_iv(pairs: Iterable[Tuple[int, int]]) -> np.ndarray:
     arr = np.array(list(pairs), dtype=np.int64).reshape(-1, 2)
     arr[:, 1] += arr[:, 0]

@@ -69,13 +69,29 @@
 | LiteralMesh | 非空；rank 不重复；rank=-1 / rank=max 拒绝 |
 | 5 个 Error product | msg 非空；空 msg 拒绝 |
 
-递归错误用对象 identity 断言，确保父对象不重新包装错误。此矩阵不等于 B.1.3 的内部 `check_*` 验证。
+递归错误用对象 identity 断言，确保父对象不重新包装错误。矩阵约束不替代 B.1.3 的运行时不变量验证，后者见下一节。
+
+## B.1.3 运行时不变量
+
+`rank_save` / `rank_load` / `rank_reshard` 在生成 plan 后、打开任何 session 前执行 per-rank 校验。校验失败时不打开 session、不触发 accessor。
+
+| 规则 | save | load | reshard |
+|---|---|---|---|
+| 本 rank 计算侧访问互不重叠 | 源（读） | 目标（写） | 按方向 |
+| 本 rank 恰好覆盖本 rank 负责的计算元素 | 指定写者 | 每个 rank 各自覆盖 | dst 为 compute 时 |
+| 单文件存储访问不重叠且不越界 | 目标（写） | 源（读），按侧分别检查 | 按方向 |
+
+覆盖按 rank 单独判定，不做全 rank 并集。一个 rank 漏分片不能被其他 rank 的字节掩盖；replicate 张量要求每个副本各自读到完整副本。元素空间比对支持非首轴分片产生的多段字节块。测试见 [io/test_runtime_invariants.py](io/test_runtime_invariants.py)：逐 rank save/load 精确字节、缺列 save 拒绝且不开 session、缺源列 load 拒绝且不开 session、每个 replicate 副本独立读全量。
+
+通过公开 builder 能构造的畸形 plan 在 plan 生成阶段已被拒绝，运行时守卫对同一批输入强制相同结果。因此变异测试无法区分两层守卫（关掉一层另一层仍拦截），守卫定位为防御深度，不单独列入 mutation_check 的变异条目。守卫的独立价值在 plan 生成层回归时生效；此场景需要绕过公开 builder 才能直接观测。
+
+设计 B.1.3 的 5 个聚合 `check_*`（跨 rank 并集 disjoint / full covering、storage mesh disjoint、physical layout disjoint）仍只做源码与注解检查。单 rank 执行器拿不到其他 rank 的 plan，跨 rank 并集校验需要设计指定聚合点（barrier 或调用方收集），当前不新增跨 rank 协调 API。
 
 ## 未覆盖或只做静态检查
 
 | 缺口 | 当前证据 | 处理边界 |
 |---|---|---|
-| 5 个内部 `check_*` 的 disjoint / covering 行为 | 源码声明、参数与 Result 注解检查；没有公开调用路径 | 保留“只通过公开 API 测试”的要求，因此不能声明这些函数已有行为测试；需要设计提供调用路径才能闭合 |
+| 5 个聚合 `check_*` 的跨 rank 并集行为 | 源码声明、参数与 Result 注解检查；per-rank 子集已在运行时强制 | 聚合点需要设计指定；不自行新增跨 rank 协调 API |
 | `Partial` 的持久化与搬运语义 | 仅 tag/union 合约 | 设计未规定 IO 行为；需要明确语义后补测试，不能按当前实现自行定义 |
 | GPU / NCCL；真实进程 PP/EP 的 IO 搬运 | CPU/gloo 已跑四轴 LAWA；PP/EP 的纯 checkpoint 矩阵仍使用线程 | 需要对应设备与执行场景；线程搬运不证明训练、token routing 或梯度通信 |
 | 对象存储 multipart、网络中断与服务端重试 | 本地文件与注入的 session/accessor 失败 | 设计将其放在 session 实现层；当前没有对象存储适配器集成用例 |
@@ -99,7 +115,7 @@ uv run --locked python tests/mutation_check.py
 scripts/review.sh
 ```
 
-`full_check.sh` 依次检查格式、lint、两个类型检查器、编译和全部 pytest，并启用 torch。CI 只安装默认依赖，不启用 torch，因此会跳过 `torch/` 的 24 个用例。变异测试由独立命令执行，不随普通 pytest 自动运行。
+`full_check.sh` 依次检查格式、lint、两个类型检查器、编译和全部 pytest，并启用 torch。GitHub Actions 将测试分为非 torch 与 CPU torch 两个领域：Python 3.12 / 3.13 跑非 torch 用例；Python 3.12 跑 `torch/` 的全部 24 个用例及两个类型检查器。9 项变异检查在 Python 3.12 的独立步骤执行，不随普通 pytest 自动运行。所有任务通过后 `CI gate` 才通过。
 
 `review.sh` 分 7 阶段演示小数据：合约、arange/CRC、LAWA、checkpoint 平均、串行/并行文件一致性、plan/约束、四轴混合拓扑。日志中 `[CRC+ARANGE]` 标识文件与元素正确性，`[lawa]` 标识数值平均，`[PLAN]` 标识实际访问区间。损坏用例的 `PASS` 表示检测器抓到了预期错误。
 

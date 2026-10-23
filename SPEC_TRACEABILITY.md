@@ -12,6 +12,7 @@
 | B.1.1 IO 与 session 生命周期 | `internal/api.py` | [`test_io_contract.py`](tests/io/test_io_contract.py)；初始化、读写、finish、commit 失败与清理 |
 | B.1.2 区间配对、所有权与偏移 | `internal/plan.py`、`internal/dtensor.py`、`internal/layout.py` | [`test_data_correctness.py`](tests/checkpoint/test_data_correctness.py)、[`test_matrix.py`](tests/checkpoint/test_matrix.py)、[`test_random.py`](tests/checkpoint/test_random.py)；独立切片、CRC、逐字节与覆盖计数 |
 | B.1.2 / B.1.3 内部接口声明 | `internal/plan.py` 的 3 个 plan 和 5 个 check | [`test_api_conformance.py`](tests/core/test_api_conformance.py) 只解析源码，与设计逐项核对名称、参数和 Result 注解，不导入内部 API |
+| B.1.3 per-rank 运行时不变量 | `internal/plan.py` 的 `validate_rank_save/load/reshard`，由 `internal/api.py` 在 plan 生成后、开 session 前调用 | [`test_runtime_invariants.py`](tests/io/test_runtime_invariants.py)；逐 rank 精确覆盖、replicate 每副本独立读全量、缺列/缺源拒绝且不开 session。5 个聚合 check 的跨 rank 并集行为未接入，缺口见[测试矩阵 B.1.3](tests/README.md) |
 | plan 的公开可观测行为 | `rank_save/load/reshard` → accessor | [`test_plan_behavior.py`](tests/io/test_plan_behavior.py)；手算 2×5 I16 区间、mesh 转置和步长切片、乱序 rank、空分片、packed 偏移、replica 去重、表顺序和缺源时不开 session |
 | TP / DP / EP / PP 及混合配置的 checkpoint 搬运 | 测试调用方构造四维 mesh，核心仍只处理设计中的 view | [`test_parallel_modes.py`](tests/checkpoint/test_parallel_modes.py)；60 个跨拓扑 / 格式 / 文件布局用例（四轴全部 15 种非空组合）及 2 个交换 expert 负例；每 rank 实际值、CRC、覆盖一次、串行整文件一致；线程模拟，不覆盖训练通信 |
 | 多 checkpoint 组合读写与调用方合并 | `rank_save/load/reshard`；数值合并由测试调用方执行 | [`test_checkpoint_merge_crc.py`](tests/checkpoint/test_checkpoint_merge_crc.py)；多 rank / tensor / 文件、跨格式重排、普通与加权平均、拆分再合并、源文件不变、等长 payload 跨文件交换 |

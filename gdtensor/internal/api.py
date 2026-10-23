@@ -10,6 +10,9 @@ from .plan import (
     d_tensors_view_rank_plan_load,
     d_tensors_view_rank_plan_reshard,
     d_tensors_view_rank_plan_save,
+    validate_rank_load,
+    validate_rank_reshard,
+    validate_rank_save,
 )
 from .ranges import CopyPlan
 from .result import catch, invalid, must_ok
@@ -101,6 +104,7 @@ def d_tensors_view_rank_save(
     ):
         raise invalid("views", "rank_save requires a compute view and a storage view")
     plan = must_ok(d_tensors_view_rank_plan_save(rank, compute_view, storage_view))
+    validate_rank_save(rank, compute_view, storage_view, plan)
     _log_plan("save", rank, plan)
     assert storage_view.begin_save is not None
     session = must_ok(storage_view.begin_save(storage_view, rank))
@@ -123,6 +127,7 @@ def d_tensors_view_rank_load(
     ):
         raise invalid("views", "rank_load requires a compute view and a storage view")
     plan = must_ok(d_tensors_view_rank_plan_load(rank, compute_view, storage_view))
+    validate_rank_load(rank, compute_view, storage_view, plan)
     _log_plan("load", rank, plan)
     assert storage_view.begin_load is not None
     session = must_ok(storage_view.begin_load(storage_view, rank))
@@ -144,6 +149,7 @@ def d_tensors_view_rank_reshard(
     ) not in (ComputeDTensorsView, StorageDTensorsView):
         raise invalid("views", "rank_reshard requires two DTensorsView values")
     plan = must_ok(d_tensors_view_rank_plan_reshard(rank, src_view, dst_view))
+    validate_rank_reshard(rank, src_view, dst_view, plan)
     _log_plan("reshard", rank, plan)
     src_session = dst_session = None
     try:
