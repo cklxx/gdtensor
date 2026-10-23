@@ -19,29 +19,13 @@ IO 使用 session 的 `init_data_accessor()`。自定义 accessor 不需要内�
 
 ## 测试
 
-测试只导入核心的设计 API。`test_api_conformance.py` 检查导出、函数与 BuilderMixin 签名、产品字段、领域边界，并用 AST 检查测试和 sim 没有导入 `gdtensor.internal`。
+领域、层级、用例数量、验证方式和缺口见 [测试矩阵](tests/README.md)。测试按 `core`、`io`、`checkpoint`、`torch`、`sim`、`demo` 分目录，共享 fixture 放在 `tests/support`；测试文件互不导入。
 
-| 文件 | 验证内容 |
-|---|---|
-| `test_api.py`、`test_constraints.py` | 类型别名、tag、helper、构造方法、哈希、递归约束及错误原样传递 |
-| `test_io_contract.py` | 自定义 session/accessor、六种 IO 方向、分块回调、失败清理、提交结果未知、view map |
-| `test_data_correctness.py` | 独立稠密切片与文件解码，CRC、arange、每元素恰好存一次；五种布局、两种格式、跨 world 加载与四种 reshard 方向；最多 32 rank / 64 tensor |
-| `test_checkpoint_merge_crc.py` | 3 个 checkpoint，3→5→2 / 8→6→4 / 16→12→8 rank，16/24/32 个小张量；混合格式重排、普通/加权平均、多文件拆分与单文件合并；CRC、逐字节、源文件不变及等长 payload 跨文件错位检测 |
-| `test_serial_parallel_crc.py` | 单 rank 写基线，对比 3/8/16 rank 并发写；完整张量和统一布局后的文件逐字节一致；交叉读取、顺序/并发读取一致；交换两个 rank 分片时必须检出拼错 |
-| `test_plan_behavior.py` | 通过公开 IO 的 accessor 回调核对手算区间；6 种搬运方向、乱序 rank、空分片、packed payload 偏移、5 个 tensor 的 replica 去重及缺源时不开 session |
-| `test_parallel_modes.py` | TP / DP / EP / PP、TP+DP、TP+EP、PP+EP、PP+DP+EP+TP；跨拓扑和格式、expert 归属变更、optimizer 分片、串行整文件对照；34 个用例，最多 16 个线程 rank |
-| `test_matrix.py` | world≤8 的 38 种 PP/DP/TP 配置 × 七种布局模式 × 两种格式；自拷贝、启动顺序、空张量 |
-| `test_random.py` | 32 个固定随机种子 × 两种格式，随机形状与 rank 排列 |
-| `test_torch_bridge.py`、`test_lawa.py` | 真实 torch.DTensor；2/4/8/16/32 个进程，最多 64 个 tensor；k=1/2/3/5，朴素与 Welford 平均，原生及逆序 mesh |
-| `test_walkthrough.py` | 12 个 arange 元素，打印实际字节、CRC 和跨 world 分片 |
-| `test_sim_formats.py`、`test_sim_runtime.py` | 仿真格式元数据、发布顺序和发布失败；独立 oracle 校验 sim 跨 rank 读写、真实子进程和失败回收 |
-| `mutation_check.py` | 在临时副本中执行九个行为变异，检测器只调用设计 API |
-
-CRC 和期望字节由独立的 NumPy 切片与文件解析得到，不调用核心的 ownership、interval 或 payload index。distcp 仿真实现使用 JSON metadata，不是 PyTorch DCP 的 pickle 格式。
+核心测试只调用设计 API。`tests/core/test_api_conformance.py` 检查导出、签名、产品字段和领域依赖，并递归检查测试及 sim 没有导入 `gdtensor.internal`。CRC 和期望字节由独立的 NumPy 切片与文件解析得到，不调用核心的 ownership、interval 或 payload index。distcp 仿真实现使用 JSON metadata，与 PyTorch DCP 的 pickle 格式不兼容。
 
 ### 串行/并行一致性和分片拼接
 
-`tests/test_serial_parallel_crc.py` 直接验证“分片有没有拼错，并行读写是否与串行一致”。这组测试只使用同一批原始 arange 数据，不做平均计算。它有 12 个正常用例和 2 个交换分片的损坏用例，覆盖两种格式、3/8/16 个并发 rank、16/24/32 个小张量，以及共享文件、按张量分组、每 rank 多文件和按 stage 分组的布局。
+`tests/checkpoint/test_serial_parallel_crc.py` 直接验证“分片有没有拼错，并行读写是否与串行一致”。这组测试只使用同一批原始 arange 数据，不做平均计算。它有 12 个正常用例和 2 个交换分片的损坏用例，覆盖两种格式、3/8/16 个并发 rank、16/24/32 个小张量，以及共享文件、按张量分组、每 rank 多文件和按 stage 分组的布局。
 
 1. 一个 rank 直接调用 `rank_save` 写出串行基线。多个 rank 通过线程屏障同时开始 `rank_save`，写出另一布局的分片文件。
 2. 独立解析两套文件，按全局元素下标重建完整张量。每个元素必须恰好出现一次；并行结果的 shape、dtype、全部字节和 CRC 必须与串行基线一致。
@@ -60,7 +44,7 @@ CRC 和期望字节由独立的 NumPy 切片与文件解析得到，不调用核
 
 ### CRC/arange checkpoint 合并测试的行为
 
-`tests/test_checkpoint_merge_crc.py` 有 14 个数据用例：12 个完整读写合并用例，以及 2 个跨文件损坏用例。完整用例是下表的三种配置 × 两种起始格式 × 两种平均方法。
+`tests/checkpoint/test_checkpoint_merge_crc.py` 有 14 个数据用例：12 个完整读写合并用例，以及 2 个跨文件损坏用例。完整用例是下表的三种配置 × 两种起始格式 × 两种平均方法。
 
 | pytest 配置名 | 初始保存 rank 数 | 重排、读回和数值合并 rank 数 | 最终合文件、读回 rank 数 | tensor 数 |
 |---|---:|---:|---:|---:|
@@ -104,10 +88,17 @@ CRC 只计算 payload 字节。独立 oracle 同时逐字节比较，并为每�
 | PP | `(3,1,1,1)` | `(2,1,1,1)` |
 | TP+DP | `(1,2,1,3)` | `(1,3,1,2)` |
 | TP+EP | `(1,1,2,3)` | `(1,1,3,2)` |
+| DP+EP | `(1,2,3,1)` | `(1,3,2,1)` |
+| PP+TP | `(2,1,1,3)` | `(3,1,1,2)` |
+| PP+DP | `(2,3,1,1)` | `(3,2,1,1)` |
 | PP+EP | `(2,1,3,1)` | `(3,1,2,1)` |
+| DP+EP+TP | `(1,2,2,2)` | `(1,2,2,3)` |
+| PP+DP+TP | `(2,2,1,2)` | `(2,3,1,2)` |
+| PP+DP+EP | `(2,2,2,1)` | `(3,1,3,1)` |
+| PP+EP+TP | `(2,1,2,2)` | `(3,1,2,2)` |
 | PP+DP+EP+TP | `(2,2,2,2)` | `(2,1,3,2)` |
 
-每个配置包含 11 个 I64 张量，单张量最多 15 个元素，含 5 个 expert、单元素和空张量。值是 `arange + tensor_order * 1000`，用于区分张量。8 个配置 × 2 种格式 × 每 rank 多文件 / 每 stage 文件，共 32 个正常用例。每例执行并发 save、换拓扑 load、compute reshard、跨格式 storage reshard，再统一为单 rank 单文件，与直接串行保存的文件逐字节比较，包含 header 和 metadata。每次落盘还独立检查 CRC、原始字节和每元素恰好存一份，检查读源文件不变。
+每个配置包含 11 个 I64 张量，单张量最多 15 个元素，含 5 个 expert、单元素和空张量。值是 `arange + tensor_order * 1000`，用于区分张量。15 个配置覆盖四个轴的全部非空组合。它们 × 2 种格式 × 每 rank 多文件 / 每 stage 文件，共 60 个正常用例。另有一个矩阵守卫检查这 15 种组合没有遗漏或重复。每例执行并发 save、换拓扑 load、compute reshard、跨格式 storage reshard，再统一为单 rank 单文件，与直接串行保存的文件逐字节比较，包含 header 和 metadata。每次落盘还独立检查 CRC、原始字节和每元素恰好存一份，检查读源文件不变。
 
 另有 2 个负例故意交换不同文件中的两个 expert payload。要求 CRC 和读回值检查都检出错误，日志标为 `[EXPECTED_MISMATCH]`。正常日志用 `[CRC+ARANGE][PARALLEL_MODES]`，打印拓扑、expert 的 PP/EP 归属、owner ranks、全局元素下标和本地实际值。这些是 checkpoint 分片与搬运测试，rank 由线程模拟；不执行训练、MoE token routing 或梯度通信。
 
@@ -126,10 +117,10 @@ scripts/full_check.sh
 uv run --locked python tests/mutation_check.py
 ```
 
-`pyproject.toml` 声明 Python 3.12 和依赖，`uv.lock` 固定版本，`.venv` 由 uv 创建。numpy / safetensors 是运行依赖，pytest / ruff / ty / pyrefly 是开发依赖。两个类型检查器都使用项目 `.venv`，并从 `tests` 解析测试辅助模块；完整类型检查需要安装 torch extra。
+`pyproject.toml` 声明 Python 3.12 和依赖，`uv.lock` 固定版本，`.venv` 由 uv 创建。numpy / safetensors 是运行依赖，pytest / ruff / ty / pyrefly 是开发依赖。两个类型检查器都使用项目 `.venv`，通过 `tests.support` 包解析测试辅助模块；完整类型检查需要安装 torch extra。
 
 `review.sh` 用小数据逐步打印：12 个 arange 元素、完整 header / CRC、2→3 rank 加载及 reshard；LAWA 使用两个真实 rank、三个小张量，打印 checkpoint、实际值与期望值。
-最后还运行 3→5→2 个模拟 rank、16 个小张量的加权 checkpoint 合并，打印各阶段文件 CRC 和前 12 个实际值。新增 CRC 合并矩阵使用线程模拟 rank；真实 torch 进程测试仍在 `test_lawa.py`。
+随后运行加权 checkpoint 合并、串行/并行文件对照、公开 IO 区间与约束检查，以及 PP+DP+EP+TP 的 16→12 rank 测试。文件测试使用线程 rank；真实 torch 进程测试在 `tests/torch/test_lawa.py`。
 
 `precommit.sh` 检查 fmt、lint、编译、导入和 API 合约。`full_check.sh` 还检查 ty（警告视为失败）和 Pyrefly，启用真实 torch 测试并运行全部 pytest。两者显示测试名称和执行阶段。缩进检查覆盖 core、sim 和 tests，代码块最多三层；括号内的换行对齐不计层级。
 

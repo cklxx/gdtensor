@@ -8,7 +8,7 @@ import pytest
 import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
-from test_io_contract import Memory, _compute, _storage
+from tests.support.memory import Memory, compute_view, storage_view
 
 
 class TraceMemory(Memory):
@@ -26,7 +26,7 @@ class TraceMemory(Memory):
 
 
 def _compute_columns(memory):
-    view = _compute(memory)
+    view = compute_view(memory)
     tensor = view.d_tensor_table.named_d_tensors[0].d_tensor
     tensor.set_global_tensor_meta(gb.GlobalTensorMeta([2, 5], "I16", 2))
     tensor.set_mesh(gb.LiteralMesh([2, 0, 3, 1], gt.WorldSize(4)))
@@ -35,7 +35,7 @@ def _compute_columns(memory):
 
 
 def _storage_rows(memory, events):
-    view = _storage(memory, events)
+    view = storage_view(memory, events)
     tensor = view.d_tensor_table.named_d_tensors[0].d_tensor
     tensor.set_global_tensor_meta(gb.GlobalTensorMeta([2, 5], "I16", 2))
     tensor.set_mesh(
@@ -81,6 +81,94 @@ def _accessed_bytes(memory):
         for _, _, offset, size in memory.ranges
         for byte in range(offset, offset + size)
     ]
+
+
+@pytest.mark.parametrize("operation", ["save", "load", "cc"])
+@pytest.mark.parametrize("rank", range(4))
+def test_permuted_mesh_changes_owners_without_changing_tensor_bytes(operation, rank):
+    source, target, events = TraceMemory(range(20)), TraceMemory([0xA5] * 20), []
+    src = (
+        _storage_rows(source, events)
+        if operation == "load"
+        else _compute_columns(source)
+    )
+    dst = (
+        _storage_rows(target, events)
+        if operation == "save"
+        else _compute_columns(target)
+    )
+    permuted = src if operation == "save" else dst
+    tensor = permuted.d_tensor_table.named_d_tensors[0].d_tensor
+    tensor.set_mesh(
+        gb.PermutedMesh(
+            gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(4)), [2, 2]), [1, 0]
+        )
+    )
+    tensor.set_placements([gt.Shard(0), gt.Shard(1)])
+    # Mesh [[0, 2], [1, 3]]; row chunks have 1 row, column chunks have 3 columns.
+    expected = {
+        0: list(range(6)),
+        1: list(range(10, 16)),
+        2: list(range(6, 10)),
+        3: list(range(16, 20)),
+    }[rank]
+    assert type(src.check_constraints()) is type(dst.check_constraints()) is gt.Ok
+    result = _run(operation, rank, src, dst)
+    assert type(result) is gt.Ok, result
+    assert (
+        sorted(_accessed_bytes(source)) == sorted(_accessed_bytes(target)) == expected
+    )
+    wanted = np.full(20, 0xA5, dtype=np.uint8)
+    wanted[expected] = np.array(expected, dtype=np.uint8)
+    np.testing.assert_array_equal(target.data, wanted)
+    np.testing.assert_array_equal(source.data, np.arange(20, dtype=np.uint8))
+    print(
+        f"[PLAN][PERMUTED_MESH][PASS] operation={operation} rank={rank} expected_bytes={expected}",
+        flush=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("selection", "owners"),
+    [(gb.Slice(0, 4, 2), [0, 2]), (gb.Slice(3, None, -1), [3, 2, 1, 0])],
+    ids=["step_two", "reverse"],
+)
+def test_sliced_mesh_step_preserves_save_and_load_ownership(selection, owners):
+    source, saved, events = TraceMemory(range(8)), TraceMemory([0xA5] * 8), []
+    cv, sv = compute_view(source), storage_view(saved, events)
+    tensor = cv.d_tensor_table.named_d_tensors[0].d_tensor
+    tensor.set_mesh(gb.SlicedMesh(gb.ArrangedMesh(gt.WorldSize(4)), [selection]))
+    tensor.set_placements([gt.Shard(0)])
+    assert type(cv.check_constraints()) is gt.Ok
+    chunk = 8 // len(owners)
+    for rank in range(4):
+        expected = (
+            list(range(owners.index(rank) * chunk, (owners.index(rank) + 1) * chunk))
+            if rank in owners
+            else []
+        )
+        source.ranges.clear()
+        saved.ranges.clear()
+        result = gio.rank_save(rank, cv, sv)
+        assert type(result) is gt.Ok, result
+        assert (
+            sorted(_accessed_bytes(source))
+            == sorted(_accessed_bytes(saved))
+            == expected
+        )
+        target = TraceMemory([0xA5] * 8)
+        loaded = gb.ComputeDTensorsView(cv.tensor_ids, cv.d_tensor_table, target)
+        result = gio.rank_load(rank, loaded, sv)
+        assert type(result) is gt.Ok, result
+        assert sorted(_accessed_bytes(target)) == expected
+        wanted = np.full(8, 0xA5, dtype=np.uint8)
+        wanted[expected] = np.array(expected, dtype=np.uint8)
+        np.testing.assert_array_equal(target.data, wanted)
+        print(
+            f"[PLAN][SLICED_MESH][PASS] step={selection.step} rank={rank} expected_bytes={expected}",
+            flush=True,
+        )
+    np.testing.assert_array_equal(saved.data, np.arange(8, dtype=np.uint8))
 
 
 @pytest.mark.parametrize("operation", ["save", "load", "cc", "cs", "sc", "ss"])
@@ -191,7 +279,7 @@ def test_packed_storage_offsets_differ_from_global_offsets(operation, rank):
 def test_replicated_save_writes_each_tensor_once_in_table_order():
     ids = ["z_first", "a_second", "m_third", "b_fourth", "y_fifth"]
     source, target, events = TraceMemory(range(5)), TraceMemory([0xA5] * 15), []
-    cv, sv = _compute(source), _storage(target, events)
+    cv, sv = compute_view(source), storage_view(target, events)
     compute_table, storage_table, entries = [], [], {}
     group = gb.DisjointStorageMeshList(
         [

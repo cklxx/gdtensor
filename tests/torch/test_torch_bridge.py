@@ -94,7 +94,7 @@ def test_reset_updates_naive_and_reshaped_wrapper(torch_mesh):
     ]
 
 
-@pytest.mark.parametrize("change", ["shape", "dtype", "placements"])
+@pytest.mark.parametrize("change", ["shape", "dtype", "placements", "mesh"])
 def test_reset_rejects_changes_without_losing_original(torch_mesh, change):
     torch, mesh = torch_mesh
     from torch.distributed.tensor import DTensor, Replicate, Shard
@@ -105,11 +105,12 @@ def test_reset_rejects_changes_without_losing_original(torch_mesh, change):
         bad = DTensor.from_local(torch.ones(3, 2), mesh, [Replicate()])
     elif change == "dtype":
         bad = first.double()
-    else:
+    elif change == "placements":
         bad = DTensor.from_local(torch.arange(6).float(), mesh, [Shard(0)])
-    with pytest.raises(
-        ValueError, match=change + (" differ" if change == "placements" else " differs")
-    ):
+    else:
+        gd.set_mesh(gb.ArrangedMesh(gt.WorldSize(2)))
+        bad = first
+    with pytest.raises(ValueError, match=change + r".*differ"):
         gdtensor.reset_d_tensor(gd, bad)
     assert gdtensor.get_d_tensor(gd) is first
 

@@ -11,11 +11,11 @@ import pytest
 import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
-from gdtensor_sim.formats import make_storage_view
 from gdtensor_sim.coord import ThreadCoordinator
+from gdtensor_sim.formats import make_storage_view
 from gdtensor_sim.models import ParallelConfig, layout_builder, storage_table
-from tensor_oracle import ArrayFabric
-from test_data_correctness import _schema, _run, SRC
+from tests.support.oracle import ArrayFabric
+from tests.support.schemas import SRC, run_ranks, tensor_schema
 
 
 def _storage(root, ct, p, kind, mode, fmt, *, save=False):
@@ -36,10 +36,10 @@ def _storage(root, ct, p, kind, mode, fmt, *, save=False):
 @pytest.mark.parametrize("field", ["dtype", "shape", "size"])
 def test_format_load_rejects_checkpoint_metadata_mismatch(tmp_path, fmt, field):
     p = (1, 1, 1)
-    ct, points, values = _schema(p)
+    ct, points, values = tensor_schema(p)
     source = ArrayFabric(ct, points, values)
     sv = _storage(tmp_path, ct, p, "single", "hf", fmt, save=True)
-    _run(1, lambda r: gio.rank_save(r, source.view(r), sv))
+    run_ranks(1, lambda r: gio.rank_save(r, source.view(r), sv))
     if fmt == "safetensors":
         path = tmp_path / "model.safetensors"
         raw = path.read_bytes()
@@ -85,7 +85,7 @@ def test_format_distcp_save_returns_after_metadata_is_published(tmp_path, monkey
         return replace(src, dst)
 
     monkeypatch.setattr(os, "replace", slow_metadata)
-    ct, points, values = _schema(SRC)
+    ct, points, values = tensor_schema(SRC)
     source = ArrayFabric(ct, points, values)
     sv = _storage(tmp_path, ct, SRC, "single", "hf", "distcp", save=True)
 
@@ -94,7 +94,7 @@ def test_format_distcp_save_returns_after_metadata_is_published(tmp_path, monkey
         assert (tmp_path / ".metadata").is_file()
         return result
 
-    _run(int(np.prod(SRC)), save)
+    run_ranks(int(np.prod(SRC)), save)
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
@@ -110,7 +110,7 @@ def test_format_save_publish_failure_reaches_all_ranks(tmp_path, monkeypatch, fm
         return fsync(fd)
 
     monkeypatch.setattr(os, "fsync", fail_one_file)
-    ct, points, values = _schema(SRC)
+    ct, points, values = tensor_schema(SRC)
     source = ArrayFabric(ct, points, values)
     sv = _storage(tmp_path, ct, SRC, "per_rank", "mirror", fmt, save=True)
     with ThreadPoolExecutor(max_workers=int(np.prod(SRC))) as pool:
@@ -130,7 +130,7 @@ def test_format_save_publish_failure_reaches_all_ranks(tmp_path, monkeypatch, fm
 @pytest.mark.parametrize("terminal", ["commit", "abort"])
 def test_save_session_rejects_calls_after_terminal_state(tmp_path, fmt, terminal):
     p = (1, 1, 1)
-    table, _, _ = _schema(p)
+    table, _, _ = tensor_schema(p)
     view = _storage(tmp_path, table, p, "single", "hf", fmt)
     assert view.begin_save is not None
     opened = view.begin_save(view, 0)
@@ -156,10 +156,10 @@ def test_save_session_rejects_calls_after_terminal_state(tmp_path, fmt, terminal
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
 def test_load_session_rejects_calls_after_finish(tmp_path, fmt):
     p = (1, 1, 1)
-    table, points, values = _schema(p)
+    table, points, values = tensor_schema(p)
     source = ArrayFabric(table, points, values)
     view = _storage(tmp_path, table, p, "single", "hf", fmt)
-    _run(1, lambda rank: gio.rank_save(rank, source.view(rank), view))
+    run_ranks(1, lambda rank: gio.rank_save(rank, source.view(rank), view))
     assert view.begin_load is not None
     opened = view.begin_load(view, 0)
     assert type(opened) is gt.Ok, opened

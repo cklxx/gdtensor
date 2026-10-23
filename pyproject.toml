@@ -28,8 +28,10 @@ select = ["F"]
 
 [tool.ty.environment]
 python = ".venv"
-extra-paths = ["tests"]
 
 [tool.pyrefly]
 python-interpreter-path = ".venv/bin/python"
-search-path = [".", "tests"]
+search-path = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

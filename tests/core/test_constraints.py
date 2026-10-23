@@ -4,7 +4,7 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.tag as gt
-from test_io_contract import Memory, _compute, _storage
+from tests.support.memory import Memory, compute_view, storage_view
 
 
 @pytest.mark.parametrize(
@@ -20,6 +20,8 @@ from test_io_contract import Memory, _compute, _storage
         (gb.NamedDTensor(""), "NamedDTensor"),
         (gb.DTensorTable([gb.NamedDTensor("a"), gb.NamedDTensor("a")]), "DTensorTable"),
         (gb.DisjointStorageMeshList(), "DisjointStorageMeshList"),
+        (gb.ArrangedMesh(gt.WorldSize(-1)), "ArrangedMesh"),
+        (gb.LiteralMesh([-1], gt.WorldSize(2)), "LiteralMesh"),
     ],
 )
 def test_documented_invalid_products(value, type_name):
@@ -48,7 +50,7 @@ def test_error_product_constraints(name):
 
 
 def test_nested_constraint_error_is_returned_unchanged():
-    view = _compute(Memory(range(8)))
+    view = compute_view(Memory(range(8)))
     meta = view.d_tensor_table.named_d_tensors[0].d_tensor.global_tensor_meta
     error = gb.ConstraintViolationError(
         type_name="GlobalTensorMeta", constraint_name="injected", msg="bad meta"
@@ -60,7 +62,7 @@ def test_nested_constraint_error_is_returned_unchanged():
 
 @pytest.mark.parametrize("change", ["ids", "accessor", "placements", "shard_axis"])
 def test_compute_view_constraints(change):
-    view = _compute(Memory(range(8)))
+    view = compute_view(Memory(range(8)))
     if change == "ids":
         view.tensor_ids = ["missing"]
     elif change == "accessor":
@@ -75,7 +77,7 @@ def test_compute_view_constraints(change):
 
 @pytest.mark.parametrize("field", ["data_accessor", "begin_save", "begin_load"])
 def test_storage_requires_callbacks(field):
-    view = _storage(Memory(range(8)), [])
+    view = storage_view(Memory(range(8)), [])
     setattr(view, field, None)
     result = view.check_constraints()
     assert type(result) is gt.Err and type(result.value) is gb.ConstraintViolationError
@@ -116,7 +118,7 @@ def test_physical_list_requires_one_label_per_tensor_row(labels):
 
 
 def test_physical_list_labels_follow_table_order():
-    view = _storage(Memory(range(8)), [])
+    view = storage_view(Memory(range(8)), [])
     group = next(iter(view.physical_layout.tensor_entries.values()))
     group.tensor_ids = ["another"]
     view.physical_layout.file_paths = {gb.TensorComponentPos("another", 0): "memory"}
@@ -156,7 +158,7 @@ def test_physical_lists_with_the_same_leader_cannot_hide_overlap():
 
 
 def test_valid_storage_view_and_equal_physical_lists_pass_constraints():
-    view = _storage(Memory(range(8)), [])
+    view = storage_view(Memory(range(8)), [])
     assert type(view.check_constraints()) is gt.Ok
     original = next(iter(view.physical_layout.tensor_entries.values()))
     copied = gb.DisjointStorageMeshList(
@@ -189,3 +191,51 @@ def test_physical_list_returns_constraint_error_for_invalid_mesh(transform):
         f"[CONSTRAINTS][EXPECTED_ERROR] invalid_mesh={transform} error={result.value}",
         flush=True,
     )
+
+
+@pytest.mark.parametrize(
+    "change,type_name,constraint",
+    [
+        ("ids", "StorageDTensorsView", "tensor_ids_match_table"),
+        ("unknown_tensor", "StorageDTensorsView", "layout_tensor_in_table"),
+        ("format", "PhysicalLayoutTable", "container_format_unique"),
+        ("extra_leader", "PhysicalLayoutTable", "file_paths_keys_are_leaders"),
+        ("content_size", "ArrangedMesh", "size_positive"),
+    ],
+)
+def test_storage_constraint_boundaries(change, type_name, constraint):
+    view = storage_view(Memory(range(8)), [])
+    layout = view.physical_layout
+    if change == "ids":
+        view.set_tensor_ids(["unknown"])
+    elif change == "unknown_tensor":
+        group = layout.tensor_entries.pop(gb.TensorComponentPos("w", 0))
+        layout.tensor_entries[gb.TensorComponentPos("unknown", 0)] = group
+    elif change == "format":
+        layout.set_container_format("mixed")
+    elif change == "extra_leader":
+        layout.file_paths[gb.TensorComponentPos("w", 1)] = "extra"
+    else:
+        group = next(iter(layout.tensor_entries.values()))
+        group.disjoint_storage_mesh_list[0].content_slots.set_size(gt.WorldSize(0))
+    result = view.check_constraints()
+    assert type(result) is gt.Err and type(result.value) is gb.ConstraintViolationError
+    assert result.value.type_name == type_name
+    assert result.value.constraint_name == constraint and result.value.msg
+
+
+def test_different_file_lists_cannot_cover_the_same_cell():
+    base = gb.OuterProductMesh(
+        gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(2))
+    )
+    first = gb.DisjointStorageMeshList([base], ["w"])
+    second = gb.DisjointStorageMeshList(
+        [gb.SlicedMesh(base, [None, gb.Slice(1, 2)])], ["w"]
+    )
+    p0, p1 = gb.TensorComponentPos("w", 0), gb.TensorComponentPos("w", 1)
+    layout = gb.PhysicalLayoutTable(
+        "safetensors", {p0: first, p1: second}, {p0: "first", p1: "second"}
+    )
+    result = layout.check_constraints()
+    assert type(result) is gt.Err and type(result.value) is gb.ConstraintViolationError
+    assert result.value.constraint_name == "meshes_disjoint"

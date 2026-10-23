@@ -4,8 +4,8 @@ import functools
 import itertools
 import json
 import os
-from pathlib import Path
 import struct
+from pathlib import Path
 
 import numpy as np
 

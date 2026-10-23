@@ -6,6 +6,7 @@ whole tensors to stages. Optimizer state also shards over DP. These tests
 move weights and optimizer state; they do not run training or MoE routing.
 """
 
+import itertools
 import zlib
 
 import numpy as np
@@ -15,11 +16,10 @@ import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
 from gdtensor_sim.coord import ThreadCoordinator
-from storage_fixture import FileStorage
-from tensor_oracle import ArrayFabric
-from test_checkpoint_merge_crc import _fingerprint
-from test_data_correctness import _regions, _run
-
+from tests.support.checkpoint import file_bytes
+from tests.support.oracle import ArrayFabric
+from tests.support.schemas import payload_regions, run_ranks
+from tests.support.storage import FileStorage
 
 CASES = [
     ("TP", (1, 1, 1, 3), (1, 1, 1, 2)),
@@ -28,9 +28,27 @@ CASES = [
     ("PP", (3, 1, 1, 1), (2, 1, 1, 1)),
     ("TP_DP", (1, 2, 1, 3), (1, 3, 1, 2)),
     ("TP_EP", (1, 1, 2, 3), (1, 1, 3, 2)),
+    ("DP_EP", (1, 2, 3, 1), (1, 3, 2, 1)),
+    ("PP_TP", (2, 1, 1, 3), (3, 1, 1, 2)),
+    ("PP_DP", (2, 3, 1, 1), (3, 2, 1, 1)),
     ("PP_EP", (2, 1, 3, 1), (3, 1, 2, 1)),
+    ("DP_EP_TP", (1, 2, 2, 2), (1, 2, 2, 3)),
+    ("PP_DP_TP", (2, 2, 1, 2), (2, 3, 1, 2)),
+    ("PP_DP_EP", (2, 2, 2, 1), (3, 1, 3, 1)),
+    ("PP_EP_TP", (2, 1, 2, 2), (3, 1, 2, 2)),
     ("PP_DP_EP_TP", (2, 2, 2, 2), (2, 1, 3, 2)),
 ]
+
+
+def test_parallel_mode_matrix_covers_every_nonempty_axis_combination():
+    expected = {
+        axes for axes in itertools.product((False, True), repeat=4) if any(axes)
+    }
+    actual = {tuple(size > 1 for size in source) for _, source, _ in CASES}
+    assert len(CASES) == len(actual) == 15
+    assert actual == expected
+
+
 SPECS = (
     [
         ("layers.0.column", (3, 5), 0, None, "column"),
@@ -171,7 +189,7 @@ def _storage(root, topology, fmt, kind, *, save=False, transpose=False):
 def _verify(root, topology, fmt, *, transpose=False):
     _, points, values, _ = _schema(topology, storage=True, transpose=transpose)
     seen = {tid: np.zeros(value.size, dtype=np.int64) for tid, value in values.items()}
-    for tid, slot, _, data, _, _ in _regions(root, fmt):
+    for tid, slot, _, data, _, _ in payload_regions(root, fmt):
         indices = np.arange(values[tid].size) if slot is None else points[slot][tid]
         expected = values[tid].ravel()[indices].copy().tobytes()
         assert zlib.crc32(data) == zlib.crc32(expected), (tid, slot)
@@ -190,7 +208,7 @@ def _save(root, topology, fmt, kind, *, transpose=False):
         is type(view.check_constraints())
         is gt.Ok
     )
-    _run(
+    run_ranks(
         int(np.prod(topology)),
         lambda rank: gio.rank_save(rank, source.view(rank), view),
     )
@@ -202,7 +220,7 @@ def _save(root, topology, fmt, kind, *, transpose=False):
 def _load(view, topology, values, *, transpose=False):
     table, points, _, _ = _schema(topology, transpose=transpose)
     target = ArrayFabric(table, points)
-    _run(
+    run_ranks(
         int(np.prod(topology)),
         lambda rank: gio.rank_load(rank, target.view(rank), view),
     )
@@ -221,13 +239,13 @@ def test_parallel_mode_checkpoint_repartition_matches_serial(
         flush=True,
     )
     source, stored = _save(tmp_path / "source", src_p, fmt, kind)
-    before = _fingerprint(tmp_path / "source")
+    before = file_bytes(tmp_path / "source")
     table, points, values, _ = _schema(dst_p, transpose=True)
     loaded = _load(stored, dst_p, values, transpose=True)
     _log_expert_placement("SOURCE", src_p, source)
     _log_expert_placement("LOADED", dst_p, loaded)
     reshaped = ArrayFabric(table, points)
-    _run(
+    run_ranks(
         int(np.prod(dst_p)),
         lambda rank: gio.rank_reshard(
             rank, source.view(rank, allow_remote_reads=True), reshaped.view(rank)
@@ -238,14 +256,14 @@ def test_parallel_mode_checkpoint_repartition_matches_serial(
     output = _storage(
         tmp_path / "repartitioned", dst_p, other, "single", save=True, transpose=True
     )
-    _run(int(np.prod(dst_p)), lambda rank: gio.rank_reshard(rank, stored, output))
+    run_ranks(int(np.prod(dst_p)), lambda rank: gio.rank_reshard(rank, stored, output))
     _verify(tmp_path / "repartitioned", dst_p, other, transpose=True)
     readable = _storage(
         tmp_path / "repartitioned", dst_p, other, "single", transpose=True
     )
     _load(readable, dst_p, values, transpose=True)
     _assert_serial_files(tmp_path, readable, other)
-    assert _fingerprint(tmp_path / "source") == before
+    assert file_bytes(tmp_path / "source") == before
     source.assert_values(values)
     expert = SPECS[4][0]
     print(
@@ -255,13 +273,13 @@ def test_parallel_mode_checkpoint_repartition_matches_serial(
 
 
 def _assert_serial_files(root, source, fmt):
-    before = _fingerprint(root / "repartitioned")
+    before = file_bytes(root / "repartitioned")
     serial = (1, 1, 1, 1)
     _save(root / "serial", serial, fmt, "single")
     target = _storage(root / "canonical", serial, fmt, "single", save=True)
     assert type(gio.rank_reshard(0, source, target)) is gt.Ok
-    assert _fingerprint(root / "canonical") == _fingerprint(root / "serial")
-    assert _fingerprint(root / "repartitioned") == before
+    assert file_bytes(root / "canonical") == file_bytes(root / "serial")
+    assert file_bytes(root / "repartitioned") == before
 
 
 def _log_expert_placement(phase, topology, fabric):
@@ -285,7 +303,7 @@ def _log_expert_placement(phase, topology, fabric):
 def test_swapped_expert_payloads_are_detected(tmp_path, fmt):
     topology = (2, 2, 2, 2)
     _, stored = _save(tmp_path, topology, fmt, "rank_multi")
-    regions = list(_regions(tmp_path, fmt))
+    regions = list(payload_regions(tmp_path, fmt))
     first = next(row for row in regions if ".experts.0." in row[0])
     second = next(
         row

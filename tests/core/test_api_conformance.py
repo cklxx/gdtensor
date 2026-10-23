@@ -4,9 +4,9 @@ import ast
 import dataclasses
 import importlib
 import inspect
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import pytest
 
@@ -14,7 +14,7 @@ import gdtensor
 import gdtensor.builder as builder
 import gdtensor.tag as tag
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PRODUCT_FIELDS = {
     "ComputeDTensorsView": ("tensor_ids", "d_tensor_table", "data_accessor"),
     "StorageDTensorsView": (
@@ -226,8 +226,8 @@ def test_type_aliases_and_namespace_separation():
 
 @pytest.mark.parametrize(
     "file",
-    sorted((ROOT / "tests").glob("*.py"))
-    + sorted((ROOT / "gdtensor_sim").glob("*.py")),
+    sorted((ROOT / "tests").rglob("*.py"))
+    + sorted((ROOT / "gdtensor_sim").rglob("*.py")),
     ids=lambda p: str(p.relative_to(ROOT)),
 )
 def test_tests_and_sim_use_no_core_internal_api(file):
@@ -241,6 +241,11 @@ def test_tests_and_sim_use_no_core_internal_api(file):
             names = [node.module or ""]
         assert all(not name.startswith("gdtensor.internal") for name in names), (
             file.name,
+            node.lineno,
+        )
+        assert all(not re.search(r"(^|\.)test_", name) for name in names), (
+            "move shared fixtures to tests.support instead of importing test modules",
+            file,
             node.lineno,
         )
     # Dynamic imports must not bypass the namespace checks.
@@ -272,7 +277,7 @@ def _check_core_node(node, file, forbidden):
     if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
         assert node.name not in forbidden, (file, node.name)
     if isinstance(node, ast.ImportFrom):
-        assert not (node.module or "").startswith("gdtensor_sim"), file
+        assert not (node.module or "").startswith(("gdtensor_sim", "tests")), file
 
 
 def test_no_reduction_api():

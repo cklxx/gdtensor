@@ -11,19 +11,18 @@ match the same baseline. A swapped-shard negative test checks this comparison
 actually detects an incorrect assembly.
 """
 
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
-import zlib
 
 import numpy as np
 import pytest
 
 import gdtensor.io as gio
 import gdtensor.tag as gt
-from tensor_oracle import ArrayFabric
-from test_checkpoint_merge_crc import _fingerprint, _small_schema
-from test_data_correctness import _regions, _storage, _storage_points
-
+from tests.support.checkpoint import file_bytes, small_schema
+from tests.support.oracle import ArrayFabric
+from tests.support.schemas import payload_regions, storage_points, storage_view
 
 CASES = [
     ((1, 1, 3), 16, "rank_multi", "mirror"),
@@ -55,12 +54,12 @@ def _concurrent(world, action):
 
 
 def _decode(root, fmt, table, parallel, mode, templates):
-    points = _storage_points(table, parallel, mode)
+    points = storage_points(table, parallel, mode)
     decoded = {tid: np.empty_like(value) for tid, value in templates.items()}
     counts = {
         tid: np.zeros(value.size, dtype=np.int64) for tid, value in templates.items()
     }
-    for tid, slot, _, data, _, _ in _regions(root, fmt):
+    for tid, slot, _, data, _, _ in payload_regions(root, fmt):
         indices = np.arange(templates[tid].size) if slot is None else points[tid, slot]
         assert len(data) == len(indices) * templates[tid].itemsize
         decoded[tid].reshape(-1)[indices] = np.frombuffer(
@@ -126,7 +125,7 @@ def _read_schedules(table, points, storage, baseline, world):
 
 
 def _canonicalize(root, fmt, source, serial_table):
-    destination = _storage(root, serial_table, ONE, "single", "hf", fmt, save=True)
+    destination = storage_view(root, serial_table, ONE, "single", "hf", fmt, save=True)
     _ok(gio.rank_reshard(0, source, destination))
 
 
@@ -135,8 +134,8 @@ def _canonicalize(root, fmt, source, serial_table):
 def test_serial_parallel_io_matches_exactly(
     tmp_path, fmt, parallel, tensor_count, kind, mode
 ):
-    serial_table, serial_points, values = _small_schema(ONE, tensor_count)
-    table, points, _ = _small_schema(parallel, tensor_count, column=True)
+    serial_table, serial_points, values = small_schema(ONE, tensor_count)
+    table, points, _ = small_schema(parallel, tensor_count, column=True)
     world = int(np.prod(parallel))
     print(
         f"[CRC+ARANGE][SERIAL_PARALLEL][START] serial_ranks=1 parallel_ranks={world} tensors={tensor_count} layout={kind}/{mode} format={fmt} numeric_merge=none",
@@ -147,13 +146,17 @@ def test_serial_parallel_io_matches_exactly(
         ArrayFabric(serial_table, serial_points, values),
         ArrayFabric(table, points, values),
     )
-    serial = _storage(serial_root, serial_table, ONE, "single", "hf", fmt, save=True)
-    distributed = _storage(parallel_root, table, parallel, kind, mode, fmt, save=True)
+    serial = storage_view(
+        serial_root, serial_table, ONE, "single", "hf", fmt, save=True
+    )
+    distributed = storage_view(
+        parallel_root, table, parallel, kind, mode, fmt, save=True
+    )
     _ok(gio.rank_save(0, serial_source.view(0), serial))
     _concurrent(world, lambda rank: gio.rank_save(rank, source.view(rank), distributed))
     serial_bytes, parallel_bytes = (
-        _fingerprint(serial_root),
-        _fingerprint(parallel_root),
+        file_bytes(serial_root),
+        file_bytes(parallel_root),
     )
     baseline = _decode(serial_root, fmt, serial_table, ONE, "hf", values)
     decoded = _decode(parallel_root, fmt, table, parallel, mode, values)
@@ -169,12 +172,12 @@ def test_serial_parallel_io_matches_exactly(
     _assert_rank_buffers(from_parallel, from_serial)
     canonical = tmp_path / "parallel_consolidated"
     _canonicalize(canonical, fmt, distributed, serial_table)
-    assert _fingerprint(canonical) == serial_bytes, (
+    assert file_bytes(canonical) == serial_bytes, (
         "parallel consolidated files differ from serial files"
     )
     assert (
-        _fingerprint(serial_root) == serial_bytes
-        and _fingerprint(parallel_root) == parallel_bytes
+        file_bytes(serial_root) == serial_bytes
+        and file_bytes(parallel_root) == parallel_bytes
     )
     serial_source.assert_values(values)
     source.assert_values(values)
@@ -198,13 +201,13 @@ def _show_crc(actual, baseline):
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
 def test_serial_baseline_detects_swapped_parallel_shards(tmp_path, fmt):
-    serial_table, serial_points, values = _small_schema(ONE, 16)
-    table, points, _ = _small_schema((1, 1, 3), 16, column=True)
-    serial = _storage(
+    serial_table, serial_points, values = small_schema(ONE, 16)
+    table, points, _ = small_schema((1, 1, 3), 16, column=True)
+    serial = storage_view(
         tmp_path / "serial", serial_table, ONE, "single", "hf", fmt, save=True
     )
     parallel_root = tmp_path / "parallel"
-    distributed = _storage(
+    distributed = storage_view(
         parallel_root, table, (1, 1, 3), "rank_multi", "mirror", fmt, save=True
     )
     _ok(
@@ -215,7 +218,9 @@ def test_serial_baseline_detects_swapped_parallel_shards(tmp_path, fmt):
     source = ArrayFabric(table, points, values)
     _concurrent(3, lambda rank: gio.rank_save(rank, source.view(rank), distributed))
     regions = [
-        region for region in _regions(parallel_root, fmt) if region[0] == "matrix"
+        region
+        for region in payload_regions(parallel_root, fmt)
+        if region[0] == "matrix"
     ]
     left, right = regions[:2]
     assert left[4] != right[4] and len(left[3]) == len(right[3]) and left[3] != right[3]

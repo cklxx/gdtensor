@@ -1,6 +1,4 @@
-"""Public IO verified with dense arange arrays and independent file decoding."""
-
-from __future__ import annotations
+"""Shared checkpoint schemas and independent dense/file oracles."""
 
 import json
 import struct
@@ -8,16 +6,13 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import pytest
 import safetensors
 
 import gdtensor.builder as gb
-import gdtensor.io as gio
 import gdtensor.tag as gt
 from gdtensor_sim.coord import ThreadCoordinator
-from storage_fixture import FileStorage
-from tensor_oracle import ArrayFabric, slice_points
-
+from tests.support.oracle import slice_points
+from tests.support.storage import FileStorage
 
 SRC = (2, 2, 2)
 DST = (2, 1, 3)
@@ -30,13 +25,13 @@ LAYOUTS = [
 ]
 
 
-def _run(world, fn):
+def run_ranks(world, fn):
     with ThreadPoolExecutor(max_workers=world) as ex:
         results = list(ex.map(fn, range(world)))
     assert all(type(r) is gt.Ok for r in results), results
 
 
-def _schema(p, column=False, tensor_count=8):
+def tensor_schema(p, column=False, tensor_count=8):
     specs: list[tuple[str, tuple[int, ...], str, tuple[gt.Box, ...], bool]] = [
         (
             "matrix",
@@ -94,7 +89,7 @@ def _schema(p, column=False, tensor_count=8):
     return gb.DTensorTable(table), points, values
 
 
-def _storage(root, ct, p, kind, mode, fmt, *, save=False):
+def storage_view(root, ct, p, kind, mode, fmt, *, save=False):
     world = int(np.prod(p))
     table = []
     for order, nd in enumerate(ct.named_d_tensors):
@@ -125,7 +120,7 @@ def _storage(root, ct, p, kind, mode, fmt, *, save=False):
     return FileStorage(
         root,
         gb.DTensorTable(table),
-        _storage_points(ct, p, mode),
+        storage_points(ct, p, mode),
         world,
         fmt,
         kind,
@@ -142,7 +137,7 @@ def _storage_slices(tensor, parallel, order):
     return slices
 
 
-def _storage_points(ct, p, mode):
+def storage_points(ct, p, mode):
     expected = {}
     for order, nd in enumerate(ct.named_d_tensors):
         dt = nd.d_tensor
@@ -165,7 +160,7 @@ def _storage_points(ct, p, mode):
     return expected
 
 
-def _regions(root, fmt):
+def payload_regions(root, fmt):
     if fmt == "safetensors":
         files = sorted(root.glob("*.safetensors"))
         assert files
@@ -203,14 +198,14 @@ def _safetensors_regions(path):
     assert len(raw) == 8 + header_len + cursor
 
 
-def _verify_crc(root, fmt, ct, p, mode, values):
+def verify_crc(root, fmt, ct, p, mode, values):
     print(
         f"[CRC+ARANGE][VERIFY][START] directory={root.name} format={fmt} ranks={int(np.prod(p))} tensors={len(values)}",
         flush=True,
     )
-    points = _storage_points(ct, p, mode)
+    points = storage_points(ct, p, mode)
     seen = {tid: np.zeros(value.size, dtype=np.int64) for tid, value in values.items()}
-    for tid, slot, info, data, _, _ in _regions(root, fmt):
+    for tid, slot, info, data, _, _ in payload_regions(root, fmt):
         value = values[tid]
         indices = np.arange(value.size) if slot is None else points[tid, slot]
         want = value.reshape(-1)[indices].copy().tobytes()
@@ -235,107 +230,3 @@ def _verify_crc(root, fmt, ct, p, mode, values):
         "[CRC+ARANGE][VERIFY][PASS] checks=payload_crc,exact_bytes,every_element_stored_once",
         flush=True,
     )
-
-
-@pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
-@pytest.mark.parametrize("kind,mode", LAYOUTS)
-def test_io_arange_crc_elastic_and_reshard(tmp_path, fmt, kind, mode):
-    ct, points, values = _schema(SRC)
-    target, target_points, _ = _schema(DST, column=True)
-    source = ArrayFabric(ct, points, values)
-    root = tmp_path / "source"
-    sv = _storage(root, ct, SRC, kind, mode, fmt, save=True)
-    _run(int(np.prod(SRC)), lambda r: gio.rank_save(r, source.view(r), sv))
-    _verify_crc(root, fmt, ct, SRC, mode, values)
-
-    loaded = ArrayFabric(target, target_points)
-    read_view = _storage(root, ct, SRC, kind, mode, fmt)
-    _run(int(np.prod(DST)), lambda r: gio.rank_load(r, loaded.view(r), read_view))
-    loaded.assert_values(values)
-    source.assert_values(values)
-
-    for branch in ("compute", "storage"):
-        destination = ArrayFabric(target, target_points)
-        src = lambda r: (
-            source.view(r, allow_remote_reads=True)
-            if branch == "compute"
-            else read_view
-        )
-        _run(
-            int(np.prod(DST)),
-            lambda r: gio.rank_reshard(r, src(r), destination.view(r)),
-        )
-        destination.assert_values(values)
-
-    # Exercise compute->storage and storage->storage, then load both results.
-    for branch in ("compute", "storage"):
-        out = tmp_path / branch
-        output_fmt = "distcp" if fmt == "safetensors" else "safetensors"
-        dst = _storage(out, target, DST, "per_rank", "mirror", output_fmt, save=True)
-        src = lambda r: (
-            loaded.view(r, allow_remote_reads=True)
-            if branch == "compute"
-            else read_view
-        )
-        _run(int(np.prod(DST)), lambda r: gio.rank_reshard(r, src(r), dst))
-        _verify_crc(out, output_fmt, target, DST, "mirror", values)
-        back = ArrayFabric(ct, points)
-        output = _storage(out, target, DST, "per_rank", "mirror", output_fmt)
-        _run(int(np.prod(SRC)), lambda r: gio.rank_load(r, back.view(r), output))
-        back.assert_values(values)
-
-
-@pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
-def test_io_crc_detects_payload_corruption(tmp_path, fmt):
-    ct, points, values = _schema(SRC)
-    source = ArrayFabric(ct, points, values)
-    sv = _storage(tmp_path, ct, SRC, "single", "hf", fmt, save=True)
-    _run(int(np.prod(SRC)), lambda r: gio.rank_save(r, source.view(r), sv))
-    _verify_crc(tmp_path, fmt, ct, SRC, "hf", values)
-    tid, slot, info, data, path, start = next(_regions(tmp_path, fmt))
-    with path.open("r+b") as f:
-        f.seek(start)
-        f.write(bytes([data[0] ^ 1]))
-    with pytest.raises(AssertionError):
-        _verify_crc(tmp_path, fmt, ct, SRC, "hf", values)
-    # Raw IO does not promise checksum validation. The independent oracle must fail.
-    loaded = ArrayFabric(ct, points)
-    read_view = _storage(tmp_path, ct, SRC, "single", "hf", fmt)
-    _run(int(np.prod(SRC)), lambda r: gio.rank_load(r, loaded.view(r), read_view))
-    with pytest.raises(AssertionError):
-        loaded.assert_values(values)
-    print(
-        f"[CRC+ARANGE][CORRUPTION][PASS] format={fmt} fault=flipped_payload_byte crc=detected arange=detected",
-        flush=True,
-    )
-
-
-@pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
-@pytest.mark.parametrize(
-    "src_p,dst_p,tensor_count,kind,mode",
-    [
-        ((1, 1, 3), (1, 1, 2), 16, "single", "hf"),
-        ((2, 2, 4), (2, 2, 3), 32, "rank_multi", "mirror"),
-        ((2, 4, 4), (2, 2, 4), 64, "per_rank", "mirror"),
-    ],
-)
-def test_many_ranks_many_tensors(tmp_path, fmt, src_p, dst_p, tensor_count, kind, mode):
-    ct, points, values = _schema(src_p, tensor_count=tensor_count)
-    target, target_points, _ = _schema(dst_p, column=True, tensor_count=tensor_count)
-    source = ArrayFabric(ct, points, values)
-    saved = _storage(tmp_path, ct, src_p, kind, mode, fmt, save=True)
-    _run(int(np.prod(src_p)), lambda r: gio.rank_save(r, source.view(r), saved))
-    _verify_crc(tmp_path, fmt, ct, src_p, mode, values)
-    loaded = ArrayFabric(target, target_points)
-    read_view = _storage(tmp_path, ct, src_p, kind, mode, fmt)
-    _run(int(np.prod(dst_p)), lambda r: gio.rank_load(r, loaded.view(r), read_view))
-    loaded.assert_values(values)
-    resharded = ArrayFabric(target, target_points)
-    _run(
-        int(np.prod(dst_p)),
-        lambda r: gio.rank_reshard(
-            r, source.view(r, allow_remote_reads=True), resharded.view(r)
-        ),
-    )
-    resharded.assert_values(values)
-    source.assert_values(values)

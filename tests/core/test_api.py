@@ -12,6 +12,7 @@ import gdtensor.access as ga
 import gdtensor.builder as gb
 import gdtensor.session as gs
 import gdtensor.tag as gt
+from tests.support.memory import Memory, compute_view, storage_view
 
 
 def test_result_and_error_are_type_aliases():
@@ -140,11 +141,6 @@ def test_session_and_accessor_interfaces_are_abstract():
         assert not hasattr(interface, "check_constraints")
 
 
-def test_view_map_rejects_unknown_origin():
-    result = gb.d_tensors_view_map(object(), gb.DTensorsViewMapCore())
-    assert type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
-
-
 def test_bridge_plain_values_and_result_lookup():
     gd = gb.NaiveDTensor(
         gb.GlobalTensorMeta([2], "F32", 4),
@@ -161,21 +157,6 @@ def test_bridge_plain_values_and_result_lookup():
     assert gdtensor.get_d_tensor(gd) is None
     result = gdtensor.get_gd_tensor(view, "w")
     assert type(result) is gt.Ok and result.value is gd
-
-
-def test_view_map_requires_result_callbacks():
-    gd = gb.NaiveDTensor(
-        gb.GlobalTensorMeta([2], "F32", 4),
-        [gt.Replicate()],
-        gb.ArrangedMesh(gt.WorldSize(1)),
-    )
-    view = gb.ComputeDTensorsView(
-        ["w"], gb.DTensorTable([gb.NamedDTensor("w", gd)]), None
-    )
-    result = gb.d_tensors_view_map(
-        view, gb.DTensorsViewMapCore(convert_each_compute_view=lambda tensor: tensor)
-    )
-    assert type(result) is gt.Err and type(result.value) is gb.InvalidArgumentError
 
 
 def test_oneof_fields_can_be_cleared():
@@ -220,9 +201,7 @@ def test_builder_methods_operate_on_the_named_field(name):
 
 
 def test_compute_bridge_rejects_storage_views_and_tensors():
-    from test_io_contract import Memory, _storage
-
-    view = _storage(Memory(range(8)), [])
+    view = storage_view(Memory(range(8)), [])
     with pytest.raises(ValueError, match="ComputeDTensorsView"):
         gdtensor.get_tensor_ids(view)
     result = gdtensor.get_gd_tensor(view, "w")
@@ -233,6 +212,20 @@ def test_compute_bridge_rejects_storage_views_and_tensors():
             gdtensor.get_d_tensor(value)
         with pytest.raises(ValueError, match="ComputeMesh"):
             gdtensor.reset_d_tensor(value, object())
+
+
+def test_file_path_missing_leader_returns_the_documented_error():
+    view = storage_view(Memory(range(8)), [])
+    view.physical_layout.mutable_file_paths().clear()
+    result = gb.file_path_of(view.physical_layout, gb.TensorComponentPos("w", 0))
+    assert type(result) is gt.Err and type(result.value) is gb.NotFoundError
+    assert result.value.key_name == "file_paths" and result.value.msg
+
+
+def test_top_level_tensor_lookup_reports_missing_id_without_torch():
+    result = gdtensor.get_gd_tensor(compute_view(Memory(range(8))), "missing")
+    assert type(result) is gt.Err and type(result.value) is gb.NotFoundError
+    assert result.value.key_name == "tensor_id" and result.value.key == "missing"
 
 
 @pytest.mark.parametrize(

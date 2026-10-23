@@ -24,9 +24,9 @@ import pytest
 import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
-from tensor_oracle import ArrayFabric, slice_points
-from test_data_correctness import _regions, _run, _schema, _storage, _verify_crc
-
+from tests.support.checkpoint import file_bytes, small_schema
+from tests.support.oracle import ArrayFabric
+from tests.support.schemas import payload_regions, run_ranks, storage_view, verify_crc
 
 CASES = [
     ((1, 1, 3), (1, 1, 5), (1, 1, 2), 16),
@@ -35,65 +35,11 @@ CASES = [
 ]
 
 
-def _small_schema(parallel, tensor_count, column=False):
-    table, _, _ = _schema(parallel, column=column, tensor_count=tensor_count)
-    values, points = {}, {rank: {} for rank in range(int(np.prod(parallel)))}
-    for order, nd in enumerate(table.named_d_tensors):
-        shape, dtype = _small_tensor(nd)
-        seed = 100 if dtype.itemsize == 2 else order * 100
-        values[nd.global_tensor_id] = (
-            np.arange(int(np.prod(shape)), dtype=dtype) + seed
-        ).reshape(shape)
-        _tensor_points(points, nd, parallel, order)
-    return table, points, values
-
-
-def _small_tensor(nd):
-    dt = nd.d_tensor
-    naive = dt.underlying_d_tensor if type(dt) is gb.ReshapedDTensor else dt
-    original = naive.global_tensor_meta.global_shape
-    shape = [3, 7] if type(dt) is gb.ReshapedDTensor else [5, 7]
-    if 0 in original:
-        shape = [0, 3]
-    elif len(original) == 3:
-        shape = [3, 4, 5]
-    elif original == [1]:
-        shape = [1]
-    naive.global_tensor_meta.set_global_shape(
-        [int(np.prod(shape))] if type(dt) is gb.ReshapedDTensor else shape
-    )
-    if type(dt) is gb.ReshapedDTensor:
-        dt.set_shape(shape)
-    dtype = np.dtype(
-        {"I64": "<i8", "F64": "<f8", "F32": "<f4", "F16": "<f2"}[
-            naive.global_tensor_meta.dtype
-        ]
-    )
-    return shape, dtype
-
-
-def _tensor_points(points, nd, parallel, order):
-    dt = nd.d_tensor
-    naive = dt.underlying_d_tensor if type(dt) is gb.ReshapedDTensor else dt
-    for rank in points:
-        points[rank][nd.global_tensor_id] = slice_points(
-            naive.global_tensor_meta.global_shape,
-            parallel,
-            naive.placements,
-            order % parallel[0],
-            rank,
-        )
-
-
-def _fingerprint(root):
-    return {path.name: path.read_bytes() for path in root.iterdir() if path.is_file()}
-
-
 def _check_files(label, root, fmt, table, parallel, mode, values, *, multiple=True):
-    _verify_crc(root, fmt, table, parallel, mode, values)
+    verify_crc(root, fmt, table, parallel, mode, values)
     payloads = {}
     tensors = {}
-    for tid, _, _, data, path, _ in _regions(root, fmt):
+    for tid, _, _, data, path, _ in payload_regions(root, fmt):
         payloads.setdefault(path.name, bytearray()).extend(data)
         tensors.setdefault(path.name, set()).add(tid)
     assert len(payloads) > 1 if multiple else len(payloads) == 1
@@ -111,15 +57,17 @@ def _save_checkpoint(root, fmt, parallel, table, points, values):
         flush=True,
     )
     source = ArrayFabric(table, points, values)
-    storage = _storage(root, table, parallel, "rank_multi", "mirror", fmt, save=True)
+    storage = storage_view(
+        root, table, parallel, "rank_multi", "mirror", fmt, save=True
+    )
     _assert_rank_multifile(storage)
-    _run(
+    run_ranks(
         int(np.prod(parallel)),
         lambda rank: gio.rank_save(rank, source.view(rank), storage),
     )
     _check_files("SAVE_CHECKPOINT", root, fmt, table, parallel, "mirror", values)
     source.assert_values(values)
-    return _storage(root, table, parallel, "rank_multi", "mirror", fmt)
+    return storage_view(root, table, parallel, "rank_multi", "mirror", fmt)
 
 
 def _assert_rank_multifile(view):
@@ -138,23 +86,23 @@ def _load_repacked(root, fmt, source, table, points, parallel, values):
         f"[CRC+ARANGE][REPACK_CHECKPOINT][START] output={root.name} format={fmt}",
         flush=True,
     )
-    destination = _storage(root, table, parallel, "hf", "hf", fmt, save=True)
-    _run(
+    destination = storage_view(root, table, parallel, "hf", "hf", fmt, save=True)
+    run_ranks(
         int(np.prod(parallel)), lambda rank: gio.rank_reshard(rank, source, destination)
     )
     _check_files("REPACK_CHECKPOINT", root, fmt, table, parallel, "hf", values)
     loaded = ArrayFabric(table, points)
-    read_view = _storage(root, table, parallel, "hf", "hf", fmt)
-    before_load = _fingerprint(root)
+    read_view = storage_view(root, table, parallel, "hf", "hf", fmt)
+    before_load = file_bytes(root)
     print(
         f"[CRC+ARANGE][LOAD_REPACKED][START] ranks={int(np.prod(parallel))}", flush=True
     )
-    _run(
+    run_ranks(
         int(np.prod(parallel)),
         lambda rank: gio.rank_load(rank, loaded.view(rank), read_view),
     )
     loaded.assert_values(values)
-    assert _fingerprint(root) == before_load, "load modified the repacked checkpoint"
+    assert file_bytes(root) == before_load, "load modified the repacked checkpoint"
     print(
         "[CRC+ARANGE][LOAD_REPACKED][PASS] checks=every_rank_every_element,source_files_unchanged",
         flush=True,
@@ -179,16 +127,16 @@ def _merge_local_buffers(fabric, sums, values, denominator):
 
 def _write_merge(root, fmt, fabric, parallel, values):
     print(f"[CRC+ARANGE][SAVE_MERGED][START] format={fmt}", flush=True)
-    storage = _storage(
+    storage = storage_view(
         root, fabric.table, parallel, "rank_multi", "mirror", fmt, save=True
     )
     _assert_rank_multifile(storage)
-    _run(
+    run_ranks(
         int(np.prod(parallel)),
         lambda rank: gio.rank_save(rank, fabric.view(rank), storage),
     )
     _check_files("SAVE_MERGED", root, fmt, fabric.table, parallel, "mirror", values)
-    return _storage(root, fabric.table, parallel, "rank_multi", "mirror", fmt)
+    return storage_view(root, fabric.table, parallel, "rank_multi", "mirror", fmt)
 
 
 def _consolidate(root, fmt, source, parallel, table, points, values):
@@ -196,8 +144,10 @@ def _consolidate(root, fmt, source, parallel, table, points, values):
         f"[CRC+ARANGE][CONSOLIDATE_FILES][START] format={fmt} target_files=1",
         flush=True,
     )
-    target = _storage(root, table, parallel, "single", "hf", fmt, save=True)
-    _run(int(np.prod(parallel)), lambda rank: gio.rank_reshard(rank, source, target))
+    target = storage_view(root, table, parallel, "single", "hf", fmt, save=True)
+    run_ranks(
+        int(np.prod(parallel)), lambda rank: gio.rank_reshard(rank, source, target)
+    )
     _check_files(
         "CONSOLIDATE_FILES",
         root,
@@ -209,20 +159,18 @@ def _consolidate(root, fmt, source, parallel, table, points, values):
         multiple=False,
     )
     loaded = ArrayFabric(table, points)
-    read_view = _storage(root, table, parallel, "single", "hf", fmt)
-    before_load = _fingerprint(root)
+    read_view = storage_view(root, table, parallel, "single", "hf", fmt)
+    before_load = file_bytes(root)
     print(
         f"[CRC+ARANGE][LOAD_CONSOLIDATED][START] ranks={int(np.prod(parallel))}",
         flush=True,
     )
-    _run(
+    run_ranks(
         int(np.prod(parallel)),
         lambda rank: gio.rank_load(rank, loaded.view(rank), read_view),
     )
     loaded.assert_values(values)
-    assert _fingerprint(root) == before_load, (
-        "load modified the consolidated checkpoint"
-    )
+    assert file_bytes(root) == before_load, "load modified the consolidated checkpoint"
     print(
         "[CRC+ARANGE][LOAD_CONSOLIDATED][PASS] checks=every_rank_every_element,source_files_unchanged",
         flush=True,
@@ -238,9 +186,9 @@ def _consolidate(root, fmt, source, parallel, table, points, values):
 def test_multifile_checkpoint_merge_crc(
     tmp_path, fmt, weights, mean_shift, source_p, merge_p, final_p, tensor_count
 ):
-    source_table, source_points, base = _small_schema(source_p, tensor_count)
-    merge_table, merge_points, _ = _small_schema(merge_p, tensor_count, column=True)
-    final_table, final_points, _ = _small_schema(final_p, tensor_count)
+    source_table, source_points, base = small_schema(source_p, tensor_count)
+    merge_table, merge_points, _ = small_schema(merge_p, tensor_count, column=True)
+    final_table, final_points, _ = small_schema(final_p, tensor_count)
     formats = [fmt, "distcp" if fmt == "safetensors" else "safetensors"]
     # Use the global closed form independently of loaded bytes and local sums.
     expected = {
@@ -267,7 +215,7 @@ def test_multifile_checkpoint_merge_crc(
         source = _save_checkpoint(
             root, formats[epoch % 2], source_p, source_table, source_points, values
         )
-        originals[root] = _fingerprint(root)
+        originals[root] = file_bytes(root)
         repacked = tmp_path / f"repacked-{epoch}"
         loaded = _load_repacked(
             repacked,
@@ -293,7 +241,7 @@ def test_multifile_checkpoint_merge_crc(
     )
     merged_root = tmp_path / "merged"
     saved = _write_merge(merged_root, fmt, merged, merge_p, expected)
-    originals[merged_root] = _fingerprint(merged_root)
+    originals[merged_root] = file_bytes(merged_root)
     final = _consolidate(
         tmp_path / "consolidated",
         formats[1],
@@ -316,7 +264,7 @@ def test_multifile_checkpoint_merge_crc(
 
 def _assert_originals_unchanged(originals):
     for root, contents in originals.items():
-        assert _fingerprint(root) == contents, f"source checkpoint changed: {root.name}"
+        assert file_bytes(root) == contents, f"source checkpoint changed: {root.name}"
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
@@ -326,9 +274,9 @@ def test_multifile_crc_detects_equal_size_payload_swap(tmp_path, fmt):
         flush=True,
     )
     parallel = (1, 1, 3)
-    table, points, values = _small_schema(parallel, 16)
+    table, points, values = small_schema(parallel, 16)
     read_view = _save_checkpoint(tmp_path, fmt, parallel, table, points, values)
-    regions = list(_regions(tmp_path, fmt))
+    regions = list(payload_regions(tmp_path, fmt))
     left, right = next(
         (left, right)
         for i, left in enumerate(regions)
@@ -339,9 +287,9 @@ def test_multifile_crc_detects_equal_size_payload_swap(tmp_path, fmt):
     _replace_payload(left, right[3])
     _replace_payload(right, left[3])
     with pytest.raises(AssertionError):
-        _verify_crc(tmp_path, fmt, table, parallel, "mirror", values)
+        verify_crc(tmp_path, fmt, table, parallel, "mirror", values)
     loaded = ArrayFabric(table, points)
-    _run(
+    run_ranks(
         int(np.prod(parallel)),
         lambda rank: gio.rank_load(rank, loaded.view(rank), read_view),
     )

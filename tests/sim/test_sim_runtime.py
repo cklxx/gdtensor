@@ -16,8 +16,8 @@ from gdtensor_sim.models import (
     storage_table,
 )
 from gdtensor_sim.runner import load_threads, run_processes, save_threads
-from tensor_oracle import ArrayFabric
-from test_data_correctness import DST, LAYOUTS, SRC, _schema
+from tests.support.oracle import ArrayFabric
+from tests.support.schemas import DST, LAYOUTS, SRC, tensor_schema
 
 
 def _fill_values(values, nd, intervals):
@@ -39,7 +39,7 @@ def _assert_fabric(fabric, oracle):
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
 @pytest.mark.parametrize("layout,mode", LAYOUTS)
 def test_sim_elastic_io_matches_independent_dense_oracle(tmp_path, fmt, layout, mode):
-    ct, points, values = _schema(SRC, column=True)
+    ct, points, values = tensor_schema(SRC, column=True)
     source = ComputeFabric(ct).allocate(
         fill=lambda nd, iv: _fill_values(values, nd, iv)
     )
@@ -49,7 +49,7 @@ def test_sim_elastic_io_matches_independent_dense_oracle(tmp_path, fmt, layout, 
     physical = layout_builder(layout, st, p, fmt, 3)
     results, _ = save_threads(ct, st, physical, str(tmp_path), source, p.world)
     assert all(type(result) is gt.Ok for result in results.values()), results
-    loaded_ct, loaded_points, _ = _schema(DST, column=True)
+    loaded_ct, loaded_points, _ = tensor_schema(DST, column=True)
     loaded = ComputeFabric(loaded_ct).allocate()
     results, _ = load_threads(
         loaded_ct, st, physical, str(tmp_path), loaded, int(np.prod(DST))
@@ -61,7 +61,7 @@ def test_sim_elastic_io_matches_independent_dense_oracle(tmp_path, fmt, layout, 
 @pytest.mark.parametrize("fmt", ["safetensors", "distcp"])
 def test_sim_process_runner_finishes_and_loads_exact_bytes(tmp_path, fmt):
     p = ParallelConfig(tp=2)
-    ct, points, _ = _schema((1, 1, 2))
+    ct, points, _ = tensor_schema((1, 1, 2))
     st = storage_table(ct, p, "hf")
     physical = layout_builder("single", st, p, fmt)
     before = {process.pid for process in mp.active_children()}
@@ -91,7 +91,7 @@ def _fail_fill(nd, intervals):
 
 def test_sim_process_runner_reaps_failed_workers(tmp_path):
     p = ParallelConfig(tp=2)
-    ct, _, _ = _schema((1, 1, 2))
+    ct, _, _ = tensor_schema((1, 1, 2))
     st = storage_table(ct, p, "hf")
     physical = layout_builder("single", st, p, "safetensors")
     before = {process.pid for process in mp.active_children()}

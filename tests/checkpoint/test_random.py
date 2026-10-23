@@ -6,8 +6,8 @@ import pytest
 import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
-from tensor_oracle import ArrayFabric, slice_points
-from test_data_correctness import _run, _storage, _verify_crc
+from tests.support.oracle import ArrayFabric, slice_points
+from tests.support.schemas import run_ranks, storage_view, verify_crc
 
 
 def _random_table(seed):
@@ -42,11 +42,11 @@ def _random_table(seed):
 def test_random_shapes_and_permuted_ranks(tmp_path, seed, fmt):
     p, table, points, values = _random_table(seed)
     source = ArrayFabric(table, points, values)
-    storage = _storage(tmp_path, table, p, "single", "hf", fmt, save=True)
-    _run(p[2], lambda rank: gio.rank_save(rank, source.view(rank), storage))
-    _verify_crc(tmp_path, fmt, table, p, "hf", values)
+    storage = storage_view(tmp_path, table, p, "single", "hf", fmt, save=True)
+    run_ranks(p[2], lambda rank: gio.rank_save(rank, source.view(rank), storage))
+    verify_crc(tmp_path, fmt, table, p, "hf", values)
     target = ArrayFabric(table, points)
-    readable = _storage(tmp_path, table, p, "single", "hf", fmt)
-    _run(p[2], lambda rank: gio.rank_load(rank, target.view(rank), readable))
+    readable = storage_view(tmp_path, table, p, "single", "hf", fmt)
+    run_ranks(p[2], lambda rank: gio.rank_load(rank, target.view(rank), readable))
     target.assert_values(values)
     source.assert_values(values)

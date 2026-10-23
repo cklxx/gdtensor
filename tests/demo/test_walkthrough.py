@@ -1,9 +1,9 @@
 """Small visible data checks for reviewing the IO path."""
 
-from concurrent.futures import ThreadPoolExecutor
 import json
 import struct
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -12,8 +12,8 @@ import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
 from gdtensor_sim.coord import ThreadCoordinator
-from storage_fixture import FileStorage
-from tensor_oracle import ArrayFabric
+from tests.support.oracle import ArrayFabric
+from tests.support.storage import FileStorage
 
 
 def _table(world, axis):

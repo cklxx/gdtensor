@@ -20,6 +20,4 @@ PY
 
 echo "[precommit] 5/5 API, IO contract, constraints and indentation"
 uv run --locked pytest -v --capture=tee-sys --log-cli-level=INFO -p no:cacheprovider \
-  tests/test_api_conformance.py tests/test_api.py \
-  tests/test_io_contract.py tests/test_constraints.py tests/test_plan_behavior.py \
-  tests/test_parallel_modes.py
+  tests/core tests/io tests/checkpoint/test_parallel_modes.py
