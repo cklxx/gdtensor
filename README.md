@@ -136,3 +136,7 @@ uv run --locked python -m gdtensor_sim.sim --root /tmp/gdtensor-ck \
 ```
 
 CLI 会重建指定的 `--root` 目录。报告和读写 trace 位于默认的 `<root>_report/`。
+
+## 并行轴演示
+
+`scripts/demo_axes.sh --tmux` 启动 tmux 会话 `gdt`，循环演示：四轴组合守卫、PP×DP×EP×TP checkpoint 的 CRC/arange、跨 EP 的多 checkpoint 合并与 expert 交换检测、16 个真实 torch 进程上的四轴 LAWA 与换拓扑。查看：`tmux attach -t gdt`。

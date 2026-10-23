@@ -38,10 +38,12 @@
 | 布局 / 参数矩阵 | 38 种 PP/DP/TP 配置 × 7 种布局 × 2 种格式＝532；另有 9 个边界用例 | 自拷贝、启动顺序、空张量 | [checkpoint/test_matrix.py](checkpoint/test_matrix.py) | 枚举范围内已验证 |
 | 随机形状 / 固定种子 | 32 seeds × 2 formats，5 个张量，随机 shape 与 rank 排列 | 不整除切片由独立稠密 oracle 对照 | [checkpoint/test_random.py](checkpoint/test_random.py) | 固定样本已验证 |
 | 多 checkpoint / 调用方合并 | 3→5→2、8→6→4、16→12→8 rank；16/24/32 tensor；等权与加权平均、拆分再合文件 | 跨文件等长 payload 交换；读源文件不变 | [checkpoint/test_checkpoint_merge_crc.py](checkpoint/test_checkpoint_merge_crc.py) | 12 正例、2 损坏负例 |
+| 多 checkpoint × EP / 调用方合并 | 5 种跨 EP 的三段拓扑（EP、EP×TP、PP×EP、DP×EP×TP、PP×DP×EP×TP）；11 tensor 含 5 个 expert；等权/加权 × 2 格式 | 跨文件交换两个 expert payload，CRC 与读回值必须同时失败 | [checkpoint/test_merge_crc_axes.py](checkpoint/test_merge_crc_axes.py) | 20 正例、2 损坏负例 |
 | 串行 vs 并行 / 文件一致性 | 单 rank 基线 vs 3/8/16 线程 rank；独立重建、统一布局后整文件相同、交叉读、顺序读 vs 并发读 | 交换同一 tensor 的两个 rank 分片必须检出拼错 | [checkpoint/test_serial_parallel_crc.py](checkpoint/test_serial_parallel_crc.py) | 12 正例、2 损坏负例 |
 | TP/DP/EP/PP / 四轴组合 | 全部 15 种非空组合 × 2 formats × 2 layouts＝60；换拓扑 load/reshard，optimizer 与 expert 归属 | 2 个 expert payload 交换负例；1 个组合完整性守卫 | [checkpoint/test_parallel_modes.py](checkpoint/test_parallel_modes.py) | 线程 checkpoint 验证 |
 | torch 桥 / 原生对象 | 9 种 dtype，原生 mesh/placements、identity、Naive/Reshaped reset | plain tensor；shape/dtype/placements/mesh 不同则拒绝且保留原 handle | [torch/test_torch_bridge.py](torch/test_torch_bridge.py) | 需要 torch 开关 |
 | LAWA / CPU 多进程 | 7 种配置，2/4/8/16/32 进程，最多 64 tensor；DP/TP/DP+TP，正序/逆序 mesh；朴素/Welford，k=1/2/3/5 | 各 rank 本地值、保存结果与独立平均值对照 | [torch/test_lawa.py](torch/test_lawa.py) | 需要 torch 开关 |
+| LAWA × 四轴 / CPU 多进程 | 9 种 (PP,DP,EP,TP) 配置，2–16 进程；PP、EP、PP×EP、EP×TP、PP×DP×EP×TP；3 例换拓扑（TP→DP×TP、PP×DP×TP→PP×TP、PP×EP×TP→PP×DP×EP）；子 mesh 上的原生 DTensor（stage / expert owner），optimizer 走 ReshapedDTensor；朴素/Welford，k=1/2/3 | 每 rank 本地值、单文件解码值与独立 numpy 平均对照；每元素恰好存一次 | [torch/test_lawa_axes.py](torch/test_lawa_axes.py) | 需要 torch 开关 |
 | sim 格式 / 生命周期 | safetensors、仿真 distcp，metadata 发布后才返回 | dtype/shape/size 不符、leader 发布失败传到所有 rank、终态后拒绝访问 | [sim/test_sim_formats.py](sim/test_sim_formats.py) | 适配器范围内已验证 |
 | sim 执行器 / 子进程 | 线程弹性 IO、真实子进程写读与独立 oracle | worker 失败时回收其他子进程 | [sim/test_sim_runtime.py](sim/test_sim_runtime.py) | 已验证 |
 | 检测器 / 行为变异 | 临时副本执行 9 项变异；每个 detector 先通过原始代码 | 偏移、尾分片、漏拷贝/清理、错误 accessor、越界导出等变异必须导致断言失败 | [mutation_check.py](mutation_check.py) | 与 pytest 分开执行 |
@@ -75,7 +77,7 @@
 |---|---|---|
 | 5 个内部 `check_*` 的 disjoint / covering 行为 | 源码声明、参数与 Result 注解检查；没有公开调用路径 | 保留“只通过公开 API 测试”的要求，因此不能声明这些函数已有行为测试；需要设计提供调用路径才能闭合 |
 | `Partial` 的持久化与搬运语义 | 仅 tag/union 合约 | 设计未规定 IO 行为；需要明确语义后补测试，不能按当前实现自行定义 |
-| GPU / NCCL；真实进程 PP/EP | CPU/gloo 的 DP/TP/DP+TP；PP/EP checkpoint 使用线程 | 需要对应设备与执行场景；线程搬运不证明训练、token routing 或梯度通信 |
+| GPU / NCCL；真实进程 PP/EP 的 IO 搬运 | CPU/gloo 已跑四轴 LAWA；PP/EP 的纯 checkpoint 矩阵仍使用线程 | 需要对应设备与执行场景；线程搬运不证明训练、token routing 或梯度通信 |
 | 对象存储 multipart、网络中断与服务端重试 | 本地文件与注入的 session/accessor 失败 | 设计将其放在 session 实现层；当前没有对象存储适配器集成用例 |
 | PyTorch DCP 外部互操作 | sim distcp 使用 JSON metadata | 不能据此声明支持 PyTorch DCP pickle checkpoint |
 | 1000 个真实 rank、完整 DeepSeek 模型容量 | 本轮最大 32 个真实 torch 进程；大矩阵使用小张量 | 未验证容量、峰值内存或吞吐；正确性矩阵不能替代规模测试 |
