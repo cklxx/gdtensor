@@ -42,7 +42,7 @@ TensorComponentPosBuilderMixin = make_builder_mixin(
 )
 DisjointStorageMeshListBuilderMixin = make_builder_mixin(
     "DisjointStorageMeshList",
-    [("disjoint_storage_mesh_list", "list")],
+    [("disjoint_storage_mesh_list", "list"), ("tensor_ids", "list")],
 )
 PhysicalLayoutTableBuilderMixin = make_builder_mixin(
     "PhysicalLayoutTable",
@@ -71,17 +71,38 @@ def pos_key(pos: TensorComponentPos) -> Tuple[str, int]:
 @dataclass(eq=True)
 class DisjointStorageMeshList(DisjointStorageMeshListBuilderMixin):
     disjoint_storage_mesh_list: List[Any] = field(default_factory=list)
+    tensor_ids: List[str] = field(default_factory=list)
     __hash__ = field_hash
 
     def __post_init__(self) -> None:
         self.disjoint_storage_mesh_list = list(self.disjoint_storage_mesh_list)
+        self.tensor_ids = list(self.tensor_ids)
 
     def check_constraints(self):
         return _cc(self)
 
 
+def _check_tensor_ids(lst: DisjointStorageMeshList) -> None:
+    rows: set = set()
+    for m in lst.disjoint_storage_mesh_list:
+        if not is_multi_tensors_storage_mesh(m):
+            raise invalid(
+                "disjoint_storage_mesh_list", "list holds MultiTensorsStorageMesh only"
+            )
+        for t, _ in storage_mesh_cells(m):
+            rows.add(t)
+    for t in rows:
+        if t >= len(lst.tensor_ids):
+            raise invalid("tensor_ids", f"row {t} has no label")
+    if any(not isinstance(t, str) or not t for t in lst.tensor_ids):
+        raise invalid("tensor_ids", "labels must be non-empty strings")
+    if len(set(lst.tensor_ids)) != len(lst.tensor_ids):
+        raise invalid("tensor_ids", "labels must be unique")
+
+
 def list_cells(lst: DisjointStorageMeshList) -> List[Tuple[int, int]]:
     """Sorted (row, column) cells of a list; meshes must be multi-tensor and disjoint."""
+    _check_tensor_ids(lst)
     out: set = set()
     for m in lst.disjoint_storage_mesh_list:
         if not is_multi_tensors_storage_mesh(m):
@@ -100,11 +121,11 @@ def list_cells(lst: DisjointStorageMeshList) -> List[Tuple[int, int]]:
 def leader_tensor_component_pos_of(
     disjoint_storage_meshes: DisjointStorageMeshList,
 ) -> TensorComponentPos:
-    """Canonical key: the smallest (row, column) cell (design B.2.2.2).
+    """Canonical key: the smallest (row, column) cell, row -> real tensor id.
 
-    This is a pure geometric helper. Row ``t`` corresponds to
-    ``d_tensor_table.named_d_tensors[t]``; the caller maps that row to its real
-    tensor id when using the returned pos as a ``file_paths`` key.
+    ``tensor_ids[row]`` labels each row in DTensorTable header order (design
+    delta approved by owner). This helper is self-contained: no extra table or
+    registry argument.
     """
     cells = list_cells(disjoint_storage_meshes)
     if not cells:
@@ -112,7 +133,12 @@ def leader_tensor_component_pos_of(
             "disjoint_storage_meshes", "empty DisjointStorageMeshList has no leader"
         )
     _t, w = cells[0]
-    return TensorComponentPos("", w)
+    if _t >= len(disjoint_storage_meshes.tensor_ids):
+        raise invalid(
+            "tensor_ids",
+            f"row {_t} has no tensor_ids label (got {len(disjoint_storage_meshes.tensor_ids)})",
+        )
+    return TensorComponentPos(disjoint_storage_meshes.tensor_ids[_t], w)
 
 
 @dataclass(eq=True)
@@ -241,6 +267,10 @@ def build_payload_index(
     files: Dict[str, FilePayload] = {}
     slots: Dict[TensorComponentPos, Tuple[str, SlotPayload]] = {}
     cols_by_row = [nonempty_columns(nd) for nd in table.named_d_tensors]
+    table_ids = [n.global_tensor_id for n in table.named_d_tensors]
+    for lst in layout.tensor_entries.values():
+        if list(lst.tensor_ids) != table_ids:
+            raise invalid("tensor_ids", "labels order != DTensorTable header order")
     lists = unique_lists(layout, table)
     for leader, lst in sorted(
         lists.items(), key=lambda kv: _path_for_list(layout, kv[1])

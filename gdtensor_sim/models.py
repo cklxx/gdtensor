@@ -457,7 +457,11 @@ def build_layout(
     file_paths: Dict[TensorComponentPos, str] = {}
     for path in sorted(groups):
         cells = groups[path]
-        lst = DisjointStorageMeshList(_cells_to_meshes(cells, len(ids), world_size))
+        # tensor_ids is the FULL DTensorTable row order (N labels), indexed by
+        # absolute row; not truncated to rows this group happens to cover.
+        lst = DisjointStorageMeshList(
+            _cells_to_meshes(cells, len(ids), world_size), ids
+        )
         leader = leader_tensor_component_pos_of(lst)  # canonical leader rank, tid=""
         t0 = min(t for t, _ in cells)  # leader row in table order
         file_paths[TensorComponentPos(ids[t0], leader.rank)] = path

@@ -20,7 +20,7 @@ import os
 import shutil
 import threading
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 
@@ -208,14 +208,63 @@ def _real_dcp_load(table: DTensorTable, root: str) -> Dict[str, object]:
 
 def _storage_offsets(root: str) -> Dict[str, int]:
     """Read ``storage_data[MetadataIndex(fqn)].offset`` from the real pickle
-    ``.metadata``. This is the genuine byte offset of each tensor's payload
-    region inside the torch-written ``.distcp`` archive (not a safetensors
-    header computation)."""
+    ``.metadata``."""
     import pickle
 
     with open(os.path.join(root, ".metadata"), "rb") as handle:
         meta = pickle.loads(handle.read())
     return {idx.fqn: sd.offset for idx, sd in meta.storage_data.items()}
+
+
+def _raw_payload_bases(root: str) -> Dict[str, List[tuple]]:
+    """Resolve the real byte offset of each tensor's raw payload inside the
+    torch-written ``.distcp`` archive, by parsing the archive structure (never by
+    searching for raw byte content, never a hard-coded header constant).
+
+    Each ``storage_data[MetadataIndex(fqn)]`` points at a self-contained sub-archive
+    of ``length`` bytes (a torch zip). Inside it the raw tensor bytes are the
+    ``archive/data/<n>`` zip entry (``data.pkl`` is the pickle, not the payload).
+    The payload file offset = sub-archive start + (local-header offset of the
+    data entry + 30 + filename length + extra-field length).
+    """
+    import pickle
+
+    with open(os.path.join(root, ".metadata"), "rb") as handle:
+        meta = pickle.loads(handle.read())
+    # fqn -> list of (distcp_file, raw_payload_base, payload_nbytes). A tensor may
+    # be sharded across several sub-archives (multiple storage_data entries for the
+    # same fqn); keep ALL chunks instead of silently overwriting with the last one.
+    out: Dict[str, List[tuple]] = {}
+    by_file: Dict[str, List] = {}
+    for idx, sd in meta.storage_data.items():
+        by_file.setdefault(sd.relative_path, []).append((idx.fqn, sd))
+    for rel, entries in by_file.items():
+        raw = open(os.path.join(root, rel), "rb").read()
+        for fqn, sd in entries:
+            chunk = _resolve_one_subarchive(root, rel, fqn, sd, raw)
+            out.setdefault(fqn, []).append(chunk)
+    return out
+
+
+def _resolve_one_subarchive(root, rel, fqn, sd, raw):
+    import io
+    import struct
+    import zipfile
+
+    sub = raw[sd.offset : sd.offset + sd.length]
+    zf = zipfile.ZipFile(io.BytesIO(sub))
+    zi = next(
+        z
+        for z in zf.infolist()
+        if z.filename.startswith("archive/data/") and z.filename != "archive/data.pkl"
+    )
+    if zi.compress_type != 0:
+        msg = f"{fqn}: unsupported DCP payload compression {zi.compress_type}"
+        raise io_error("read", msg, os.path.join(root, rel))
+    lh = sub[zi.header_offset : zi.header_offset + 30]
+    nlen, elen = struct.unpack("<HH", lh[26:30])
+    data_in_sub = zi.header_offset + 30 + nlen + elen
+    return (rel, sd.offset + data_in_sub, zi.file_size)
 
 
 def _resolve_slot(index: PayloadIndex, rng):
@@ -416,9 +465,9 @@ class DcpLoadSession(StorageLoadSession):
             self.full = _real_dcp_load(table, root)
         except BaseException as exc:  # noqa: BLE001
             raise io_error("read", f"real DCP load failed: {exc}", root) from None
-        # Genuine byte offsets of each tensor's payload region inside the torch
-        # ``.distcp`` archive, read from the real pickle .metadata.
-        self.offsets = _storage_offsets(root)
+        # Real raw byte offset of each tensor's payload inside the torch-written
+        # ``.distcp`` archive, resolved by parsing the sub-archive zip structure.
+        self.offsets = _raw_payload_bases(root)
 
     @catch
     def init_data_accessor(self):
@@ -430,18 +479,67 @@ class DcpLoadSession(StorageLoadSession):
     def get_file_offset(self, pos):
         if self.state != "open":
             raise invalid("session", f"get_file_offset on {self.state} session")
-        # Real torch DCP ``.distcp`` is a pickle-wrapped archive: the public
-        # ``storage_data.offset`` is a logical offset into torch's internal
-        # unpacking, NOT a raw-byte pread location (pread at it returns pickle
-        # framing, not tensor bytes). The raw payload region is not exposed by the
-        # public metadata API, so this load session cannot truthfully return a raw
-        # file offset. Report the gap explicitly rather than faking storage_data.offset.
-        raise invalid(
-            "file_offset",
-            f"{pos.tensor_id}:{pos.rank}: real DCP metadata does not expose raw "
-            "byte offsets; storage_data.offset is a logical archive offset, not a "
-            "raw pread location",
-        )
+        hit = self.index.slots.get(pos)
+        if hit is None:
+            raise not_found(
+                "tensor_entries",
+                f"{pos.tensor_id}:{pos.rank}",
+                f"{pos.tensor_id}:{pos.rank} has no physical file",
+            )
+        _path, slot = hit
+        chunks = self.offsets.get(pos.tensor_id)
+        if not chunks:
+            raise not_found(
+                "tensor_entries",
+                f"{pos.tensor_id}:{pos.rank}",
+                f"{pos.tensor_id}:{pos.rank} has no payload in the archive",
+            )
+        # Slot's global owned interval and the matched chunk's global origin.
+        # local offset = (slot.global_first - chunk.global_origin) * itemsize.
+        # no_dist: one chunk holds the whole tensor (origin 0) -> local = global_first.
+        # sharded: each chunk holds exactly one rank's shard (origin = that shard's
+        # global start) -> local = 0 for the owning rank.
+        global_first = int(slot.intervals[0, 0]) * slot.itemsize
+        # Total owned bytes = sum of interval lengths * itemsize, NOT
+        # (last - first) * itemsize. The latter is wrong for non-contiguous
+        # multi-interval slots.
+        total_elems = int(sum(b - a for a, b in slot.intervals.tolist()))
+        slot_bytes = total_elems * slot.itemsize
+        # Select the chunk whose archive file matches the slot's authoritative path
+        # (file_path_of(layout, pos)), compared as fully normalized paths against the
+        # checkpoint root — never basename-only, never inferred from pos.rank.
+        want = os.path.normpath(os.path.join(self.root, _path))
+        matches = [
+            (rel, base, nbytes)
+            for rel, base, nbytes in chunks
+            if os.path.normpath(os.path.join(self.root, rel)) == want
+        ]
+        if matches:
+            chosen = matches[0]
+        elif len(chunks) == 1:
+            chosen = chunks[0]
+        else:
+            chosen = None
+        if chosen is None:
+            raise invalid(
+                "file_offset",
+                f"{pos.tensor_id}:{pos.rank}: no DCP chunk file matches slot path {want!r} "
+                f"among {[os.path.normpath(os.path.join(self.root, c[0])) for c in chunks]}",
+            )
+        rel, base, nbytes = chosen
+        # A dedicated shard chunk (one chunk per rank/slot) starts at the slot's own
+        # global origin, so local offset is 0. A shared chunk (no_dist, whole tensor
+        # for all slots) starts at global 0, so local offset = slot.global_first.
+        chunk_origin = 0 if len(chunks) == 1 else global_first
+        local = global_first - chunk_origin
+        if local < 0 or local + slot_bytes > nbytes:
+            raise invalid(
+                "file_offset",
+                f"{pos.tensor_id}:{pos.rank}: slot bytes [{local},{local + slot_bytes}) not contained "
+                f"in chunk {rel} (size {nbytes}); a single base offset cannot represent a slot "
+                "spanning multiple DCP chunk files",
+            )
+        return Ok(base + local)
 
     @catch
     def finish(self):

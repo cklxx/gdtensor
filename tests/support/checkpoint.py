@@ -81,27 +81,40 @@ def payload_file_bytes(root):
 def corrupt_distcp_payload(root, tid_substring=None):
     """Inject a real on-disk byte fault into a real torch DCP checkpoint.
 
-    Decodes each tensor through the independent oracle (torch's own reader,
-    not gdtensor_sim), locates one tensor's raw bytes inside the shard by
-    direct search, and flips a single byte there. The fault never goes through
-    the backend's save path — the container is left byte-corrupted on disk,
-    so the oracle re-decoding afterwards reads genuinely wrong payloads.
+    Locates the target tensor through the public ``.metadata`` pickle:
+    ``storage_data[MetadataIndex].StorageInfo`` gives the shard file
+    (relative_path) and the segment (offset, length) holding that tensor's
+    mini-zip. The tensor payload entry (``archive/data/N``) is found by
+    parsing the per-entry local zip headers inside that segment — no content
+    search, no fixed offset. One payload byte is flipped in place. The fault
+    never goes through the backend's save path, and repeated payload bytes
+    cannot mis-attribute the fault to the wrong tensor.
     """
-    from tests.support.schemas import payload_regions
+    import pickle
+    import re
+    import struct
 
-    shards = list(root.glob("*.distcp"))
-    assert shards, "no distcp shard to corrupt"
-    regions = list(payload_regions(root, "distcp"))
+    meta = pickle.loads((root / ".metadata").read_bytes())
+    entries = list(meta.storage_data.items())
     if tid_substring is not None:
-        region = next(r for r in regions if tid_substring in r[0])
+        idx, info = next(e for e in entries if tid_substring in e[0].fqn)
     else:
-        region = regions[0]
-    data = region[3]
-    raw = bytearray(shards[0].read_bytes())
-    idx = raw.find(data[:32])
-    assert idx >= 0, "tensor payload bytes not found in shard"
-    raw[idx] ^= 0xFF
-    shards[0].write_bytes(bytes(raw))
+        idx, info = entries[0]
+    shard = root / info.relative_path
+    raw = bytearray(shard.read_bytes())
+    segment = bytes(raw[info.offset : info.offset + info.length])
+    headers = [info.offset + m.start() for m in re.finditer(rb"PK\x03\x04", segment)]
+    payload = None
+    for pos in headers:
+        fnlen = struct.unpack("<H", raw[pos + 26 : pos + 28])[0]
+        extralen = struct.unpack("<H", raw[pos + 28 : pos + 30])[0]
+        name = bytes(raw[pos + 30 : pos + 30 + fnlen]).decode()
+        if re.fullmatch(r"archive/data/\d+", name):
+            payload = pos + 30 + fnlen + extralen
+            break
+    assert payload is not None, f"no archive/data entry for {idx.fqn}"
+    raw[payload] ^= 0xFF
+    shard.write_bytes(bytes(raw))
 
 
 def repack_via_compute(world, src_read_view, dst_save_view, table, points, values=None):

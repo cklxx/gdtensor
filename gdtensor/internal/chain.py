@@ -17,6 +17,7 @@ from .dtensor import (
     EMPTY,
     box_of,
     box_to_intervals,
+    iv_intersect,
     global_tensor_meta_of,
     iv_normalize,
     iv_total,
@@ -297,15 +298,17 @@ def _wanted_intervals(compute_view: ComputeDTensorsView, tid: str, rank: int):
     return owned_intervals(nd, "compute", rank)
 
 
-def _cache_owned_blocks(nd, tid: str, rank: int, num_ranks_per_node: int):
-    """Element intervals the cache on this rank's node offers for this rank.
+def _cache_owned_blocks(nd, tid: str, rank: int, num_ranks_per_node: int, want):
+    """Element intervals the cache on this rank's node offers for ``want``.
 
-    The executor serially walks the full S x C slot grid for the node, so the
-    node's cache offers the union of every non-empty slot box on its spatial
-    node. We do NOT pin step n = node n (no design basis); the union over all
-    (step, slot) coordinates on this node is exactly the region the node can
-    serve. ``_pair`` then intersects that with the wanted compute share, which
-    is why the cache need not know the rank's step.
+    The cache mesh tiles the tensor across (step, slot) participants; only the
+    spatial node expands to ranks. For the rank's wanted share, the cache only
+    needs to stage the slot boxes that actually intersect ``want`` — not the
+    whole S x C union. We pick the real owner coordinate from box_of (never an
+    invented node==step map): every (step, slot) on this node whose box meets
+    the wanted elements is emitted as a full owner block, so ``_pair`` keeps
+    the owner-relative offset. The allocator reuses a step buffer across slots;
+    peak live bytes are the max-step union, computed independently in stats.
     """
     naive = naive_of(nd)
     mesh = naive.mesh
@@ -316,13 +319,14 @@ def _cache_owned_blocks(nd, tid: str, rank: int, num_ranks_per_node: int):
     n_index = nodes.index(rank // num_ranks_per_node)
     shape = global_tensor_meta_of(nd).global_shape
     isz = global_tensor_meta_of(nd).itemsize
-    union = []
-    for s in range(S):
-        for c in range(C):
-            lo, hi = box_of(naive, (S, N, C), (s, n_index, c))
-            union.append(box_to_intervals(shape, lo, hi))
-    intervals = iv_normalize(np.concatenate(union)) if union else EMPTY
-    return [(intervals, ("compute", tid, isz))] if intervals.size else []
+    out = []
+    slots = ((s, c) for s in range(S) for c in range(C))
+    for s, c in slots:
+        lo, hi = box_of(naive, (S, N, C), (s, n_index, c))
+        iv = box_to_intervals(shape, lo, hi)
+        if iv.size and iv_total(iv_normalize(iv_intersect(iv, want))):
+            out.append((iv, ("compute", tid, isz)))
+    return out
 
 
 def _element_blocks(view, tid: str, rank: int, want, num_ranks_per_node: int):
@@ -340,7 +344,7 @@ def _element_blocks(view, tid: str, rank: int, want, num_ranks_per_node: int):
         return list(_Side(view).src_candidates(tid, rank))
     nd = named_of(view.d_tensor_table, tid)
     if type(view) is CacheDTensorsView:
-        return _cache_owned_blocks(nd, tid, rank, num_ranks_per_node)
+        return _cache_owned_blocks(nd, tid, rank, num_ranks_per_node, want)
     isz = global_tensor_meta_of(nd).itemsize
     owned = owned_intervals(nd, "compute", rank)
     return [(owned, ("compute", tid, isz))] if owned.size else []
@@ -507,32 +511,43 @@ def _view_node_ids(view):
     return None
 
 
-def _cache_tensor_resident_bytes(nd, node: int) -> int:
-    """Peak resident cache bytes on ``node`` for one tensor.
+def _tensor_resident_bytes(nd, node: int, k: int, drain_view) -> int:
+    """Peak resident bytes of one tensor's cache on ``node``.
 
-    The executor serially walks the full S x C slot grid: for each step it
-    allocates the slots the concurrency Shard split that step into, consumes
-    them, then frees them before the next step (temporal reuse). Peak live
-    bytes = the maximum, over steps, of the union of that step's slot boxes.
-    Each slot box is taken from the real mesh via box_of; no whole-step-copy
-    factor is assumed.
+    Each tensor has its own backing region. Temporal reuse serialises steps (a
+    step drains before the next fills); the C slots of one step are live
+    together. Which step the node stages is fixed by the ranks that live on it:
+    the node's cache only holds the step box intersecting those ranks' wanted
+    share. Peak = max over steps of (box on this node at that step intersected
+    with the node's ranks' want), in bytes.
     """
-    mesh = nd.mesh
+    naive = naive_of(nd)
+    mesh = naive.mesh
     S = cache_num_steps(mesh)
     N = cache_num_nodes(mesh)
     C = cache_concurrency_width(mesh)
-    shape = nd.global_tensor_meta.global_shape
-    isz = nd.global_tensor_meta.itemsize
-    # node index into the spatial LiteralMesh order.
+    shape = naive.global_tensor_meta.global_shape
+    isz = naive.global_tensor_meta.itemsize
     n_index = sorted(cache_node_set(mesh)).index(node)
+    tid = nd.global_tensor_id
+    drain_nd = named_of(drain_view.d_tensor_table, tid)
+    wants = [
+        owned_intervals(drain_nd, "compute", r) for r in range(node * k, (node + 1) * k)
+    ]
+    want_node = iv_normalize(np.concatenate(wants)) if wants else EMPTY
 
-    def slot_boxes(s: int):
-        for c in range(C):
-            lo, hi = box_of(nd, (S, N, C), (s, n_index, c))
-            yield box_to_intervals(shape, lo, hi)
+    def _ranges(iv):
+        out = set()
+        for a, b in iv:
+            out.update(range(a, b))
+        return out
 
     def step_live(s: int) -> int:
-        union = {i for iv in slot_boxes(s) for a, b in iv for i in range(a, b)}
+        union = set()
+        for c in range(C):
+            lo, hi = box_of(naive, (S, N, C), (s, n_index, c))
+            iv = iv_intersect(box_to_intervals(shape, lo, hi), want_node)
+            union.update(_ranges(iv))
         return len(union) * isz
 
     return max((step_live(s) for s in range(S)), default=0)
@@ -545,6 +560,46 @@ def _node_compute_bytes(dst_view, node: int, k: int) -> int:
         isz = named.d_tensor.global_tensor_meta.itemsize
         for r in range(node * k, (node + 1) * k):
             total += iv_total(owned_intervals(named, "compute", r)) * isz
+    return total
+
+
+def _record_inbound(acc, dst, dst_view, nodes, k: int) -> None:
+    if type(dst) is CacheDTensorsView:
+        _acc_cache_pull(acc, dst, dst_view, nodes, k)
+    else:
+        _add_node_bytes(acc, nodes, dst_view, k)
+
+
+def _acc_cache_pull(acc, cache_view, dst_view, nodes, k: int) -> None:
+    for node in nodes:
+        acc[node] = acc.get(node, 0) + _node_cache_pull_bytes(
+            cache_view, dst_view, node, k
+        )
+
+
+def _node_cache_pull_bytes(cache_view, dst_view, node: int, k: int) -> int:
+    """Bytes the ranks on ``node`` pull from source into the cache.
+
+    Each rank's src->cache leg stages the real cache owner block (step/slot box
+    from box_of) that covers that rank's wanted compute share — not the wanted
+    share itself. Ranks on the same node may stage the same step slice, and the
+    executor drives ``chain_load`` per rank, so this sums per-rank pulls rather
+    than unioning the node's owned bytes.
+    """
+    total = 0
+    for cnd, dnd in zip(
+        cache_view.d_tensor_table.named_d_tensors,
+        dst_view.d_tensor_table.named_d_tensors,
+    ):
+        tid = cnd.global_tensor_id
+        isz = cnd.d_tensor.global_tensor_meta.itemsize
+        nd = named_of(cache_view.d_tensor_table, tid)
+        for r in range(node * k, (node + 1) * k):
+            want = owned_intervals(dnd, "compute", r)
+            blocks = _cache_owned_blocks(nd, tid, r, k, want)
+            ivs = [iv for iv, _ in blocks]
+            union = iv_normalize(np.concatenate(ivs)) if ivs else EMPTY
+            total += iv_total(union) * isz
     return total
 
 
@@ -562,15 +617,30 @@ def get_stat_inbound_traffic_of_chain_load(read_chain: DTensorsReadChain) -> Lis
 
 
 def _stat_overhead(chain) -> List[int]:
+    """Per-node resident cache bytes.
+
+    Each tensor owns a distinct backing region. A cache node only stages the step
+    boxes intersecting the ranks that live on it (spatial Replicate gives every
+    node a copy, but each node serves its own rank block — not every node runs
+    every rank's share). Resident per node = sum over tensors of that tensor's
+    per-step peak on the node, taking the node's ranks' want as the intersect.
+    """
+    drain_dst: dict = {}
+    for src, dst in legs_of(chain):
+        if type(src) is CacheDTensorsView:
+            drain_dst[src] = dst
+    k = getattr(chain, "num_ranks_per_node", 1)
     acc: dict = {}
     for src, dst in legs_of(chain):
         nodes = _view_node_ids(dst)
         if nodes is None:
             continue
+        cache_view = cast(CacheDTensorsView, dst)
+        drain_view = drain_dst.get(cache_view, dst)
         for node in nodes:
             resident = sum(
-                _cache_tensor_resident_bytes(nd.d_tensor, node)
-                for nd in cast(CacheDTensorsView, dst).d_tensor_table.named_d_tensors
+                _tensor_resident_bytes(nd, node, k, drain_view)
+                for nd in cache_view.d_tensor_table.named_d_tensors
             )
             acc[node] = acc.get(node, 0) + resident
     n = (max(acc) + 1) if acc else 0
@@ -599,7 +669,7 @@ def _stat_traffic(chain, outbound: bool) -> List[int]:
             # Both ends on the same node set: local cache motion, no traffic.
             continue
         if dst_nodes is not None:
-            _add_node_bytes(in_acc, dst_nodes, dst_view, k)
+            _record_inbound(in_acc, dst, dst_view, dst_nodes, k)
         if src_nodes is not None:
             _add_node_bytes(out_acc, src_nodes, dst_view, k)
     acc = out_acc if outbound else in_acc

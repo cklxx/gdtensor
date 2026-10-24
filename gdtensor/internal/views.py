@@ -70,7 +70,16 @@ class StorageDTensorsView(StorageDTensorsViewBuilderMixin):
 
     def check_constraints(self):
         from .constraints import check_constraints
+        from .result import invalid
 
+        table_ids = [n.global_tensor_id for n in self.d_tensor_table.named_d_tensors]
+        bad = [
+            l
+            for l in self.physical_layout.tensor_entries.values()
+            if list(l.tensor_ids) != table_ids
+        ]
+        if bad:
+            raise invalid("tensor_ids", "labels order != DTensorTable header order")
         return check_constraints(self)
 
 

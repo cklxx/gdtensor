@@ -432,6 +432,7 @@ LAWA 对最近 k 个 checkpoint 的权重做逐元素平均。核心不决定“
 # must_ok unwraps Ok; error handling omitted.
 import gdtensor
 import gdtensor.io as io
+
 rank = ...
 ckpts = latest_k_checkpoints(run_dir, k)  # caller selects the latest k
 k = len(ckpts)
@@ -475,6 +476,7 @@ must_ok(io.rank_save(rank, acc_view, out_storage))
 # must_ok unwraps Ok; error handling omitted.
 import gdtensor
 import gdtensor.io as io
+
 rank = ...
 ckpts = latest_k_checkpoints(run_dir, k)  # caller selects the latest k
 acc_view = make_compute_view_like(ckpts[0])  # framework allocates
@@ -1648,8 +1650,7 @@ Err =
 
 ```python
 class Foo(FooBuilderMixin):
-    def check_constraints(self) -> Result[None]:
-        ...
+    def check_constraints(self) -> Result[None]: ...
 ```
 
 `FooBuilderMixin` 提供：
@@ -1671,9 +1672,9 @@ class ComputeDTensorsViewBuilderMixin:
     def set_data_accessor(self, value: DTensorDataAccessor) -> None: ...
     def mutable_d_tensor_table(self) -> DTensorTable: ...
 
+
 class ComputeDTensorsView(ComputeDTensorsViewBuilderMixin):
-    def check_constraints(self) -> Result[None]:
-        ...
+    def check_constraints(self) -> Result[None]: ...
 ```
 
 `StorageDTensorsView` 的 mixin 还包含 `set_physical_layout` / `set_begin_save` / `set_begin_load`；`PhysicalLayoutTable` 的 mixin 包含 `set_container_format` / `mutable_tensor_entries` / `mutable_file_paths`。
@@ -1686,6 +1687,8 @@ class ComputeDTensorsView(ComputeDTensorsViewBuilderMixin):
 
 ```python
 class NamedDTensor: ...
+
+
 class GlobalTensorMeta: ...
 ```
 
@@ -1694,7 +1697,7 @@ product 类按字段实现 `__eq__` / `__hash__`，因为它要当 dict 键：`P
 类型别名和字符串字面量直接映射成 Python 原生类型，不生成新类，也不生成 `enum` / `Literal`：
 
 ```python
-ContainerFormat = str          # 当前是 "safetensors" / "distcp"；新增格式不改这个类型
+ContainerFormat = str  # 当前是 "safetensors" / "distcp"；新增格式不改这个类型
 ```
 
 tuple 也直接写 Python 的 `tuple[...]`：
@@ -1710,22 +1713,30 @@ DTensorsView = ComputeDTensorsView | StorageDTensorsView | CacheDTensorsView
 DTensorRange = RangeFromComputeView | RangeFromStorageView
 GenericDTensor = NaiveDTensor | ReshapedDTensor
 DTensorsReadChain = (
-    DirectDTensorsReadChain | OneLayerCachedDTensorsReadChain
-    | TwoLayerCachedDTensorsReadChain | MixedDTensorsReadChain
+    DirectDTensorsReadChain
+    | OneLayerCachedDTensorsReadChain
+    | TwoLayerCachedDTensorsReadChain
+    | MixedDTensorsReadChain
 )
 ConcreteDTensorsReadChain = (
-    DirectDTensorsReadChain | OneLayerCachedDTensorsReadChain
+    DirectDTensorsReadChain
+    | OneLayerCachedDTensorsReadChain
     | TwoLayerCachedDTensorsReadChain
 )
 CopyPlanChain = (
-    DirectCopyPlanChain | OneLayerCachedCopyPlanChain
-    | TwoLayerCachedCopyPlanChain | MixedCopyPlanChain
+    DirectCopyPlanChain
+    | OneLayerCachedCopyPlanChain
+    | TwoLayerCachedCopyPlanChain
+    | MixedCopyPlanChain
 )
 CacheMesh = StCacheOuterProductMesh | PermutedMesh[CacheMesh]
 Placement = Shard | Replicate | Partial
 Error = (
-    ConstraintViolationError | CheckFailedError | NotFoundError
-    | InvalidArgumentError | GDTensorIOError
+    ConstraintViolationError
+    | CheckFailedError
+    | NotFoundError
+    | InvalidArgumentError
+    | GDTensorIOError
 )
 ```
 
@@ -1735,14 +1746,18 @@ payload 是泛型 `T`、`int` 或 void 的分支也是命名类型，和别的 p
 class Ok[T](OkBuilderMixin):
     def check_constraints(self) -> Result[None]: ...
 
+
 class Err(ErrBuilderMixin):
     def check_constraints(self) -> Result[None]: ...
+
 
 class Shard(ShardBuilderMixin):
     def check_constraints(self) -> Result[None]: ...
 
+
 class Replicate(ReplicateBuilderMixin):
     def check_constraints(self) -> Result[None]: ...
+
 
 class Partial(PartialBuilderMixin):
     def check_constraints(self) -> Result[None]: ...
@@ -1763,9 +1778,11 @@ type Result[T] = Ok[T] | Err
 构造和别的数据类一样走 protobuf 风格：
 
 ```python
-ok = new_ok(); ok.set_value(3)
-err = new_err(); err.set_value(NotFoundError(...))
-replicate = new_replicate()                 # Replicate 没有字段
+ok = new_ok()
+ok.set_value(3)
+err = new_err()
+err.set_value(NotFoundError(...))
+replicate = new_replicate()  # Replicate 没有字段
 ```
 
 判别用 `type(x)`：`type(x) is Ok`、`type(placement) is Shard`、`type(placement) is Replicate`。`Ok` / `Err` 的 payload 在 `get_value()` 里；`Replicate` / `Partial` 没有字段，`type(x)` 就足够区分。`isinstance(x, Ok)` 可以（不带参数），`isinstance(x, Ok[int])` 不行（参数化泛型不能给 `isinstance`）。
@@ -1788,6 +1805,7 @@ inline product 先提成命名类型：`GenericDTensor` 的第二个分支 `(Nai
 
 ```python
 import types
+
 
 class Box:
     # 一个 tagged[...] 标量：tag 是类本身，值挂在 value 上。
@@ -1829,6 +1847,7 @@ inline product 先提成命名类型：`GenericDTensor` 的第二个分支 `(Nai
 import abc
 from typing import Callable
 
+
 class StorageSaveSession(abc.ABC):
     @abc.abstractmethod
     def get_file_offset(self, pos: TensorComponentPos) -> Result[int]: ...
@@ -1844,6 +1863,7 @@ class StorageSaveSession(abc.ABC):
     @abc.abstractmethod
     def abort(self) -> Result[None]: ...
 
+
 class StorageLoadSession(abc.ABC):
     @abc.abstractmethod
     def get_file_offset(self, pos: TensorComponentPos) -> Result[int]: ...
@@ -1856,8 +1876,10 @@ class StorageLoadSession(abc.ABC):
     @abc.abstractmethod
     def finish(self) -> Result[None]: ...
 
+
 # (buffer_ptr, buffer_len) -> Result[void]
 BufferCallback = Callable[[int, int], Result[None]]
+
 
 class DTensorDataAccessor[RangeT](abc.ABC):
     @abc.abstractmethod

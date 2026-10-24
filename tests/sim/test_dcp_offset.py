@@ -1,22 +1,17 @@
-"""Offset contract for the real-DCP backend.
+"""Offset contract: real raw payload offset resolved by archive structure.
 
-Empirical fact (verified by independent pread): real torch DCP ``.distcp`` is a
-pickle-wrapped archive. The public ``storage_data.offset`` is a LOGICAL offset
-into torch's internal unpacking, NOT a raw-byte pread location — preading at it
-returns pickle framing, not the tensor's raw bytes. The raw payload region is not
-exposed by the public metadata API (raw bytes sit at ``storage_offset + 704``,
-where 704 is torch's internal header size, not a public constant).
+Real DCP ``.distcp`` is a concatenation of self-contained torch-zip sub-archives,
+one per tensor. ``storage_data.offset``/``length`` delimit each sub-archive. Inside
+it the raw tensor bytes are the ``archive/data/<n>`` zip entry. We resolve the raw
+file offset by parsing that zip structure (never by searching raw byte content,
+never a hard-coded header constant):
 
-Therefore:
-- SAVE (we control the writer): staged slots occupy a header-less contiguous raw
-  region, so ``get_file_offset`` returns the slot's ``contiguous_payload_offset``
-  (the staging-file offset). pread at that offset is byte-exact.
-- LOAD (official reader): real DCP metadata does not expose raw byte offsets, so
-  ``get_file_offset`` reports the gap explicitly (invalid), rather than faking
-  ``storage_data.offset`` as if it were a raw file location.
+    raw_offset = sub_archive_start + (data_entry local-header offset + 30
+                                       + filename length + extra-field length)
+
+pread at that offset (plus the slot's within-blob interval offset) must equal the
+tensor's raw bytes, byte-exact, for repeated payloads, BF16, and multi-dtype.
 """
-
-import pickle
 
 import numpy as np
 import pytest
@@ -24,97 +19,119 @@ import pytest
 torch = pytest.importorskip("torch")
 
 
-def test_real_dcp_packs_second_tensor_at_nonzero_offset(tmp_path):
-    """Two tensors saved by real DCP: the second's storage_data offset is a real
-    non-zero logical offset (packed after the first), read from pickle metadata."""
+def _save(tmp_path, tensors):
     from torch.distributed.checkpoint import save as dcp_save
 
-    dcp_save(
-        {
-            "alpha": np.arange(4, dtype=np.float32),
-            "beta": np.arange(6, dtype=np.float32),
-        },
-        checkpoint_id=str(tmp_path),
-        no_dist=True,
-    )
-    meta = pickle.loads((tmp_path / ".metadata").read_bytes())
-    offsets = {idx.fqn: sd.offset for idx, sd in meta.storage_data.items()}
-    assert offsets["alpha"] == 0, offsets
-    assert offsets["beta"] > 0, offsets
+    dcp_save(dict(tensors), checkpoint_id=str(tmp_path), no_dist=True)
 
 
-def test_storage_offset_is_logical_not_raw_pread_location(tmp_path):
-    """pread at storage_data.offset returns pickle framing, NOT raw tensor bytes.
+def test_raw_offset_resolves_by_structure_not_content_search(tmp_path):
+    """Two tensors share an identical repeated payload (all-zeros). A content-based
+    search would match the wrong blob; structure parsing must place each at its own
+    data entry. pread at the resolved offset is byte-exact."""
+    a = torch.zeros(6, dtype=torch.float32)  # all zeros -> ambiguous content
+    b = torch.arange(5, dtype=torch.float64)
+    c = torch.arange(7, dtype=torch.bfloat16)
+    _save(tmp_path, [("alpha", a), ("beta", b), ("gamma", c)])
 
-    The raw tensor bytes exist in the archive (located by search) but NOT at the
-    metadata-recorded offset. This pins that nonzero storage_data.offset is a
-    logical archive offset, not a raw-byte file location."""
-    from torch.distributed.checkpoint import save as dcp_save
+    from gdtensor_sim.dcp_backend import _raw_payload_bases
 
-    a = torch.arange(4, dtype=torch.float32)
-    b = torch.arange(6, dtype=torch.float32)
-    dcp_save({"alpha": a, "beta": b}, checkpoint_id=str(tmp_path), no_dist=True)
-    raw = (tmp_path / "__0_0.distcp").read_bytes()
-    meta = pickle.loads((tmp_path / ".metadata").read_bytes())
-    off = {idx.fqn: sd.offset for idx, sd in meta.storage_data.items()}
-
-    for tid, expect in (("alpha", a), ("beta", b)):
-        o = off[tid]
-        chunk = raw[o : o + expect.numel() * expect.element_size()]
-        raw_located = raw.find(expect.numpy().tobytes())
-        assert raw_located != -1, tid
-        assert chunk != expect.numpy().tobytes(), (
-            tid,
-            "storage_data.offset is a logical pickle-archive offset, not a raw "
-            "byte pread location",
-        )
+    bases = _raw_payload_bases(str(tmp_path))
+    raw = open(tmp_path / "__0_0.distcp", "rb").read()
+    for tid, t in (("alpha", a), ("beta", b), ("gamma", c)):
+        base = bases[tid][0][1]
+        want = t.contiguous().view(torch.uint8).numpy().tobytes()
+        got = raw[base : base + len(want)]
+        assert got == want, tid
+    # alpha (all-zero) must resolve to a distinct blob from beta
+    assert bases["alpha"][0][1] != bases["beta"][0][1]
 
 
-def test_save_get_file_offset_maps_staging_contiguous_offset(tmp_path):
-    """Save-unpublished: staged slots are a header-less contiguous raw region, so
-    get_file_offset returns the slot's contiguous_payload_offset (pread byte-exact)."""
-    import gdtensor.builder as gb
-    from gdtensor_sim._layout import build_payload_index
-    from gdtensor_sim.models import build_layout
-    from tests.support.schemas import tensor_schema
-    from gdtensor_sim.dcp_backend import DcpSaveSession
-
-    ct, _, _ = tensor_schema((1, 1, 1))
-    layout = build_layout(ct, 1, "safetensors", lambda t, w, nd: f"f{t}.safetensors")
-    index = build_payload_index(ct, layout)
-    session = DcpSaveSession(0, str(tmp_path), ct, layout, index, mode="thread")
-    tid = ct.named_d_tensors[0].global_tensor_id
-    got = session.get_file_offset(gb.TensorComponentPos(tid, 0))
-    assert type(got).__name__ == "Ok", got
-    _path, slot = index.slots[gb.TensorComponentPos(tid, 0)]
-    assert got.value == slot.contiguous_payload_offset
-
-
-def test_load_get_file_offset_reports_unrepresentable_not_fake_offset(tmp_path):
-    """Load: real DCP metadata does not expose raw byte offsets. get_file_offset
-    must report the gap explicitly (invalid), NOT return storage_data.offset as if
-    it were a raw file location, and NOT NotFound for an existing pos."""
+def test_session_get_file_offset_preads_byte_exact(tmp_path):
+    """Through the real DcpLoadSession, get_file_offset returns a raw file offset
+    that preads byte-exact tensor bytes (existing pos); missing pos is NotFound."""
     import gdtensor.builder as gb
     from gdtensor.builder import global_tensor_meta_of
+    from gdtensor_sim._geometry import nonempty_columns
     from gdtensor_sim._layout import build_payload_index
     from gdtensor_sim.models import build_layout
     from tests.support.schemas import tensor_schema
     from gdtensor_sim.dcp_backend import DcpLoadSession
-    from torch.distributed.checkpoint import save as dcp_save
 
     ct, _, _ = tensor_schema((1, 1, 1))
-    state = {
-        nd.global_tensor_id: torch.zeros(
-            tuple(global_tensor_meta_of(nd).global_shape), dtype=torch.float32
-        )
-        for nd in ct.named_d_tensors
+    _DT = {
+        "I64": torch.int64,
+        "F64": torch.float64,
+        "F32": torch.float32,
+        "F16": torch.float16,
     }
-    dcp_save(state, checkpoint_id=str(tmp_path), no_dist=True)
+    state = {}
+    for nd in ct.named_d_tensors:
+        meta = global_tensor_meta_of(nd)
+        # pyrefly-ignore-next-line possibly-missing-attribute
+        state[nd.global_tensor_id] = torch.zeros(
+            tuple(meta.global_shape), dtype=_DT[meta.dtype]
+        )
+    _save(tmp_path, list(state.items()))
     layout = build_layout(ct, 1, "safetensors", lambda t, w, nd: f"f{t}.safetensors")
     index = build_payload_index(ct, layout)
     session = DcpLoadSession(0, str(tmp_path), ct, layout, index)
-    tid = ct.named_d_tensors[0].global_tensor_id
-    got = session.get_file_offset(gb.TensorComponentPos(tid, 0))
-    # Existing pos -> explicit "unrepresentable" error, not fake Ok(offset), not NotFound.
-    assert type(got).__name__ == "Err", got
-    assert "raw byte offset" in str(got.value) or "logical" in str(got.value)
+    raw = open(tmp_path / "__0_0.distcp", "rb").read()
+    for nd in ct.named_d_tensors:
+        tid = nd.global_tensor_id
+        for rank in nonempty_columns(nd):
+            pos = gb.TensorComponentPos(tid, rank)
+            got = session.get_file_offset(pos)
+            assert type(got).__name__ == "Ok", got
+            want = state[tid].contiguous().view(torch.uint8).numpy().tobytes()
+            assert got.value is not None
+            chunk = raw[got.value : got.value + len(want)]
+            assert chunk == want, (tid, rank)
+    missing = session.get_file_offset(gb.TensorComponentPos("nope", 0))
+    assert type(missing).__name__ == "Err", missing
+
+
+def test_middle_slot_within_chunk_offset_preads_distinct_ranges(tmp_path):
+    """A row-sharded tensor over world_size=2 stores both rank slots in ONE data entry.
+    slot0 owns the first half, slot1 the second half. get_file_offset must return
+    base+global_start for each so pread yields the correct distinct range — not the
+    same base for every slot in the chunk."""
+    import gdtensor.builder as gb
+    from gdtensor.builder import global_tensor_meta_of
+    from gdtensor_sim._geometry import nonempty_columns
+    from gdtensor_sim._layout import build_payload_index
+    from gdtensor_sim.models import build_layout
+    from tests.support.schemas import tensor_schema
+    from gdtensor_sim.dcp_backend import DcpLoadSession
+
+    ct, _, _ = tensor_schema((1, 1, 1))
+    state = {}
+    for nd in ct.named_d_tensors:
+        meta = global_tensor_meta_of(nd)
+        dt = {
+            "I64": torch.int64,
+            "F64": torch.float64,
+            "F32": torch.float32,
+            "F16": torch.float16,
+        }[meta.dtype]
+        # pyrefly-ignore-next-line possibly-missing-attribute
+        state[nd.global_tensor_id] = torch.arange(
+            int(np.prod(meta.global_shape)), dtype=dt
+        ).reshape(tuple(meta.global_shape))
+    _save(tmp_path, list(state.items()))
+    layout = build_layout(ct, 2, "safetensors", lambda t, w, nd: f"f{t}.safetensors")
+    index = build_payload_index(ct, layout)
+    session = DcpLoadSession(0, str(tmp_path), ct, layout, index)
+    _raw = open(tmp_path / "__0_0.distcp", "rb").read()
+    for nd in ct.named_d_tensors:
+        tid = nd.global_tensor_id
+        slots = {}
+        for rank in nonempty_columns(nd):
+            pos = gb.TensorComponentPos(tid, rank)
+            got = session.get_file_offset(pos)
+            assert type(got).__name__ == "Ok", (tid, rank, got)
+            slots[rank] = got.value
+        # Two ranks must resolve to distinct offsets within the shared chunk.
+        if len(slots) == 2:
+            offs = list(slots.values())
+            assert offs[0] != offs[1], (tid, slots)

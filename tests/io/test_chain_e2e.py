@@ -73,7 +73,8 @@ def _storage_view(accessor, tensor_id, shape, world):
             gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(world))
             )
-        ]
+        ],
+        [tensor_id],
     )
     leader = gb.TensorComponentPos(tensor_id, 0)
     entries = {gb.TensorComponentPos(tensor_id, rank): group for rank in range(world)}
@@ -267,7 +268,9 @@ def test_stats_return_list_of_int_per_node():
     assert mem == [4, 4], mem
     # Each node owns 4 bytes of compute (2 ranks x 2 elems).
     assert out == [4, 4], out
-    assert inb == [4, 4], inb
+    # Each rank independently stages the 4-byte step slice covering its want;
+    # two ranks per node pull it, so inbound = 8 bytes per node (observed).
+    assert inb == [8, 8], inb
 
 
 @pytest.mark.parametrize(
@@ -362,15 +365,16 @@ def _multi_storage(accessor, specs, world):
             gb.GlobalTensorMeta(shape, "U8", 1), [gb.Replicate(), gb.Shard(0)], mesh
         )
         named.append(gb.NamedDTensor(tid, dt))
+    ids = [t for t, _ in specs]
     group = gb.DisjointStorageMeshList(
         [
             gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(len(specs))),
                 gb.ArrangedMesh(gt.WorldSize(world)),
             )
-        ]
+        ],
+        ids,
     )
-    ids = [t for t, _ in specs]
     entries = {gb.TensorComponentPos(t, 0): group for t in ids}
     layout = gb.PhysicalLayoutTable(
         "safetensors", entries, {gb.TensorComponentPos(ids[0], 0): "m"}
@@ -391,7 +395,9 @@ def _multi_storage(accessor, specs, world):
 
 
 def test_multi_tensor_a6_b2_c1_peak_resident():
-    # A[6]/B[2]/C[1], S=2 step slice: A3+B1+C1=5 elems peak resident per node.
+    # A[6]/B[2]/C[1], S=2, distinct per-tensor backing. Each tensor reuses its
+    # buffer across the two temporal steps, so per tensor resident = the larger
+    # step slice: A=3, B=1, C=1. Independent regions sum -> 5 bytes per node.
     world, k = 2, 1
     specs = [("a", [6]), ("b", [2]), ("c", [1])]
     sv = _multi_storage(TraceMemory(np.zeros(9, np.uint8)), specs, world)
@@ -404,8 +410,9 @@ def test_multi_tensor_a6_b2_c1_peak_resident():
     )
     assert type(chain.check_constraints()) is gb.Ok, chain.check_constraints()
     mem = gio.chain_stat_mem_overhead(chain)
-    # step0 = A[0:3]+B[0:1]+C[0:1] = 5 elems U8 = 5 bytes per node.
-    assert mem == [5, 5], mem
+    # node0 serves rank0 (step0: A3+B1+C1=5); node1 serves rank1 (step1:
+    # A3+B1=4, C empty). Per-node rank share, not a broadcast global max.
+    assert mem == [5, 4], mem
 
 
 def test_mixed_b_segment_fails_a_still_loads_same_error():

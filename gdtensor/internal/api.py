@@ -189,17 +189,19 @@ def _collect_concrete_chains(read_chain, plan_chain, legs_for):
     raise invalid("read_chain", f"unknown read chain type {t.__name__}")
 
 
-def _run_concrete_chain(rank, chain, pc, legs) -> None:
-    """Open the src storage session once and execute every leg in order."""
-    storage = chain.src
+def _run_shared_source(rank, storage, items) -> None:
+    """Open one load session on ``storage`` and run every concrete chain whose
+    source it is. A Mixed chain whose segments share the same storage view opens
+    (and finishes) the session exactly once for the whole chain."""
     assert type(storage) is StorageDTensorsView
     assert storage.begin_load is not None
-    _LOG.info("chain_load rank=%d phase=begin", rank)
+    _LOG.info("chain_load rank=%d phase=begin shared_source", rank)
     session = must_ok(storage.begin_load(storage, rank))
     assert session is not None
     storage_session_view = _session_view(storage, session)
     try:
-        _execute_chain_legs(pc, legs, storage, storage_session_view)
+        for pc, legs in items:
+            _execute_chain_legs(pc, legs, storage, storage_session_view)
     except BaseException:
         primary = _finish_chain_sessions([session])
         if primary is not None:
@@ -208,7 +210,7 @@ def _run_concrete_chain(rank, chain, pc, legs) -> None:
     primary = _finish_chain_sessions([session])
     if primary is not None:
         raise primary
-    _LOG.info("chain_load rank=%d phase=finished", rank)
+    _LOG.info("chain_load rank=%d phase=finished shared_source", rank)
 
 
 def _execute_chain_legs(pc, legs, storage, storage_session_view) -> None:
@@ -224,8 +226,18 @@ def d_tensors_view_rank_chain_load(rank: int, read_chain) -> Result[None]:
 
     plan_chain = must_ok(d_tensors_view_rank_plan_chain_load(rank, read_chain))
     chains = _collect_concrete_chains(read_chain, plan_chain, legs_of)
+    # Group concrete chains by their storage view: Mixed segments that share the
+    # same source open (and finish) one load session for the whole chain.
+    by_storage: dict = {}
+    order = []
     for chain, pc, legs in chains:
-        _run_concrete_chain(rank, chain, pc, legs)
+        storage = chain.src
+        if storage not in by_storage:
+            by_storage[storage] = []
+            order.append(storage)
+        by_storage[storage].append((pc, legs))
+    for storage in order:
+        _run_shared_source(rank, storage, by_storage[storage])
 
 
 def _chain_plans(plan_chain):

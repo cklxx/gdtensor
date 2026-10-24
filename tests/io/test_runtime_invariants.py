@@ -39,7 +39,8 @@ def _two_rank_shard():
             gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(2))
             )
-        ]
+        ],
+        ["w"],
     )
     sv.physical_layout.set_tensor_entries(
         {gb.TensorComponentPos("w", rank): group for rank in (0, 1)}
@@ -85,6 +86,7 @@ def test_missing_storage_column_is_rejected_before_any_session():
     )
     group = gb.DisjointStorageMeshList(
         [gb.SlicedMesh(base, [None, gb.Slice(0, 1)])],
+        ["w"],
     )
     sv.physical_layout.tensor_entries = {gb.TensorComponentPos("w", 0): group}
     first = gio.rank_save(0, cv, sv)
@@ -116,6 +118,7 @@ def test_rank_load_without_its_column_is_rejected_before_any_session():
     )
     group = gb.DisjointStorageMeshList(
         [gb.SlicedMesh(base, [None, gb.Slice(0, 1)])],
+        ["w"],
     )
     sv.physical_layout.tensor_entries = {gb.TensorComponentPos("w", 0): group}
     result = gio.rank_load(1, cv, sv)

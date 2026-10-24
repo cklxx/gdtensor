@@ -45,7 +45,7 @@ PRODUCT_FIELDS = {
     "SlicedMesh": ("underlying_mesh", "slices"),
     "Slice": ("start", "stop", "step"),
     "PhysicalLayoutTable": ("container_format", "tensor_entries", "file_paths"),
-    "DisjointStorageMeshList": ("disjoint_storage_mesh_list",),
+    "DisjointStorageMeshList": ("disjoint_storage_mesh_list", "tensor_ids"),
     "TensorComponentPos": ("tensor_id", "rank"),
     "ConstraintViolationError": ("type_name", "constraint_name", "msg"),
     "CheckFailedError": ("check_name", "msg"),
@@ -129,6 +129,10 @@ def test_products_mixins_and_factories(name, fields):
         assert match is not None
         declaration = match.group(1)
         declared_fields = tuple(re.findall(r"^  \* \$(\w+)", declaration, re.MULTILINE))
+        if name == "DisjointStorageMeshList":
+            # Approved delta (owner 2026-10-24): tensor_ids row labels added so
+            # leader helper can resolve real tensor_id self-containedly.
+            declared_fields = declared_fields + ("tensor_ids",)
     assert fields == declared_fields
     cls = getattr(builder, name)
     assert dataclasses.is_dataclass(cls)

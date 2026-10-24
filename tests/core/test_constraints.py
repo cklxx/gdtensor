@@ -106,8 +106,9 @@ def test_file_leader_and_path_resolution_by_list_identity():
     mesh = gb.SlotOuterProductMesh(
         gb.ArrangedMesh(gt.TensorCount(2)), gb.ArrangedMesh(gt.WorldSize(2))
     )
-    group = gb.DisjointStorageMeshList([mesh])
+    group = gb.DisjointStorageMeshList([mesh], ["a_second", "b_other"])
     leader = gb.leader_tensor_component_pos_of(group)
+    assert leader == gb.TensorComponentPos("a_second", 0)
     a0 = gb.TensorComponentPos("a_second", 0)
     queried = gb.TensorComponentPos("a_second", 1)
     layout = gb.PhysicalLayoutTable(
@@ -120,6 +121,43 @@ def test_file_leader_and_path_resolution_by_list_identity():
     assert gb.file_path_of(layout, queried) == gb.Ok("shared")
     missing = gb.file_path_of(layout, gb.TensorComponentPos("absent", 0))
     assert type(missing) is gb.Err and type(missing.value) is gb.NotFoundError
+
+
+def test_list_without_tensor_ids_label_cannot_resolve_leader():
+    mesh = gb.SlotOuterProductMesh(
+        gb.ArrangedMesh(gt.TensorCount(2)), gb.ArrangedMesh(gt.WorldSize(2))
+    )
+    group = gb.DisjointStorageMeshList([mesh])  # no tensor_ids
+    raised = False
+    try:
+        gb.leader_tensor_component_pos_of(group)
+    except Exception as e:
+        raised = type(e).__name__ == "Fail"
+    assert raised
+
+
+def test_reverse_order_labels_are_rejected_before_session():
+    mesh = gb.SlotOuterProductMesh(
+        gb.ArrangedMesh(gt.TensorCount(2)), gb.ArrangedMesh(gt.WorldSize(1))
+    )
+    group = gb.DisjointStorageMeshList([mesh], ["other", "w"])  # reversed
+    view = storage_view(Memory(range(8)), [])
+    view.d_tensor_table = gb.DTensorTable(
+        [
+            gb.NamedDTensor("w", view.d_tensor_table.named_d_tensors[0].d_tensor),
+            gb.NamedDTensor("other", view.d_tensor_table.named_d_tensors[0].d_tensor),
+        ]
+    )
+    view.set_tensor_ids(["w", "other"])
+    pos = gb.TensorComponentPos("w", 0)
+    view.physical_layout.set_tensor_entries({pos: group})
+    view.physical_layout.set_file_paths({pos: "m"})
+    raised = False
+    try:
+        view.check_constraints()
+    except Exception as e:
+        raised = "labels order" in str(e)
+    assert raised
 
 
 def test_physical_lists_with_the_same_leader_cannot_hide_overlap():
@@ -142,7 +180,9 @@ def test_valid_storage_view_and_equal_physical_lists_pass_constraints():
     view = storage_view(Memory(range(8)), [])
     assert type(view.check_constraints()) is gb.Ok
     original = next(iter(view.physical_layout.tensor_entries.values()))
-    copied = gb.DisjointStorageMeshList(list(original.disjoint_storage_mesh_list))
+    copied = gb.DisjointStorageMeshList(
+        list(original.disjoint_storage_mesh_list), list(original.tensor_ids)
+    )
     view.physical_layout.tensor_entries[gb.TensorComponentPos("w", 0)] = copied
     assert type(view.check_constraints()) is gb.Ok
 
@@ -190,9 +230,6 @@ def test_storage_constraint_boundaries(change, type_name, constraint):
     elif change == "unknown_tensor":
         group = layout.tensor_entries.pop(gb.TensorComponentPos("w", 0))
         layout.tensor_entries[gb.TensorComponentPos("unknown", 0)] = group
-        group.disjoint_storage_mesh_list[0].tensor_slots.set_size(gt.TensorCount(2))
-        # The relabeled group keeps the old file path; storage-view checks
-        # validate layout tensor ids against the view table first.
         old_path = layout.file_paths.pop(gb.TensorComponentPos("w", 0))
         layout.file_paths[gb.TensorComponentPos("unknown", 0)] = old_path
     elif change == "format":

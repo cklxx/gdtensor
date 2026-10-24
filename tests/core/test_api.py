@@ -78,14 +78,11 @@ def test_file_path_and_leader_helpers():
             gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(2)), gb.ArrangedMesh(gt.WorldSize(2))
             )
-        ]
+        ],
+        ["a", "b"],
     )
-    # DESIGN GAP: leader_tensor_component_pos_of(list) takes only the list and
-    # cannot recover the arbitrary tensor_id name from (row, col) geometry.
-    # The geometric leader's rank is deterministic; the real tensor_id is
-    # resolved only by build_payload_index inside a table context.
     leader = gb.leader_tensor_component_pos_of(group)
-    assert leader.rank == 0
+    assert leader == gb.TensorComponentPos("a", 0)
     pos = gb.TensorComponentPos("a", 1)
     a0 = gb.TensorComponentPos("a", 0)
     layout = gb.PhysicalLayoutTable(

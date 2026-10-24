@@ -49,7 +49,8 @@ def _storage_rows(memory, events):
             gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(3))
             )
-        ]
+        ],
+        ["w"],
     )
     view.physical_layout.set_tensor_entries(
         {gb.TensorComponentPos("w", rank): group for rank in (0, 1)}
@@ -285,7 +286,8 @@ def test_replicated_save_writes_each_tensor_once_in_table_order():
             gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(5)), gb.ArrangedMesh(gt.WorldSize(1))
             )
-        ]
+        ],
+        ids,
     )
     for size, tid in enumerate(ids, 1):
         meta = gb.GlobalTensorMeta([size], "U8", 1)
@@ -340,7 +342,8 @@ def test_wrong_leader_file_paths_key_is_rejected():
             gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(5)), gb.ArrangedMesh(gt.WorldSize(1))
             )
-        ]
+        ],
+        ids,
     )
     for size, tid in enumerate(ids, 1):
         meta = gb.GlobalTensorMeta([size], "U8", 1)
@@ -388,7 +391,8 @@ def test_value_equal_lists_share_one_file_without_identity():
                 gb.SlotOuterProductMesh(
                     gb.ArrangedMesh(gt.TensorCount(5)), gb.ArrangedMesh(gt.WorldSize(1))
                 )
-            ]
+            ],
+            ids,
         )
         for size, tid in enumerate(ids, 1):
             meta = gb.GlobalTensorMeta([size], "U8", 1)

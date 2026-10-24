@@ -49,9 +49,16 @@
 - 单元：tests/core + tests/io 独立复跑 486 passed / 0 skip；torch env 全量 1314 passed / 0 skip（log/gate/full_check_final2.txt）；precommit.sh 本体 exit 0（557 passed）；ty/pyrefly 全绿。
 - CI：checks job 仅允许 torch importorskip；torch job 跑 tests/torch+sim+checkpoint+demo 且强制 zero skip；collection 计数已预验（no-torch 1255、torch 816 含 distcp）。
 
+## 已决设计项（2026-10-25 更新）
+
+- `DisjointStorageMeshList.tensor_ids` 行标签已恢复：storage view / table 严格按 full table 行序，helper 单参返回真实 ID；反序 labels、未知 tensor boundary 均有正反例（core 479 过）。
+- DCP `get_file_offset`：nonzero real raw supported case 已实测（gloo 2-rank row+col offset/path/pread，3 tests 过）。跨 chunk boundary 选择待 Main 批准；不擅新增 multi-segment 核心 API。
+
 ## 待决设计项（不记 pass）
 
-- 公开 `leader_tensor_component_pos_of(group)` 现返回 `TensorComponentPos("", 0)`（空 tensor_id），测试仅固化该行为；属设计缺口，未视为满足设计。
-- DCP distcp `get_file_offset`：存在 pos 的真实文件偏移未决——逻辑 archive framing（A0=0/B1577）与实际 raw（704/2281）不一致；若 torch DCP 不可表示真实偏移，记设计缺口，不按 format 放宽文档。
 - concurrency 槽 C 对 `mem_overhead` 的贡献：3.4（temporal/concurrency 分片、非副本）与 5.8（多一槽多占一份）存在表述张力，待设计最小确认；最终验收以真实峰值与 accessor 实际 bytes 为准，不接受跨时间 box union 或 stats 自证。
-- cache 覆盖缺口（返修中）：multi-tensor 链、`PermutedMesh`/`ReshapedMesh[CacheMesh]`、Mixed chain 段间失败生命周期、world=4/k=2 真峰值反例。
+- cache 覆盖缺口（返修中，独立 oracle 实测值）：multi-tensor 链、`PermutedMesh`/`ReshapedMesh[CacheMesh]`、Mixed chain 段间失败生命周期、world=4/k=2 真峰值反例。独立观察测试 `tests/io/test_cache_observation.py` 实测：
+  - multi-tensor 峰值（reference ResidentCache，r3）：stats `mem_overhead=[4,4]` vs per-node allocator 实测 peak_by_node=[5,4]——node 0 stats 低估 1B。
+  - delayed read：read callback parked 期间生产已推进后续 leg/finish 事件（4 个事件在 barrier 释放前出现）。
+  - world=4/k=2：outbound stats [4,4] == 观测 [4,4]；inbound stats [4,4] vs 观测 [8,8]（inbound 少计 2×）。
+

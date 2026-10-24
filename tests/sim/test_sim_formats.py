@@ -213,13 +213,9 @@ def test_load_session_rejects_calls_after_finish(tmp_path, fmt):
     assert session is not None
     pos = gb.TensorComponentPos("matrix", 0)
     off = session.get_file_offset(pos)
-    # Save-unpublished staging (safetensors): real offset >=0.
-    # Real DCP load: metadata does not expose raw byte offsets -> explicit Err,
-    # not a fake offset, not NotFound for an existing pos.
-    if fmt == "distcp":
-        assert type(off) is gb.Err, off
-    else:
-        assert type(off) is gb.Ok and off.value is not None and off.value >= 0, off
+    # Both formats map an existing pos to a real file offset (>=0). Real DCP load
+    # resolves it by parsing the sub-archive zip structure (raw payload entry).
+    assert type(off) is gb.Ok and off.value is not None and off.value >= 0, off
     assert type(session.init_data_accessor()) is gb.Ok
     assert type(session.finish()) is gb.Ok
     for call in (

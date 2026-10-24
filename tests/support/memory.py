@@ -94,7 +94,8 @@ def storage_view(
             gb.SlotOuterProductMesh(
                 gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(1))
             )
-        ]
+        ],
+        ["w"],
     )
     pos = gb.TensorComponentPos("w", 0)
     layout = gb.PhysicalLayoutTable("safetensors", {pos: group}, {pos: "memory"})

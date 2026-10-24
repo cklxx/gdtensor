@@ -327,6 +327,7 @@ def test_save_rejects_nonempty_tensor_without_complete_physical_storage(partial)
         )
         group = gb.DisjointStorageMeshList(
             [gb.SlicedMesh(base, [None, gb.Slice(0, 1)])],
+            ["w"],
         )
         view.physical_layout.tensor_entries = {gb.TensorComponentPos("w", 0): group}
     else:

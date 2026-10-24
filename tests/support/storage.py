@@ -122,7 +122,10 @@ def _file_layout(storage, points, kind, stages):
     )
     entries, paths = {}, {}
     for path, cells in groups.items():
-        group = gb.DisjointStorageMeshList(_group_meshes(base, cells))
+        # tensor_ids is the FULL DTensorTable row order (N labels), indexed by
+        # absolute row; not truncated to rows this group covers.
+        row_labels = [nd.global_tensor_id for nd in storage.table.named_d_tensors]
+        group = gb.DisjointStorageMeshList(_group_meshes(base, cells), row_labels)
         leader = gb.leader_tensor_component_pos_of(group)  # canonical leader rank
         t0 = min(order for order, _ in cells)  # leader row in table order
         paths[gb.TensorComponentPos(storage.ids[t0], leader.rank)] = path
