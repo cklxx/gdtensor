@@ -62,7 +62,7 @@
 - bounded C cache pipeline：两次实现尝试失败后回退 serial（world4/k2 fill node box off 0:4、rank0 drain 0:2、rank1 drain 2:4，需 node 级 slot state across calls），当前未实现。
 - Mixed shared source：begin1/finish1 同源 identity group 尚无合法 test 验证。
 - cache 覆盖缺口：独立观察测试 `tests/io/test_cache_observation.py` 5/5 通过（含 indent 合规，log/cache-observer-r6.txt）。reference ResidentCache 按 (node, global_tensor_id, offset) 隔离，write retain 到同 (node,tid) reader ack 才 free。
-  - multi-tensor 峰值：stats `mem_overhead=[4,4]` vs per-node allocator 实测 peak_by_node=[5,4]（独立 observer wrapper 仅 print 统计，未改文件/source）——node 0 stats 低估 1B；inbound 8 为独立字节计数口径，与峰值不混淆。
+  - multi-tensor 峰值：stats `mem_overhead=[5,4]` 与 per-node allocator peak_by_node=[5,4] 一致（独立 observer wrapper 仅 print 统计，test assert 同 expected PASS）；inbound 8 为独立字节计数口径，与峰值不混淆。
   - delayed read：barrier 释放前同 slot 下游 leg/finalize 不发生；释放后 cache.live 为空且 rank-0 shard 字节完整。（此前"释放前 4 事件提前推进"为误判，已撤回。）
   - world=4/k=2：outbound [4,4] 一致；inbound 实测 [8,8]（每 rank stage 4 node→rank 实际 8），stats 已对齐实测 8。
 
