@@ -19,6 +19,6 @@
 
 reference ResidentCache 按 (node, global_tensor_id, offset) 三维隔离，write retain 到同 (node,tid) reader ack 才 free；peak_by_node 逐 node 记录。
 
-- multi-tensor 峰值：stats `mem_overhead=[4,4]` 与 per-node allocator 实测 peak_by_node=[4,4] 一致（producer 修 inbound 计数后）。
+- multi-tensor 峰值：stats `mem_overhead=[4,4]` vs per-node allocator 实测 peak_by_node=[5,4]（独立 observer wrapper 仅 print 统计，未改文件/source）——node 0 stats 低估 1B；inbound 8 为独立字节计数口径，与峰值不混淆。
 - delayed read：barrier 释放前同 slot 下游 leg/finalize 不发生；释放后 cache.live 为空且 rank-0 shard 字节完整。（此前"释放前 4 事件提前推进"为误判，已撤回。）
 - world=4/k=2：outbound [4,4] 一致；inbound 实测 [8,8]，stats 已对齐。
