@@ -29,10 +29,12 @@
 
 核心测试的 session、文件 fixture 和内存 fixture 只依赖设计 API。格式实现测试调用 `gdtensor_sim` 中的具体实现；独立数据 oracle 不调用这些实现的区间或布局算法。
 
-设计方已明确两条规则，并已同步到唯一设计文档：
+设计方已明确两条规则：
 
 - `DisjointStorageMeshList.tensor_ids` 是表顺序的行标签。布局构造器填充，list 校验长度，storage view 校验与表的顺序一致。leader 通过 `tensor_ids[row]` 取得 ID。
 - view map 只包装 `begin_save/load`。rank IO 打开 session 后执行转换，使用返回的替换 session。转换失败立即清理原 session；正常提交或结束由 rank IO 执行。
+
+本轮用户批准的 delta 记录在本地 [docs/decisions-2026-10-25.md](docs/decisions-2026-10-25.md)；vendored 云设计原文保持字节原样（md5 未变），未被本地 delta 覆盖。
 
 [`test_constraints.py`](tests/core/test_constraints.py) 验证行数、表顺序和跨张量文件 leader。[`test_view_map.py`](tests/core/test_view_map.py) 验证延迟转换、替换 session、转换失败和清理失败。sim 与测试均由 AST 检查禁止导入核心内部模块。
 
@@ -42,23 +44,25 @@
 
 形式化制品仅验证抽象模型。本次重构的正确性证据是设计 API 测试、独立数据 oracle、真实 torch 进程和行为变异；不宣称完成了真实 1000 rank 或完整 DeepSeek 模型验证。
 
-## 本轮门禁已验证范围（2026-10-24，证据在 log/gate/ 与 formal/）
+## 本轮门禁已验证范围（受测 commit `47d9e7a`，证据在 log/gate/ 与 formal/）
 
-- 形式化：`formal/lean/ShardAlgebra.lean`（工具链 `leanprover/lean4:v4.34.0`，`formal/lean/check.sh` 拒绝 sorry/admit/axiom，编译 exit 0）；`formal/tla/CopyPlan.tla`（S∈{2,3}×N∈{1,2,3,5,6} 含 N=1 零 size 边界）与 `AtomicPublish.tla`（`formal/tla/run_tlc.sh`，全部不变量通过，log 落 `log/tla/`）。形式化仅证抽象模型。
-- 行为变异：`tests/mutation_check.py` 9/9 killed（log/gate/mutation_final.txt）。pyrefly 已 0（core 将 negative issubclass 反射与构造分独立测试，未 ignore/未改产品 API）。
-- 单元：tests/core + tests/io 独立复跑 486 passed / 0 skip；torch env 全量 1314 passed / 0 skip（log/gate/full_check_final2.txt）；precommit.sh 本体 exit 0（557 passed）；ty/pyrefly 全绿。
-- CI：checks job 仅允许 torch importorskip；torch job 跑 tests/torch+sim+checkpoint+demo 且强制 zero skip；collection 计数已预验（no-torch 1255、torch 816 含 distcp）。
+- 形式化：`formal/lean/ShardAlgebra.lean`（`formal/lean/check.sh` 拒绝 sorry/admit/axiom，编译 exit 0）；`formal/tla/CopyPlan.tla` 与 `AtomicPublish.tla`（`formal/tla/run_tlc.sh`，全部不变量通过，log 落 `log/tla/`）。形式化仅证抽象模型。
+- 行为变异：`tests/mutation_check.py` 9/9 killed（log/gate/mutation.txt，exit 0）。
+- 门禁：precommit.sh 576 passed exit 0（log/gate/precommit_final.txt）；torch env 全量 `GDTENSOR_TORCH_TESTS=1` 1339 passed / 0 skip（log/gate/full_check_final.txt，EXIT=0）；ty/pyrefly 全绿。
+- CI：checks job 仅允许 torch importorskip；torch job 跑 tests/torch+sim+checkpoint+demo 且强制 zero skip。
 
 ## 已决设计项（2026-10-25 更新）
 
 - `DisjointStorageMeshList.tensor_ids` 行标签已恢复：storage view / table 严格按 full table 行序，helper 单参返回真实 ID；反序 labels、未知 tensor boundary 均有正反例（core 479 过）。
-- DCP `get_file_offset`：nonzero real raw supported case 已实测（gloo 2-rank row+col offset/path/pread，3 tests 过）。跨 chunk boundary 选择待 Main 批准；不擅新增 multi-segment 核心 API。
+- DCP `get_file_offset`：supported case 已实测——gloo 2-rank row+col public session、file_path_of、os.pread 真实 archive，world=1 满 tensor 跨 2 文件返回 offset error、torch 读全量正确（3 个公共 session 测试过）。跨 chunk / 跨 slot boundary 选择待 Main 最小能力边界批准；不擅新增 multi-segment 核心 API。
 
 ## 待决设计项（不记 pass）
 
 - concurrency 槽 C 对 `mem_overhead` 的贡献：3.4（temporal/concurrency 分片、非副本）与 5.8（多一槽多占一份）存在表述张力，待设计最小确认；最终验收以真实峰值与 accessor 实际 bytes 为准，不接受跨时间 box union 或 stats 自证。
-- cache 覆盖缺口（返修中，独立 oracle 实测值）：multi-tensor 链、`PermutedMesh`/`ReshapedMesh[CacheMesh]`、Mixed chain 段间失败生命周期、world=4/k=2 真峰值反例。独立观察测试 `tests/io/test_cache_observation.py` 实测：
-  - multi-tensor 峰值（reference ResidentCache，r3）：stats `mem_overhead=[4,4]` vs per-node allocator 实测 peak_by_node=[5,4]——node 0 stats 低估 1B。
-  - delayed read：read callback parked 期间生产已推进后续 leg/finish 事件（4 个事件在 barrier 释放前出现）。
-  - world=4/k=2：outbound stats [4,4] == 观测 [4,4]；inbound stats [4,4] vs 观测 [8,8]（inbound 少计 2×）。
+- bounded C cache pipeline：两次实现尝试失败后回退 serial（world4/k2 fill node box off 0:4、rank0 drain 0:2、rank1 drain 2:4，需 node 级 slot state across calls），当前未实现。
+- Mixed shared source：begin1/finish1 同源 identity group 尚无合法 test 验证。
+- cache 覆盖缺口：独立观察测试 `tests/io/test_cache_observation.py` 5/5 通过（含 indent 合规，log/cache-observer-r6.txt）。reference ResidentCache 按 (node, global_tensor_id, offset) 隔离，write retain 到同 (node,tid) reader ack 才 free。
+  - multi-tensor 峰值：stats `mem_overhead=[4,4]` 与 per-node allocator 实测 peak_by_node=[4,4] 一致（producer 已修 inbound 计数后）。
+  - delayed read：barrier 释放前同 slot 下游 leg/finalize 不发生；释放后 cache.live 为空且 rank-0 shard 字节完整。（此前"释放前 4 事件提前推进"为误判，已撤回。）
+  - world=4/k=2：outbound [4,4] 一致；inbound 实测 [8,8]（每 rank stage 4 node→rank 实际 8），stats 已对齐实测 8。
 
