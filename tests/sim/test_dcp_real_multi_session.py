@@ -188,7 +188,7 @@ def test_real_sharded_public_session_pread_bytes_match(tmp_path):
         fd = os.open(distcp_path, os.O_RDONLY)
         try:
             assert got.value is not None
-            chunk = os.pread(fd, slot.nbytes, int(got.value))
+            chunk = os.pread(fd, slot.nbytes, int(got.value or 0))
         finally:
             os.close(fd)
         assert chunk == want_chunk, (
@@ -243,7 +243,7 @@ def test_real_col_sharded_public_session_pread_bytes_match(tmp_path):
         fd = os.open(root / path.value, os.O_RDONLY)
         try:
             assert got.value is not None
-            chunk = os.pread(fd, slot.nbytes, int(got.value))
+            chunk = os.pread(fd, slot.nbytes, int(got.value or 0))
         finally:
             os.close(fd)
         want_chunk = want[
@@ -342,3 +342,61 @@ def test_world1_slot_spanning_two_chunks_returns_err(tmp_path):
     np.testing.assert_array_equal(
         dst_mem.data.view(np.float32).reshape(GLOBAL_ROWS, COLS), want_full.numpy()
     )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("GDTENSOR_TORCH_TESTS"), reason="set GDTENSOR_TORCH_TESTS=1"
+)
+def test_col_shard_sub_slot_second_row_pread(tmp_path):
+    """Col-shard checkpoint (2 chunks, each 2x2). Build gdtensor layout world=4
+    where rank2 owns only row1 cols 0:2 (global flat [4,6)). This sub-slot sits
+    inside chunk __0_0.distcp (rows 0:2, cols 0:2); its local offset within the
+    chunk is row1*chunk_width = 2 elems = 8 bytes, NOT 0 and NOT global_first.
+    """
+    root = tmp_path / "ckpt_sub"
+    root.mkdir()
+    _spawn_col(root)
+
+    import gdtensor.builder as gb
+    import gdtensor.tag as gt
+    from gdtensor_sim._layout import build_payload_index
+    from gdtensor_sim.models import build_layout
+    from gdtensor_sim.dcp_backend import DcpLoadSession
+
+    # world=4 mesh (2 rows x 2 cols): rank2 = row1, col0.
+    placements = [gb.Shard(0), gb.Shard(1)]
+    mesh = gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(4)), [2, 2])
+    dt = gb.NaiveDTensor(
+        gb.GlobalTensorMeta([C_ROWS, C_COLS], "F32", ITEMSIZE),
+        placements,
+        mesh,
+    )
+    table = gb.DTensorTable([gb.NamedDTensor("c", dt, ["c.alias"])])
+    # rank2 row1 col0 -> chunk __0_0.distcp (rows 0:2 cols 0:2)
+    layout = build_layout(
+        table, 4, "safetensors", lambda t, w, nd: f"__{w % 2}_0.distcp"
+    )
+    index = build_payload_index(table, layout)
+
+    want = torch.arange(C_ROWS * C_COLS, dtype=torch.float32).reshape(C_ROWS, C_COLS)
+
+    session = DcpLoadSession(2, str(root), table, layout, index)
+    pos = gb.TensorComponentPos("c", 2)
+    got = session.get_file_offset(pos)
+    assert type(got).__name__ == "Ok", got
+    _, slot = index.slots[pos]
+    path = gb.file_path_of(layout, pos)
+    assert type(path).__name__ == "Ok", path
+    fd = os.open(root / path.value, os.O_RDONLY)
+    try:
+        chunk = os.pread(fd, slot.nbytes, int(got.value or 0))
+    finally:
+        os.close(fd)
+    # rank2 = row1 cols 0:2
+    want_chunk = want[1:2, 0:2].contiguous()
+    want_bytes_chunk = want_chunk.view(torch.uint8).numpy().tobytes()
+    assert chunk == want_bytes_chunk, (
+        f"rank2 sub-slot: pread {len(chunk)}B at offset {got.value} "
+        f"want {len(want_bytes_chunk)}B; intervals={slot.intervals.tolist()}"
+    )
+    session.finish()

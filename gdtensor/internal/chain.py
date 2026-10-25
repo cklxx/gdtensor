@@ -543,6 +543,9 @@ def _tensor_resident_bytes(nd, node: int, k: int, drain_view) -> int:
         return out
 
     def step_live(s: int) -> int:
+        # Real box_of cell (temporal x concurrency shards on dim0; spatial
+        # Replicate does not split). Slots serialise across a node, so peak
+        # resident per tensor is one such cell (times itemsize).
         union = set()
         for c in range(C):
             lo, hi = box_of(naive, (S, N, C), (s, n_index, c))
@@ -638,11 +641,14 @@ def _stat_overhead(chain) -> List[int]:
         cache_view = cast(CacheDTensorsView, dst)
         drain_view = drain_dst.get(cache_view, dst)
         for node in nodes:
-            resident = sum(
-                _tensor_resident_bytes(nd, node, k, drain_view)
-                for nd in cache_view.d_tensor_table.named_d_tensors
+            resident = max(
+                (
+                    _tensor_resident_bytes(nd, node, k, drain_view)
+                    for nd in cache_view.d_tensor_table.named_d_tensors
+                ),
+                default=0,
             )
-            acc[node] = acc.get(node, 0) + resident
+            acc[node] = max(acc.get(node, 0), resident)
     n = (max(acc) + 1) if acc else 0
     return [acc.get(i, 0) for i in range(n)]
 

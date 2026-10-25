@@ -216,6 +216,50 @@ def _storage_offsets(root: str) -> Dict[str, int]:
     return {idx.fqn: sd.offset for idx, sd in meta.storage_data.items()}
 
 
+def _chunk_flat_offset(offs, shape) -> int:
+    """Row-major contiguous flat element offset of a chunk's (offsets, shape)."""
+    flat = 0
+    for i, o in enumerate(offs):
+        prod = int(np.prod(shape[i + 1 :])) if i + 1 < len(shape) else 1
+        flat += o * prod
+    return flat
+
+
+def _slot_local_in_chunk(slot_offsets, slot_sizes, chunk_offsets, chunk_shape):
+    """Map a slot's global intervals to a contiguous packed local offset inside
+    a chunk. Returns (local_elem_start, local_elem_count) if the slot is a
+    contiguous sub-range of the chunk's packed region, else None."""
+    local_start = 0
+    local_elems = 1
+    for i, (s_off, s_size, c_off, c_size) in enumerate(
+        zip(slot_offsets, slot_sizes, chunk_offsets, chunk_shape)
+    ):
+        lo = s_off - c_off
+        if lo < 0 or lo + s_size > c_size:
+            return None
+        stride = int(np.prod(chunk_shape[i + 1 :])) if i + 1 < len(chunk_shape) else 1
+        local_start += lo * stride
+        local_elems *= s_size
+    return local_start, local_elems
+
+
+def _slot_sizes(coords, gshape, total_elems):
+    """Per-dim sizes of a contiguous flat slot of total_elems starting at coords."""
+    if total_elems == int(np.prod(gshape)):
+        return list(gshape)
+    sizes = []
+    remaining = total_elems
+    for i in range(len(gshape)):
+        stride = int(np.prod(gshape[i + 1 :])) if i + 1 < len(gshape) else 1
+        if remaining == 0:
+            sizes.append(0)
+            continue
+        s = min(remaining // stride, gshape[i] - coords[i])
+        sizes.append(s)
+        remaining -= s * stride
+    return sizes
+
+
 def _raw_payload_bases(root: str) -> Dict[str, List[tuple]]:
     """Resolve the real byte offset of each tensor's raw payload inside the
     torch-written ``.distcp`` archive, by parsing the archive structure (never by
@@ -226,23 +270,34 @@ def _raw_payload_bases(root: str) -> Dict[str, List[tuple]]:
     ``archive/data/<n>`` zip entry (``data.pkl`` is the pickle, not the payload).
     The payload file offset = sub-archive start + (local-header offset of the
     data entry + 30 + filename length + extra-field length).
-    """
+
+    Returns fqn -> list of (distcp_file, raw_payload_base, payload_nbytes,
+    chunk_flat_offset). chunk_flat_offset = chunk.offsets flattened row-major
+    against the tensor shape, i.e. the global element index where this chunk's
+    packed payload starts."""
     import pickle
 
     with open(os.path.join(root, ".metadata"), "rb") as handle:
         meta = pickle.loads(handle.read())
-    # fqn -> list of (distcp_file, raw_payload_base, payload_nbytes). A tensor may
-    # be sharded across several sub-archives (multiple storage_data entries for the
-    # same fqn); keep ALL chunks instead of silently overwriting with the last one.
     out: Dict[str, List[tuple]] = {}
     by_file: Dict[str, List] = {}
     for idx, sd in meta.storage_data.items():
-        by_file.setdefault(sd.relative_path, []).append((idx.fqn, sd))
+        by_file.setdefault(sd.relative_path, []).append((idx.fqn, sd, idx))
     for rel, entries in by_file.items():
         raw = open(os.path.join(root, rel), "rb").read()
-        for fqn, sd in entries:
+        for fqn, sd, idx in entries:
             chunk = _resolve_one_subarchive(root, rel, fqn, sd, raw)
-            out.setdefault(fqn, []).append(chunk)
+            offs = tuple(int(x) for x in (idx.offset or (0,)))
+            shape = tuple(int(x) for x in meta.state_dict_metadata[fqn].size)
+            ts = meta.state_dict_metadata[fqn]
+            # Find the ChunkStorageMetadata whose offsets match idx.offset.
+            ch_meta = next(
+                c for c in ts.chunks if tuple(int(x) for x in c.offsets) == offs
+            )
+            ch_shape = tuple(int(x) for x in ch_meta.sizes)
+            out.setdefault(fqn, []).append(
+                (*chunk, _chunk_flat_offset(offs, shape), offs, ch_shape)
+            )
     return out
 
 
@@ -469,6 +524,17 @@ class DcpLoadSession(StorageLoadSession):
         # ``.distcp`` archive, resolved by parsing the sub-archive zip structure.
         self.offsets = _raw_payload_bases(root)
 
+    def _raise_missing_slot(self, pos):
+        known_ids = {nd.global_tensor_id for nd in self.table.named_d_tensors}
+        if pos.tensor_id not in known_ids:
+            msg = f"{pos.tensor_id}:{pos.rank} has no physical file"
+            raise not_found("tensor_entries", f"{pos.tensor_id}:{pos.rank}", msg)
+        msg = (
+            f"{pos.tensor_id}:{pos.rank}: tensor exists in layout but this slot has no "
+            "indexed payload (empty tensor or non-participating rank); no single base offset"
+        )
+        raise invalid("file_offset", msg)
+
     @catch
     def init_data_accessor(self):
         if self.state != "open":
@@ -481,25 +547,23 @@ class DcpLoadSession(StorageLoadSession):
             raise invalid("session", f"get_file_offset on {self.state} session")
         hit = self.index.slots.get(pos)
         if hit is None:
-            raise not_found(
-                "tensor_entries",
-                f"{pos.tensor_id}:{pos.rank}",
-                f"{pos.tensor_id}:{pos.rank} has no physical file",
-            )
+            self._raise_missing_slot(pos)
         _path, slot = hit
         chunks = self.offsets.get(pos.tensor_id)
         if not chunks:
-            raise not_found(
-                "tensor_entries",
-                f"{pos.tensor_id}:{pos.rank}",
-                f"{pos.tensor_id}:{pos.rank} has no payload in the archive",
+            # pos exists in the layout index; a missing payload means the
+            # checkpoint is inconsistent with the layout (not an unknown pos).
+            raise invalid(
+                "file_offset",
+                f"{pos.tensor_id}:{pos.rank}: layout declares this slot but the DCP archive "
+                f"has no storage chunks for fqn {pos.tensor_id!r}",
             )
         # Slot's global owned interval and the matched chunk's global origin.
         # local offset = (slot.global_first - chunk.global_origin) * itemsize.
         # no_dist: one chunk holds the whole tensor (origin 0) -> local = global_first.
         # sharded: each chunk holds exactly one rank's shard (origin = that shard's
         # global start) -> local = 0 for the owning rank.
-        global_first = int(slot.intervals[0, 0]) * slot.itemsize
+        _global_first = int(slot.intervals[0, 0]) * slot.itemsize
         # Total owned bytes = sum of interval lengths * itemsize, NOT
         # (last - first) * itemsize. The latter is wrong for non-contiguous
         # multi-interval slots.
@@ -510,8 +574,8 @@ class DcpLoadSession(StorageLoadSession):
         # checkpoint root — never basename-only, never inferred from pos.rank.
         want = os.path.normpath(os.path.join(self.root, _path))
         matches = [
-            (rel, base, nbytes)
-            for rel, base, nbytes in chunks
+            (rel, base, nbytes, origin, ch_off, ch_shape)
+            for rel, base, nbytes, origin, ch_off, ch_shape in chunks
             if os.path.normpath(os.path.join(self.root, rel)) == want
         ]
         if matches:
@@ -526,13 +590,37 @@ class DcpLoadSession(StorageLoadSession):
                 f"{pos.tensor_id}:{pos.rank}: no DCP chunk file matches slot path {want!r} "
                 f"among {[os.path.normpath(os.path.join(self.root, c[0])) for c in chunks]}",
             )
-        rel, base, nbytes = chosen
-        # A dedicated shard chunk (one chunk per rank/slot) starts at the slot's own
-        # global origin, so local offset is 0. A shared chunk (no_dist, whole tensor
-        # for all slots) starts at global 0, so local offset = slot.global_first.
-        chunk_origin = 0 if len(chunks) == 1 else global_first
-        local = global_first - chunk_origin
-        if local < 0 or local + slot_bytes > nbytes:
+        rel, base, nbytes, chunk_origin_elems, ch_off, ch_shape = chosen
+        # Per-dim global->local mapping: subtract chunk offset in each dim, then
+        # ravel by chunk shape (not full tensor shape). This correctly handles
+        # sub-slots within a sharded chunk (e.g. row 1 of a 2-row col-shard chunk).
+        # Derive slot's global per-dim offset and size from global_first_elems and
+        # total_elems against the global shape.
+        nd = next(
+            n for n in self.table.named_d_tensors if n.global_tensor_id == pos.tensor_id
+        )
+        gshape = tuple(x for x in global_tensor_meta_of(nd).global_shape)
+        gf = int(slot.intervals[0, 0])
+        # Decompose gf into per-dim coords (row-major, outer to inner).
+        coords = []
+        rem = gf
+        for i in range(len(gshape)):
+            stride = int(np.prod(gshape[i + 1 :])) if i + 1 < len(gshape) else 1
+            coords.append(rem // stride)
+            rem = rem % stride
+        # Slot size per dim: for a contiguous flat interval of total_elems starting
+        sizes = _slot_sizes(coords, gshape, total_elems)
+        local_map = _slot_local_in_chunk(coords, sizes, ch_off, ch_shape)
+        if local_map is None:
+            raise invalid(
+                "file_offset",
+                f"{pos.tensor_id}:{pos.rank}: slot global coords {coords} size {sizes} not contained "
+                f"in chunk offset {ch_off} shape {ch_shape}; a single base offset cannot represent "
+                "a slot spanning multiple DCP chunk files",
+            )
+        local_start, local_elems = local_map
+        local = local_start * slot.itemsize
+        if local < 0 or local_elems * slot.itemsize > nbytes:
             raise invalid(
                 "file_offset",
                 f"{pos.tensor_id}:{pos.rank}: slot bytes [{local},{local + slot_bytes}) not contained "

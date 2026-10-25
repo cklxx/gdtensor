@@ -115,7 +115,7 @@ def test_real_multichunk_offset_chunk_cover_and_crossfile_counterexample(tmp_pat
     ]
 
     # Layout 1: a slot exactly covering one chunk preads byte-exact from ITS file.
-    for r, (rel, base, nbytes) in enumerate(x_chunks):
+    for r, (rel, base, nbytes, *_rest) in enumerate(x_chunks):
         raw = open(root / rel, "rb").read()
         got = raw[base : base + len(oracle[r])]
         assert got == oracle[r], (r, rel, base)
@@ -124,8 +124,8 @@ def test_real_multichunk_offset_chunk_cover_and_crossfile_counterexample(tmp_pat
     # Cross-file counterexample: rank1's chunk lives in a DIFFERENT file. A single
     # int offset returned by get_file_offset cannot name which file, so the caller
     # cannot pread rank1's bytes using rank0's file. Record the actual metadata.
-    r0_rel, r0_base, _ = x_chunks[0]
-    r1_rel, r1_base, _ = x_chunks[1]
+    r0_rel, r0_base, _nbytes, *_rest = x_chunks[0]
+    r1_rel, r1_base, _n2, *_rest2 = x_chunks[1]
     assert r0_rel != r1_rel, (r0_rel, r1_rel)
     raw0 = open(root / r0_rel, "rb").read()
     # If a caller used the rank0 file + rank1-style offset, it does NOT yield rank1
