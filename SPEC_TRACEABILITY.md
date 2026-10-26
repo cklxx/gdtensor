@@ -34,7 +34,7 @@
 - `DisjointStorageMeshList.tensor_ids` 是表顺序的行标签。布局构造器填充，list 校验长度，storage view 校验与表的顺序一致。leader 通过 `tensor_ids[row]` 取得 ID。
 - view map 只包装 `begin_save/load`。rank IO 打开 session 后执行转换，使用返回的替换 session。转换失败立即清理原 session；正常提交或结束由 rank IO 执行。
 
-本轮用户批准的 delta 记录在本地 [docs/decisions-2026-10-25.md](docs/decisions-2026-10-25.md)；vendored 云设计原文保持字节原样（md5 未变），未被本地 delta 覆盖。
+本轮用户批准的 delta 记录在本地 [docs/decisions-2026-10-25.md](docs/decisions-2026-10-25.md)；vendored 云设计原文语义一致但**非 byte-exact**（md5 与云原文不同，差异为格式重排，见 [docs/design-source-provenance.md](docs/design-source-provenance.md)），未被本地 delta 覆盖。
 
 [`test_constraints.py`](tests/core/test_constraints.py) 验证行数、表顺序和跨张量文件 leader。[`test_view_map.py`](tests/core/test_view_map.py) 验证延迟转换、替换 session、转换失败和清理失败。sim 与测试均由 AST 检查禁止导入核心内部模块。
 

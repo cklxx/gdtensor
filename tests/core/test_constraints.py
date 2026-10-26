@@ -149,23 +149,23 @@ def test_reverse_order_labels_are_rejected_before_session():
         ]
     )
     view.set_tensor_ids(["w", "other"])
-    pos = gb.TensorComponentPos("w", 0)
+    pos = gb.TensorComponentPos("other", 0)  # geometric leader of labels ["other","w"]
     view.physical_layout.set_tensor_entries({pos: group})
     view.physical_layout.set_file_paths({pos: "m"})
-    raised = False
-    try:
-        view.check_constraints()
-    except Exception as e:
-        raised = "labels order" in str(e)
-    assert raised
+    result = view.check_constraints()
+    assert type(result) is gb.Err and type(result.value) is gb.ConstraintViolationError
+    assert result.value.constraint_name == "list_labels_match_table"
+    assert "labels" in result.value.msg
 
 
 def test_physical_lists_with_the_same_leader_cannot_hide_overlap():
     base = gb.SlotOuterProductMesh(
         gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(2))
     )
-    first = gb.DisjointStorageMeshList([gb.SlicedMesh(base, [None, gb.Slice(0, 1)])])
-    second = gb.DisjointStorageMeshList([base])
+    first = gb.DisjointStorageMeshList(
+        [gb.SlicedMesh(base, [None, gb.Slice(0, 1)])], ["w"]
+    )
+    second = gb.DisjointStorageMeshList([base], ["w"])
     p0, p1 = gb.TensorComponentPos("w", 0), gb.TensorComponentPos("w", 1)
     layout = gb.PhysicalLayoutTable(
         "safetensors",
@@ -216,7 +216,7 @@ def test_physical_list_returns_constraint_error_for_invalid_mesh(transform):
     "change,type_name,constraint",
     [
         ("ids", "StorageDTensorsView", "tensor_ids_match_table"),
-        ("unknown_tensor", "StorageDTensorsView", "layout_tensor_in_table"),
+        ("unknown_tensor", "PhysicalLayoutTable", "file_paths_keys_are_leaders"),
         ("format", "PhysicalLayoutTable", "container_format_unique"),
         ("extra_leader", "PhysicalLayoutTable", "file_paths_keys_are_leaders"),
         ("content_size", "ArrangedMesh", "size_positive"),
@@ -249,8 +249,10 @@ def test_different_file_lists_cannot_cover_the_same_cell():
     base = gb.SlotOuterProductMesh(
         gb.ArrangedMesh(gt.TensorCount(1)), gb.ArrangedMesh(gt.WorldSize(2))
     )
-    first = gb.DisjointStorageMeshList([base])
-    second = gb.DisjointStorageMeshList([gb.SlicedMesh(base, [None, gb.Slice(1, 2)])])
+    first = gb.DisjointStorageMeshList([base], ["w"])
+    second = gb.DisjointStorageMeshList(
+        [gb.SlicedMesh(base, [None, gb.Slice(1, 2)])], ["w"]
+    )
     p0, p1 = gb.TensorComponentPos("w", 0), gb.TensorComponentPos("w", 1)
     layout = gb.PhysicalLayoutTable(
         "safetensors", {p0: first, p1: second}, {p0: "first", p1: "second"}

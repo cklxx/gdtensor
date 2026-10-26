@@ -5,7 +5,7 @@
 - Same slot: fill -> drain (cache read callback ACK) -> release/reuse.
 - Different slots: cross-leg interleave permitted.
 - Finish: all copies / reader ACK done.
-- Public API unchanged; vendored cloud artifacts byte-exact.
+- Public API unchanged; vendored cloud artifacts semantically equivalent but NOT byte-exact (see design-source-provenance.md).
 
 ## Cache observer results (14/14 pass)
 
@@ -30,4 +30,4 @@
 
 - Multi-machine replication untested.
 - Packed compression format rejected.
-- cloud vendored artifacts unchanged (md5 verified).
+- cloud vendored artifacts: content semantically unchanged, but md5 differs from cloud (cloud 109401B `9e0155…` vs vendored 109406B `f3dc57cc…`; formatting-only reflow, see design-source-provenance.md).

@@ -95,11 +95,41 @@ def test_real_multichunk_offset_chunk_cover_and_crossfile_counterexample(tmp_pat
     files = sorted(set(c[1] for c in chunks))
     assert len(files) >= 2, files  # chunks live in separate __<rank>_0.distcp files
 
-    # Resolve each chunk's raw payload base by archive structure.
-    from gdtensor_sim.dcp_backend import _raw_payload_bases
+    # Resolve each chunk's raw payload base by an INDEPENDENT archive-structure
+    # walk using the stdlib zipfile on the self-contained sub-archive. This must
+    # not import the production private ``_raw_payload_bases`` — otherwise the
+    # oracle and the code under test share a constructor and cannot disagree.
+    import io
+    import struct
+    import zipfile
 
-    bases = _raw_payload_bases(str(root))
-    x_chunks = bases["x"]
+    def independent_payload_base(
+        path: Path, sub_offset: int, sub_length: int
+    ) -> tuple[int, int]:
+        raw = path.read_bytes()
+        sub = raw[sub_offset : sub_offset + sub_length]
+        zf = zipfile.ZipFile(io.BytesIO(sub))
+        zi = next(
+            z
+            for z in zf.infolist()
+            if z.filename.startswith("archive/data/")
+            and z.filename != "archive/data.pkl"
+        )
+        (nlen,) = struct.unpack(
+            "<H", sub[zi.header_offset + 26 : zi.header_offset + 28]
+        )
+        (elen,) = struct.unpack(
+            "<H", sub[zi.header_offset + 28 : zi.header_offset + 30]
+        )
+        base = sub_offset + zi.header_offset + 30 + nlen + elen
+        return base, zi.file_size
+
+    x_chunks = []
+    for fqn, rel, sd_off, sd_len in chunks:
+        if fqn != "x":
+            continue
+        base, usize = independent_payload_base(root / rel, sd_off, sd_len)
+        x_chunks.append((rel, base, usize))
     assert len(x_chunks) == 2, x_chunks
 
     global_t = torch.arange(GLOBAL_ROWS * COLS, dtype=torch.float32).reshape(

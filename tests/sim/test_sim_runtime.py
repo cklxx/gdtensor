@@ -147,7 +147,7 @@ def test_sim_elastic_bf16_is_byte_exact_through_public_io(tmp_path, fmt):
     )
     for rank in range(world):
         raw = loaded.buffers[rank]["bf16.weight"]
-        got = _t.frombuffer(bytes(raw), dtype=_t.bfloat16).reshape(-1)
+        got = _t.frombuffer(bytearray(raw), dtype=_t.bfloat16).reshape(-1)
         lo, hi = rank * 3, (rank + 1) * 3  # Shard(1), tp=2
         expect = want[:, lo:hi].reshape(-1)
         _t.testing.assert_close(got, expect)

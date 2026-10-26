@@ -1,6 +1,6 @@
 # 本地决策记录（用户批准 delta，不改动云原文）
 
-日期：2026-10-25。本文件为本地工程决策快照；云设计文档（vendored）保持字节原样（md5 未变），不覆盖。
+日期：2026-10-25。本文件为本地工程决策快照；云设计文档（vendored）语义与云原文一致，但**并非 byte-exact**（云 109401B md5 `9e0155…` vs vendored 109406B md5 `f3dc57cc…`，差异为格式重排：分号拆行/空行/注释对齐，语义未改；详见 [design-source-provenance.md](design-source-provenance.md)），不覆盖云原文。
 
 ## 已决（用户批准）
 

@@ -61,7 +61,17 @@ class Err(ErrBuilderMixin):
         return _types.GenericAlias(cls, item)
 
     def check_constraints(self):
-        return Ok(None)
+        from .result import ERROR_TYPES, ConstraintViolationError
+
+        if self.value is None or type(self.value) not in ERROR_TYPES:
+            return Err(
+                ConstraintViolationError(
+                    type_name="Err",
+                    constraint_name="value_non_empty",
+                    msg="Err value must be one of the Error branches",
+                )
+            )
+        return self.value.check_constraints()
 
     def __repr__(self):
         return f"Err({self.value!r})"

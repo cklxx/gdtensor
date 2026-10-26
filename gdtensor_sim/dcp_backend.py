@@ -225,39 +225,43 @@ def _chunk_flat_offset(offs, shape) -> int:
     return flat
 
 
-def _slot_local_in_chunk(slot_offsets, slot_sizes, chunk_offsets, chunk_shape):
-    """Map a slot's global intervals to a contiguous packed local offset inside
-    a chunk. Returns (local_elem_start, local_elem_count) if the slot is a
-    contiguous sub-range of the chunk's packed region, else None."""
-    local_start = 0
-    local_elems = 1
-    for i, (s_off, s_size, c_off, c_size) in enumerate(
-        zip(slot_offsets, slot_sizes, chunk_offsets, chunk_shape)
-    ):
-        lo = s_off - c_off
-        if lo < 0 or lo + s_size > c_size:
+def _owned_chunk_local_run(owned_flat, gshape, ch_off, ch_shape):
+    """Map the slot's owned GLOBAL flat element indices to chunk-local packed
+    indices.
+
+    Returns ``(local_start_elem, n_elems)`` iff the owned elements form a SINGLE
+    contiguous run inside this chunk's packed row-major region, i.e. iff a
+    ``pread(base + local_start*itemsize, n_elems*itemsize)`` yields exactly the
+    slot's bytes. Returns ``None`` when the owned elements are strided /
+    non-contiguous in the packed chunk (e.g. an inner-axis column shard inside a
+    full-tensor no_dist chunk) — such a slot cannot be represented by one base
+    offset and must raise InvalidArg rather than silently return a wrong window.
+    """
+    owned_flat = np.asarray(owned_flat, dtype=np.int64).reshape(-1)
+    if owned_flat.size == 0:
+        return None
+    local = []
+    ch_off = [int(x) for x in ch_off]
+    ch_shape = [int(x) for x in ch_shape]
+    for g in owned_flat.tolist():
+        rem = int(g)
+        coords = []
+        for i in range(len(gshape)):
+            stride = int(np.prod(gshape[i + 1 :])) if i + 1 < len(gshape) else 1
+            coords.append(rem // stride)
+            rem = rem % stride
+        rel = [coords[i] - ch_off[i] for i in range(len(gshape))]
+        if any(r < 0 or r >= ch_shape[i] for i, r in enumerate(rel)):
             return None
-        stride = int(np.prod(chunk_shape[i + 1 :])) if i + 1 < len(chunk_shape) else 1
-        local_start += lo * stride
-        local_elems *= s_size
-    return local_start, local_elems
-
-
-def _slot_sizes(coords, gshape, total_elems):
-    """Per-dim sizes of a contiguous flat slot of total_elems starting at coords."""
-    if total_elems == int(np.prod(gshape)):
-        return list(gshape)
-    sizes = []
-    remaining = total_elems
-    for i in range(len(gshape)):
-        stride = int(np.prod(gshape[i + 1 :])) if i + 1 < len(gshape) else 1
-        if remaining == 0:
-            sizes.append(0)
-            continue
-        s = min(remaining // stride, gshape[i] - coords[i])
-        sizes.append(s)
-        remaining -= s * stride
-    return sizes
+        lf = 0
+        for i in range(len(ch_shape)):
+            stride = int(np.prod(ch_shape[i + 1 :])) if i + 1 < len(ch_shape) else 1
+            lf += rel[i] * stride
+        local.append(lf)
+    local.sort()
+    if local[-1] - local[0] + 1 != len(local):
+        return None  # gap between owned elements in chunk-packed order
+    return local[0], len(local)
 
 
 def _raw_payload_bases(root: str) -> Dict[str, List[tuple]]:
@@ -558,17 +562,6 @@ class DcpLoadSession(StorageLoadSession):
                 f"{pos.tensor_id}:{pos.rank}: layout declares this slot but the DCP archive "
                 f"has no storage chunks for fqn {pos.tensor_id!r}",
             )
-        # Slot's global owned interval and the matched chunk's global origin.
-        # local offset = (slot.global_first - chunk.global_origin) * itemsize.
-        # no_dist: one chunk holds the whole tensor (origin 0) -> local = global_first.
-        # sharded: each chunk holds exactly one rank's shard (origin = that shard's
-        # global start) -> local = 0 for the owning rank.
-        _global_first = int(slot.intervals[0, 0]) * slot.itemsize
-        # Total owned bytes = sum of interval lengths * itemsize, NOT
-        # (last - first) * itemsize. The latter is wrong for non-contiguous
-        # multi-interval slots.
-        total_elems = int(sum(b - a for a, b in slot.intervals.tolist()))
-        slot_bytes = total_elems * slot.itemsize
         # Select the chunk whose archive file matches the slot's authoritative path
         # (file_path_of(layout, pos)), compared as fully normalized paths against the
         # checkpoint root — never basename-only, never inferred from pos.rank.
@@ -591,41 +584,35 @@ class DcpLoadSession(StorageLoadSession):
                 f"among {[os.path.normpath(os.path.join(self.root, c[0])) for c in chunks]}",
             )
         rel, base, nbytes, chunk_origin_elems, ch_off, ch_shape = chosen
-        # Per-dim global->local mapping: subtract chunk offset in each dim, then
-        # ravel by chunk shape (not full tensor shape). This correctly handles
-        # sub-slots within a sharded chunk (e.g. row 1 of a 2-row col-shard chunk).
-        # Derive slot's global per-dim offset and size from global_first_elems and
-        # total_elems against the global shape.
         nd = next(
             n for n in self.table.named_d_tensors if n.global_tensor_id == pos.tensor_id
         )
         gshape = tuple(x for x in global_tensor_meta_of(nd).global_shape)
-        gf = int(slot.intervals[0, 0])
-        # Decompose gf into per-dim coords (row-major, outer to inner).
-        coords = []
-        rem = gf
-        for i in range(len(gshape)):
-            stride = int(np.prod(gshape[i + 1 :])) if i + 1 < len(gshape) else 1
-            coords.append(rem // stride)
-            rem = rem % stride
-        # Slot size per dim: for a contiguous flat interval of total_elems starting
-        sizes = _slot_sizes(coords, gshape, total_elems)
-        local_map = _slot_local_in_chunk(coords, sizes, ch_off, ch_shape)
-        if local_map is None:
+        # Map the slot's OWNED global elements to this chunk's packed order. Only
+        # a single contiguous packed run is representable by one pread base; a
+        # strided/non-contiguous slot (e.g. an inner-axis column shard inside a
+        # full-tensor no_dist chunk) must raise InvalidArg here, never return Ok
+        # with a window that sweeps into the peer rank's bytes.
+        owned_flat = np.concatenate(
+            [np.arange(int(a), int(b)) for a, b in slot.intervals.tolist()]
+        )
+        run = _owned_chunk_local_run(owned_flat, gshape, ch_off, ch_shape)
+        if run is None:
             raise invalid(
                 "file_offset",
-                f"{pos.tensor_id}:{pos.rank}: slot global coords {coords} size {sizes} not contained "
-                f"in chunk offset {ch_off} shape {ch_shape}; a single base offset cannot represent "
-                "a slot spanning multiple DCP chunk files",
+                f"{pos.tensor_id}:{pos.rank}: owned {owned_flat.size} elements do not form a single "
+                f"contiguous packed run in chunk offset {tuple(int(x) for x in ch_off)} shape "
+                f"{tuple(int(x) for x in ch_shape)}; a single base offset cannot represent a "
+                "strided/non-contiguous slot",
             )
-        local_start, local_elems = local_map
+        local_start, local_elems = run
         local = local_start * slot.itemsize
         if local < 0 or local_elems * slot.itemsize > nbytes:
             raise invalid(
                 "file_offset",
-                f"{pos.tensor_id}:{pos.rank}: slot bytes [{local},{local + slot_bytes}) not contained "
-                f"in chunk {rel} (size {nbytes}); a single base offset cannot represent a slot "
-                "spanning multiple DCP chunk files",
+                f"{pos.tensor_id}:{pos.rank}: slot bytes [{local},{local + local_elems * slot.itemsize}) "
+                f"not contained in chunk {rel} (size {nbytes}); a single base offset cannot represent "
+                "a slot spilling past the chunk",
             )
         return Ok(base + local)
 

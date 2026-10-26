@@ -13,7 +13,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from .result import ConstraintViolationError, ERROR_TYPES
+from .result import ConstraintViolationError, ERROR_TYPES, Fail
 from ..tag import Box
 from .products import Err, Ok
 
@@ -80,7 +80,8 @@ def _compute_view(o):
 def _storage_view(o):
     from .dtensor import tensor_ids_of
 
-    if tensor_ids_of(o.d_tensor_table) != list(o.tensor_ids):
+    table_ids = tensor_ids_of(o.d_tensor_table)
+    if table_ids != list(o.tensor_ids):
         return _err(
             o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table"
         )
@@ -93,8 +94,16 @@ def _storage_view(o):
                 "layout_tensor_in_table",
                 f"layout tensor {pos.tensor_id} not in d_tensor_table",
             )
-    # Row labels live on the meshes and table order; the list carries no
-    # tensor_ids field. build_payload_index validates row count separately.
+    # Every list's row labels must equal the full DTensorTable header order.
+    # A standalone list cannot know the table; the view (which holds the table)
+    # enforces full-row labels here before any session opens.
+    for lst in entries.values():
+        if list(lst.tensor_ids) != list(table_ids):
+            return _err(
+                o,
+                "list_labels_match_table",
+                "list labels must equal DTensorTable header order",
+            )
     if o.data_accessor is None or o.begin_save is None or o.begin_load is None:
         return _err(
             o,
@@ -182,17 +191,17 @@ def _layout(o):
             "container_format_unique",
             f"unknown container_format {o.container_format!r}",
         )
-    # Structural invariants that hold without the DTensorTable header order:
-    # each distinct physical list has exactly one file_paths key sitting on a
-    # component position of that list, and distinct files never share a cell.
-    lists: dict[int, Any] = {}
+    # Group physical lists by equality: entries pointing at value-equal lists
+    # (deepcopy) are the same physical file (approved delta), never by object id.
+    lists: dict[Any, Any] = {}
     for lst in o.tensor_entries.values():
-        lists.setdefault(id(lst), lst)
-    error = _check_file_path_keys(o, lists)
-    if error is not None:
-        return error
+        lists.setdefault(lst, lst)
+    # Pass 1: labels + geometric cells + file disjointness (first-error wins).
     seen_cells = set()
     for lst in lists.values():
+        labels_error = _list_row_labels(lst)
+        if labels_error is not None:
+            return labels_error
         try:
             cells = set(list_cells(lst))
         except Exception as exc:  # noqa: BLE001
@@ -200,7 +209,23 @@ def _layout(o):
         if seen_cells & cells:
             return _err(o, "meshes_disjoint", "a slot is covered by two files")
         seen_cells |= cells
-    return None
+    # Pass 2: file_paths keys vs the true geometric leader of each list.
+    return _check_file_path_keys(o, lists)
+
+
+def _geometric_leader(o, lst):
+    """True leader = smallest actual (row, column) cell of the list's meshes.
+
+    Reuses leader_tensor_component_pos_of(lst) (single-argument, real geometry);
+    it raises Fail only on label/geometry problems, never recurses into any
+    check_constraints. Fail is mapped to a ConstraintViolationError here.
+    """
+    from .layout import leader_tensor_component_pos_of
+
+    try:
+        return leader_tensor_component_pos_of(lst), None
+    except Fail as exc:
+        return None, _err(o, "list_labels_match_geometry", str(exc.error.msg))
 
 
 def _check_file_path_keys(o, lists):
@@ -209,7 +234,14 @@ def _check_file_path_keys(o, lists):
             msg = f"file_paths key {pos.tensor_id},{pos.rank} is not a tensor entry"
             return _err(o, "file_paths_keys_are_leaders", msg)
     for lst in lists.values():
-        keys = [pos for pos in o.file_paths if o.tensor_entries.get(pos) is lst]
+        labels_error = _list_row_labels(lst)
+        if labels_error is not None:
+            return labels_error
+        leader, err = _geometric_leader(o, lst)
+        if err is not None:
+            return err
+        assert leader is not None
+        keys = [pos for pos in o.file_paths if o.tensor_entries.get(pos) == lst]
         if not keys:
             return _err(o, "list_has_file_path", "a physical list has no file path")
         if len(keys) > 1:
@@ -217,6 +249,24 @@ def _check_file_path_keys(o, lists):
                 o,
                 "file_paths_keys_are_leaders",
                 "a physical list has more than one file path key",
+            )
+        # The true geometric leader cell must itself carry an entry pointing at
+        # this list; a layout whose leader cell is missing an entry (only a
+        # non-leader row is registered) is rejected, never papered over by
+        # taking the minimum registered member.
+        if o.tensor_entries.get(leader) != lst:
+            return _err(
+                o,
+                "file_paths_keys_are_leaders",
+                f"true leader cell {leader.tensor_id},{leader.rank} "
+                f"has no tensor entry for this physical list",
+            )
+        if keys[0] != leader:
+            return _err(
+                o,
+                "file_paths_keys_are_leaders",
+                f"file_paths key {keys[0].tensor_id},{keys[0].rank} "
+                f"is not the geometric leader {leader.tensor_id},{leader.rank}",
             )
     return None
 
@@ -242,9 +292,17 @@ def _list(o):
 
 
 def _list_row_labels(value):
-    from .mesh import storage_mesh_base
+    from .mesh import storage_mesh_base, storage_mesh_cells
     from ..tag import TensorCount
 
+    labels = list(value.tensor_ids)
+    if any(not isinstance(x, str) or not x for x in labels):
+        return _err(
+            value, "labels_non_empty_strings", "labels must be non-empty strings"
+        )
+    if len(set(labels)) != len(labels):
+        return _err(value, "labels_unique", "labels must be unique")
+    covered = set()
     for mesh in value.disjoint_storage_mesh_list:
         tensor_count = storage_mesh_base(mesh).tensor_slots.size
         if type(tensor_count) is not TensorCount:
@@ -253,6 +311,11 @@ def _list_row_labels(value):
                 "tensor_slots_tagged",
                 "mesh tensor slots must be tagged TensorCount",
             )
+        for t, _ in storage_mesh_cells(mesh):
+            covered.add(t)
+    missing = [t for t in sorted(covered) if t >= len(labels)]
+    if missing:
+        return _err(value, "labels_cover_rows", f"row {missing[0]} has no label")
     return None
 
 

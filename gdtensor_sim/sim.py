@@ -36,6 +36,36 @@ from .models import (
 from .runner import load_threads, run_processes, save_threads
 from gdtensor_sim.fabric import ComputeFabric
 
+
+def _actual_distcp_bytes(root: str) -> tuple[int, int]:
+    """Return ``(payload_bytes, metadata_bytes)`` actually on disk for a distcp root.
+
+    The DCP path publishes through torch ``dcp_save(no_dist=True)``: the real
+    payload files are whatever ``.metadata.storage_data.relative_path`` enumerates,
+    which need NOT match the layout-derived PayloadIndex file names. Stating the
+    layout names directly crashes (files torch never wrote); this reads the real
+    artifact manifest instead.
+    """
+    import pickle
+
+    meta_path = os.path.join(root, ".metadata")
+    if not os.path.exists(meta_path):
+        return 0, 0
+    with open(meta_path, "rb") as h:
+        meta = pickle.loads(h.read())
+    payload = 0
+    seen: set = set()
+    for sd in getattr(meta, "storage_data", {}).values():
+        rel = getattr(sd, "relative_path", None)
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        path = os.path.join(root, rel)
+        if os.path.exists(path):
+            payload += os.path.getsize(path)
+    return payload, os.path.getsize(meta_path)
+
+
 SIZE_BINS = [
     ("<4KiB", 4 << 10),
     ("4-64KiB", 64 << 10),
@@ -207,7 +237,10 @@ def main(argv=None) -> dict:
 
     _LOG.info("save complete elapsed=%.3fs writes=%d", t_save, len(wrecs))
     # ---- load
-    data_bytes = sum(os.path.getsize(os.path.join(a.root, f)) for f in index.files)
+    if a.format == "distcp":
+        data_bytes, _meta_bytes = _actual_distcp_bytes(a.root)
+    else:
+        data_bytes = sum(os.path.getsize(os.path.join(a.root, f)) for f in index.files)
     ct2 = compute_table(m, lp)
     fab2 = ComputeFabric(ct2).allocate()
     t1 = time.perf_counter()
