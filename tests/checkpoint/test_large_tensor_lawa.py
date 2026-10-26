@@ -42,7 +42,7 @@ def _large_schema():
     world = int(np.prod(P))
     placements = (gb.Replicate(), gb.Replicate(), gb.Shard(0))
     mesh = gb.SlicedMesh(
-        gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(world)), P),
+        gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(world)), list(P)),
         [gb.Slice(0, 1), None, None],
     )
     dt = gb.NaiveDTensor(

@@ -45,7 +45,9 @@ def _worker(rank, init_file, root):
     from torch.distributed.device_mesh import DeviceMesh
 
     torch.set_num_threads(1)
-    dist.init_process_group(
+    _init = getattr(dist, "init_process_group")
+    _destroy = getattr(dist, "destroy_process_group")
+    _init(
         "gloo",
         init_method="file://" + init_file,
         rank=rank,
@@ -93,7 +95,7 @@ def _worker(rank, init_file, root):
         )
         dcp_save({"x": mean_shard}, checkpoint_id=str(Path(root) / "mean"))
     finally:
-        dist.destroy_process_group()
+        _destroy()
 
 
 @pytest.mark.skipif(

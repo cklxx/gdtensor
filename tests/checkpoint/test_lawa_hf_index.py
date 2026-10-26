@@ -54,7 +54,7 @@ def save_hf_dir(root: Path, tensors: dict[str, np.ndarray]):
         st_numpy.save_file(group, str(root / SHARDS[i]))
         for tid, arr in group.items():
             weight_map[tid] = SHARDS[i]
-            total_size += int(arr.nbytes)
+            total_size += arr.nbytes
     (root / INDEX).write_text(
         json.dumps({"metadata": {"total_size": total_size}, "weight_map": weight_map})
     )
@@ -76,10 +76,10 @@ def assert_valid_hf_dir(root: Path, tids: set[str]):
     total = 0
     for shard_name in referenced:
         decoded = st_numpy.load_file(str(root / shard_name))
-        for tid, mapped in weight_map.items():
-            if mapped == shard_name:
-                assert tid in decoded, (shard_name, tid)
-                total += int(decoded[tid].nbytes)
+        held = [tid for tid, mapped in weight_map.items() if mapped == shard_name]
+        for tid in held:
+            assert tid in decoded, (shard_name, tid)
+            total += decoded[tid].nbytes
     assert index["metadata"]["total_size"] == total
 
 

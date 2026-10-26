@@ -16,6 +16,7 @@ independent of gdtensor ownership code.
 """
 
 import multiprocessing as mp
+import itertools
 import os
 import time
 import zlib
@@ -376,9 +377,8 @@ def _run_case(tmp_path, label, src, dst, epochs, k_values, join_seconds):
             for p in tmp_path.glob("rank*.log")
         }
         assert all(p.exitcode == 0 for p in procs), logs
-        for k in k_values:
-            for m in ("naive", "welford"):
-                check_files(tmp_path, dst, k, m)
+        for k, m in itertools.product(k_values, ("naive", "welford")):
+            check_files(tmp_path, dst, k, m)
         crcs = check_files(tmp_path, dst, k_values[-1], "naive")
         print(
             f"[lawa-axes] PASS {label} files decoded, every element once; "
