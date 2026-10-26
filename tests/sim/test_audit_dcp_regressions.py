@@ -44,7 +44,7 @@ def _table(specs):
     nds = []
     for name, shape, dn, isz, axis in specs:
         mesh = gb.SlicedMesh(
-            gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(WORLD)), (1, 1, WORLD)),
+            gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(WORLD)), [1, 1, WORLD]),
             [gb.Slice(0, 1), None, None],
         )
         placements = [
@@ -113,6 +113,7 @@ def _resolve_payload_base(path, sub_offset, sub_length):
 
 def _open_load_session(table, root):
     sv = storage_view(root, table, (1, 1, WORLD), "single", "mirror", "distcp")
+    assert sv.begin_load is not None
     sessions = {}
     for r in range(WORLD):
         res = sv.begin_load(sv, r)

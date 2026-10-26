@@ -185,12 +185,8 @@ def test_view_label_order_mismatch_returns_err_not_raise():
     bad_pos = gb.TensorComponentPos("u", 0)  # geometric leader of reversed labels
     view.physical_layout.set_tensor_entries({bad_pos: bad})
     view.physical_layout.set_file_paths({bad_pos: "m"})
-    raised = False
-    try:
-        result = view.check_constraints()
-    except Exception:
-        raised = True
-    assert not raised, "public check_constraints must return Result, never raise"
+    # Any exception fails the test; the public contract returns a Result.
+    result = view.check_constraints()
     assert type(result) is gb.Err
     assert result.value.constraint_name == "list_labels_match_table"
 

@@ -8,7 +8,7 @@ IS_MAC="$(uname -s)"; IS_MAC="${IS_MAC:-Linux}"
 if [ "${GDTENSOR_REMOTE_TEST:-0}" != "1" ] && { [ "$IS_MAC" = "Darwin" ] || [ "${GDTENSOR_FORCE_REMOTE:-0}" = "1" ]; }; then
   exec scripts/remote_gate.sh full
 fi
-unset PYTHONPATH; export PYTHONPATH="."
+unset PYTHONPATH
 
 # Keep the same locked CPU torch environment for every full-check step.
 echo "[full-check] 1/5 fmt check"
