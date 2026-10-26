@@ -42,19 +42,28 @@ jobs:
         run: uv run --locked ruff check --no-cache gdtensor gdtensor_sim tests
       - name: Compile
         run: uv run --locked python -m compileall -q gdtensor gdtensor_sim tests
-      - name: Public API, IO, checkpoint, sim and demo tests (no torch)
+      - name: Pure core + IO tests (no torch; zero skip)
         run: |
           set -euo pipefail
-          uv run --locked pytest -v -p no:cacheprovider --ignore=tests/torch -rs | tee no_torch.txt
-          bad="$(grep '^SKIPPED' no_torch.txt | grep -v "could not import 'torch" || true)"
+          uv run --locked pytest -v -p no:cacheprovider tests/core tests/io -rs | tee no_torch.txt
+          bad="$(grep '^SKIPPED' no_torch.txt || true)"
           if [ -n "$bad" ]; then
-            echo "Unexpected skips in no-torch job (only torch importorskip is legal):" >&2
+            echo "Unexpected skips in pure no-torch job:" >&2
             echo "$bad" >&2
             exit 1
           fi
-      - name: Behavioral mutations
+      - name: No-torch import probe (core must not depend on torch)
+        run: |
+          set -euo pipefail
+          uv run --locked python - <<'PY'
+          import subprocess, sys
+          code = "import sys; import gdtensor; bad=[m for m in list(sys.modules) if m.startswith('torch')]; sys.exit(1 if bad else 0)"
+          subprocess.run([sys.executable, "-c", code], check=True)
+          print("core imports torch: no")
+          PY
+      - name: "Behavioral mutations (no-torch: core API guards)"
         if: matrix.python == '3.12'
-        run: uv run --locked python tests/mutation_check.py
+        run: uv run --locked python tests/mutation_check.py --group notorch
 
   torch:
     name: Torch, types and LAWA (CPU)
@@ -85,11 +94,41 @@ jobs:
             grep '^SKIPPED' torch.txt >&2
             exit 1
           fi
+      - name: CLI smoke (real python -m subprocess; distcp/safetensors x single/per_rank)
+        run: |
+          set -euo pipefail
+          uv run --locked --extra torch-cpu pytest -v -s -p no:cacheprovider \
+            tests/sim/test_cli_smoke.py -rs | tee cli.txt
+          if grep -q '^SKIPPED' cli.txt; then
+            echo "CLI smoke was skipped (torch must import; only torch importorskip is legal):" >&2
+            grep '^SKIPPED' cli.txt >&2
+            exit 1
+          fi
+          if ! grep -q '4 passed' cli.txt; then
+            echo "CLI smoke did not collect all 4 cases (expect distcp/safetensors x single/per_rank)" >&2
+            exit 1
+          fi
+      - name: "Behavioral mutations (torch: DCP contiguous-guard)"
+        run: uv run --locked --extra torch-cpu python tests/mutation_check.py --group torch
+
+  formal:
+    name: Formal proofs (Lean v4.34.0 + TLC v1.8.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install elan (Lean version manager; toolchain pinned by formal/lean/lean-toolchain)
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Lean proof + real TLC model checking (pinned, sha256-verified jar)
+        run: bash scripts/formal_gate.sh
 
   gate:
     name: CI gate
     if: always()
-    needs: [checks, torch]
+    needs: [checks, torch, formal]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -97,4 +136,8 @@ jobs:
         env:
           CHECKS_RESULT: ${{ needs.checks.result }}
           TORCH_RESULT: ${{ needs.torch.result }}
-        run: test "$CHECKS_RESULT" = success && test "$TORCH_RESULT" = success
+          FORMAL_RESULT: ${{ needs.formal.result }}
+        run: |
+          test "$CHECKS_RESULT" = success
+          test "$TORCH_RESULT" = success
+          test "$FORMAL_RESULT" = success

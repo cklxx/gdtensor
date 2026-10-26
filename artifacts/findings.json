@@ -1,0 +1,93 @@
+{
+  "scope": "shard-A 独立只读 API/不变量审计 @ df1db8c9078467ad8f60e2e994cdd3bd84ce5ae3 (clean)",
+  "method": "只用公开 import（gdtensor/builder/io/session/access/tag）+ 独立行主序 dense oracle；不 import internal 也不 import internal tests；internal 只读 AST 审线。原源码/原测试零改动。repro 全部在 log/audit-df1/API/，单 case timeout 10s。",
+  "baseline": "tests/core+tests/io 532 passed in 7.73s（亲自跑）；全量非 torch 套件 240s 未跑完（task stopped exit -1），不采信其计数。",
+  "scenario_counts": {
+    "r1_namespace_mixin_sweep": "378 PASS / 0 FAIL（3 个脚本探针伪影已剔除：Placement 是 Union 别名非 dataclass；Mixed/DisjointTensorIdsAndReadChain 构造器需位置参，非产品缺陷）",
+    "r2_products_union": "21 PASS / 1 FAIL —— FAIL 即 A-F3 独立钉住（Err(None).check_constraints 应返 Err 实返 Ok）",
+    "r3_error_fidelity": "全 PASS",
+    "r4_leader_labels": "全 PASS；有效 leader 正例正确；坏标签经 list.check_constraints=Ok 但 leader helper 抛 Fail（helper 签名返回 TensorComponentPos 非 Result，抛 Fail 视为合理，noissue）",
+    "r5_reversed_labels_io": "全 PASS；PROBE：view.check_constraints 对 reversed labels raise Fail（A-F4）；rank_save 返 Err 不开 session",
+    "r5b_nonleader_key": "全 PASS；PROBE：layout.check_constraints 对非 leader 键=Ok（A-F1）；rank_save=Err(InvalidArgumentError,\"file_paths key ('u', 0) is not the leader ('w', 0)\") 不开 session",
+    "r6_equal_distinct_lists": "1 FAIL 即 A-F2 独立钉住；其余 PASS（等值 list hash 相等；file_path_of 双 pos 同路径；重叠 cell 经 meshes_disjoint 拒绝）",
+    "r7_per_rank_e2e_oracle": "全 PASS（world=2 Shard(0) shape[6]U8 往返字节与 oracle 一致；未触区保持零；N1 缺 slot→Err 不开 begin_load；N2 截断→Err 无静默半载）",
+    "r8_mutation_hash": "全 PASS",
+    "r9_chain_public": "全 PASS"
+  },
+  "findings": [
+    {
+      "id": "A-F1",
+      "severity": "P2",
+      "title": "PhysicalLayoutTable.check_constraints 不校验 file_paths 键是 leader pos（设计 5.7 表声称校验）",
+      "claimed_contract": "docs/DTensorsView-design.md:1281 声称 PhysicalLayoutTable 检查含 \"file_paths 的键是 leader pos\"",
+      "current_file_line": "gdtensor/internal/constraints.py:206-221 _check_file_path_keys 只验 key∈tensor_entries 且每 list 恰一键；几何 leader 校验仅在 gdtensor/internal/layout.py:281-290 build_payload_index",
+      "missing_test_line": "tests/io/test_plan_behavior.py:335 test_wrong_leader_file_paths_key_is_rejected 只钉 IO 路径拒绝；无测试调用 layout.check_constraints 对非 leader 键断言 Err",
+      "repro_command": "cd <repo> && PYTHONPATH=. timeout 10 .venv/bin/python log/audit-df1/API/r5b_nonleader_key.py",
+      "result": "file_paths 键为非 leader p_u 时 layout.check_constraints()=Ok；同布局 rank_save=Err(InvalidArgumentError,\"file_paths key ('u', 0) is not the leader ('w', 0)\") 且 session 未开",
+      "impact": "公共 check_constraints 给假 Ok；leader 违规拖到 IO 才暴露",
+      "status": "unfixed"
+    },
+    {
+      "id": "A-F2",
+      "severity": "P2",
+      "title": "equal-but-distinct(deepcopy) list：check_constraints 按 id 分组 vs build_payload_index 按等值分组，口径相反",
+      "claimed_contract": "已批 delta + gdtensor/internal/layout.py:229 docstring \"value-equal lists (deepcopy) are the same physical file\"",
+      "current_file_line": "gdtensor/internal/constraints.py:188-190 id(lst) 分组 vs gdtensor/internal/layout.py:234 by_list.setdefault(lst) 等值分组",
+      "missing_test_line": "tests/core/test_constraints.py:179 test_valid_storage_view_and_equal_physical_lists_pass_constraints 只覆盖\"同一 pos 键换 deepcopy\"（单 entry），未覆盖两不同 pos 指向等值不同 list",
+      "repro_command": "cd <repo> && PYTHONPATH=. timeout 10 .venv/bin/python log/audit-df1/API/r6_equal_distinct_lists.py",
+      "result": "entries={p_w:list_a, p_u:list_b(等值不同对象)}+单文件路径 → layout.check_constraints()=Err(list_has_file_path)；file_path_of 两 pos 同路径（IO 接受）",
+      "impact": "delta 认可的 deepcopy 布局被公共 check_constraints 误拒；check 与 IO 自相矛盾",
+      "status": "unfixed"
+    },
+    {
+      "id": "A-F3",
+      "severity": "P2",
+      "title": "Err.check_constraints 无条件 Ok，不校验 value 非空",
+      "claimed_contract": "docs/DTensorsView-design.md:1288 \"Err | value 非空\"",
+      "current_file_line": "gdtensor/internal/products.py:63-64 Err.check_constraints 直返 Ok(None)；gdtensor/internal/constraints.py:300-301 _error hook 只注册 5 个 Error 分支，不含 Ok/Err 本体",
+      "missing_test_line": "tests/core/test_constraints.py 无 Err(None).check_constraints 断言",
+      "repro_command": "cd <repo> && PYTHONPATH=. timeout 10 .venv/bin/python log/audit-df1/API/r2_products_union.py（r2 现 EXIT=1，唯一 FAIL 即此）",
+      "result": "Err(None).check_constraints()=Ok(None)；有效 Err(InvalidArgumentError(...)).check_constraints()=Ok（正例）",
+      "impact": "空 Err 通过公共约束检查",
+      "status": "unfixed"
+    },
+    {
+      "id": "A-F4",
+      "severity": "P2",
+      "title": "StorageDTensorsView.check_constraints 对 label 顺序违规 raise Fail（内部异常外泄），同方法其余违规返 Err——返回形态不统一",
+      "claimed_contract": "设计 5.7：check_constraints 返回 Result[None]；public 方法不可 pin 行为当作合规",
+      "current_file_line": "gdtensor/internal/views.py:82 raise invalid(\"tensor_ids\",\"labels order != DTensorTable header order\")",
+      "missing_test_line": "tests/core/test_constraints.py:156-160 把该 raise Fail 固化为正确——pin 不等于合规",
+      "repro_command": "cd <repo> && PYTHONPATH=. timeout 10 .venv/bin/python log/audit-df1/API/r5_reversed_labels_io.py（PROBE 行）",
+      "result": "view.check_constraints() 对 reversed labels raise Fail；同方法对 data_accessor=None 返 Err(ConstraintViolationError)。注：rank_save 走 IO @catch 路径，reversed labels 在 session 前被正确拒为 Err(InvalidArgumentError) 不开 session——IO 行为正确，仅公共 check 方法本身形态不一致",
+      "impact": "公共用户对同一方法需 try/except 与 Result 双处理",
+      "status": "unfixed"
+    },
+    {
+      "id": "A-F5",
+      "severity": "P2",
+      "title": "DisjointStorageMeshList 自身 check_constraints 不校验 tensor_ids 标签（重复/过短/空串）；layout 层兜住但 Err.constraint_name 误标 meshes_disjoint",
+      "claimed_contract": "已批 delta：labels 唯一非空、行序=table 行序",
+      "current_file_line": "gdtensor/internal/constraints.py:224-256 _list hook 只查非空+TensorCount tag+mesh 重叠；label 校验在 gdtensor/internal/layout.py:85-100 _check_tensor_ids 仅经 list_cells 触发",
+      "missing_test_line": "tests/core/test_constraints.py:126-136 只测\"无 tensor_ids\"经 leader helper 抛 Fail；无 dup/过短/空串经 list.check_constraints 断言",
+      "repro_command": "cd <repo> && PYTHONPATH=. timeout 10 .venv/bin/python log/audit-df1/API/r4_leader_labels.py",
+      "result": "三种坏标签 list.check_constraints()=Ok；PhysicalLayoutTable.check_constraints()=Err(constraint_name='meshes_disjoint', msg='labels must be unique')（名不符实）",
+      "impact": "独立 list 验收弱；错误分类名误导排障",
+      "status": "unfixed"
+    }
+  ],
+  "observed_noissue": [
+    "leader_tensor_component_pos_of 签名返回 TensorComponentPos 而非 Result，对坏标签抛 Fail 视为合理（helper 非公共 Result 契约）；消息正确：'labels must be unique' / 'row 1 has no label' / 'labels must be non-empty strings'（r4）",
+    "r1 中 Placement=Union 别名、Mixed/DisjointTensorIdsAndReadChain 需位置参——探针伪影非缺陷"
+  ],
+  "verified_correct": [
+    "namespace/export 全量可 import；26 个 new_* 工厂返回目标类；所有公开 dataclass 每声明字段有 get_/set_，list/dict 字段有 mutable_/add_/clear_（r1）",
+    "IO @catch 入口（rank_save/rank_load/chain_load/get_gd_tensor）不泄漏内部 Fail：违规均被包成 Err 分支；注意公共 check_constraints 方法本身有 A-F4 形态不一致，二者范畴不同（r3/r5b/r7/r9）",
+    "Error 保真：5 分支字段保真、空 msg 必 Err；accessor 返 Err 分支保真不包装；accessor 抛裸异常→Err(GDTensorIOError,'internal')（r3）",
+    "per-rank e2e 独立 dense oracle：rank0[0:3)/rank1[3:6) 往返字节与 oracle 一致，未触区保持零；无跨并集掩 rank（r7）",
+    "缺 slot→Err(InvalidArgumentError,'no source covers 3 destination elements') 且 begin_load 未开；截断 1/3 字节→Err('read chunks have 1 bytes, expected 3') 不静默半载（r7 N1/N2）",
+    "reversed labels 经 rank_save→Err(InvalidArgumentError) 不开 session；dict 反序插入不影响 leader 解析（r5）",
+    "equal list 的 file_path_of 双 pos 同路径（r6 正例）；chain_load direct 字节==dense；chain mismatch→Err；stats 纯函数（r9）",
+    "mutable_ 返活引用；ctor 拷贝防别名；dict 字段 hash 稳定（r8）"
+  ]
+}

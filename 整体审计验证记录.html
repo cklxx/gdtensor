@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gdtensor 固定 commit(df1db8c) 整体审计验证记录</title>
+<style>
+  :root{
+    --teal-900:#134e4a; --teal-700:#0f766e; --teal-600:#0d9488; --teal-100:#ccfbf1; --teal-50:#f0fdfa;
+    --ink-900:#111827; --ink-700:#374151; --ink-500:#6b7280; --ink-300:#d1d5db;
+    --paper:#ffffff; --panel:#f8fafc; --line:#e2e8f0;
+    --warn-bg:#fef3c7; --warn-fg:#92400e;
+    --fail-bg:#fee2e2; --fail-fg:#991b1b;
+    --ok-bg:#d1fae5; --ok-fg:#065f46;
+    --note-bg:#e5e7eb; --note-fg:#374151;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--paper);color:var(--ink-900);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    line-height:1.65;font-size:15px;}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 28px 80px;}
+  header.top{border-bottom:3px solid var(--teal-700);padding-bottom:18px;margin-bottom:24px;}
+  h1{font-size:24px;color:var(--teal-900);margin:0 0 6px;}
+  h2{font-size:19px;color:var(--teal-900);border-left:5px solid var(--teal-600);padding-left:10px;margin:36px 0 12px;}
+  h3{font-size:16px;color:var(--teal-700);margin:22px 0 8px;}
+  .meta{color:var(--ink-500);font-size:13px;}
+  .draft-banner{background:var(--warn-bg);border:1px solid #fcd34d;color:var(--warn-fg);
+    padding:10px 14px;border-radius:6px;font-size:13.5px;margin-bottom:18px;}
+  .verdict{background:var(--teal-50);border:1px solid var(--teal-600);border-radius:8px;
+    padding:18px 20px;margin:18px 0;}
+  .verdict .big{font-size:20px;font-weight:700;color:var(--teal-900);}
+  table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13.5px;background:var(--paper);}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top;}
+  th{background:var(--teal-50);color:var(--teal-900);font-weight:600;}
+  td code, p code, li code{background:var(--panel);border:1px solid var(--line);
+    border-radius:4px;padding:1px 5px;font-size:12.5px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere;word-break:normal;}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    padding:10px 12px;overflow-x:auto;font-size:12.5px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;line-height:1.5;}
+  .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600;white-space:nowrap;}
+  .b-p0{background:var(--fail-bg);color:var(--fail-fg);}
+  .b-p1{background:var(--fail-bg);color:var(--fail-fg);}
+  .b-p2{background:var(--warn-bg);color:var(--warn-fg);}
+  .b-fail{background:var(--fail-bg);color:var(--fail-fg);}
+  .b-ok{background:var(--ok-bg);color:var(--ok-fg);}
+  .b-design{background:var(--note-bg);color:var(--note-fg);}
+  .finding{border:1px solid var(--line);border-left:5px solid var(--teal-600);
+    border-radius:6px;padding:14px 16px;margin:14px 0;background:var(--paper);}
+  .finding.p1{border-left-color:#b91c1c;}
+  .finding h3{margin-top:0;}
+  .kv{display:grid;grid-template-columns:110px 1fr;gap:4px 10px;font-size:13.5px;margin-top:8px;}
+  .kv .k{color:var(--ink-500);}
+  .cols3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:12px 0;}
+  .col{border:1px solid var(--line);border-radius:6px;padding:12px 14px;background:var(--panel);font-size:13px;}
+  .col h4{margin:0 0 6px;font-size:14px;}
+  .col.emptybug{border-top:4px solid var(--teal-600);}
+  .col.wire{border-top:4px solid #b45309;}
+  .col.latent{border-top:4px solid var(--ink-300);}
+  a{color:var(--teal-700);}
+  ul{margin:6px 0;padding-left:22px;}
+  .small{font-size:12.5px;color:var(--ink-500);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1>gdtensor 固定 commit 整体审计验证记录</h1>
+  <div class="meta">
+    受审提交 <code>df1db8c9078467ad8f60e2e994cdd3bd84ce5ae3</code>（与 GitHub main 一致， ahead/behind = 0/0）；
+    tree <code>3492c1aa8bb4c94fe08df40c2b1dc3a9a706a1ac</code>；
+    源码与测试本轮零修改；仓库根未跟踪项仅为审计材料（<code>artifacts/</code>）与本报告 <code>整体审计验证记录.html</code>，均非源码/配置/测试；
+    环境 Python 3.12.12 / torch 2.14.1 / numpy 2.5.4，单机 CPU。
+    报告生成日期：2026-10-26。
+  </div>
+</header>
+
+<div class="verdict">
+  <div class="big">总结论：尚未完全搞定。</div>
+  <p style="margin:8px 0 0;">
+    本轮全量门禁已在受审 commit 独立跑到终态：<code>scripts/full_check.sh</code> EXIT 0，pytest
+    <b>1359 passed / 0 failed / 0 errors / 0 skipped</b>（839.55s，墙钟 841s，1800s 上限未触）。
+    但全绿<b>不改变</b>未修结论：只读源码独立审计确认 <b>0 个 P0、1 个 P1、7 个 P2 共 8 项未修/待更正</b>——
+    DCP 侧 1 个 P1（<code>get_file_offset</code> 对非行主序连续槽返回错误 Ok 偏移）+ 1 个 P2（distcp CLI 保存后必崩）；
+    公共 API 侧 5 个 P2（公共 <code>check_constraints</code> 假 Ok / 误拒 / 返回形态不统一）；
+    另 1 个 P2 为审计记录文档准确性（设计文档与云原文字节一致声明不实）。
+    缓存（cache）侧 <b>没有实证 bug</b>（15 用例 13 通过 / 1 设计边界 / 1 接线观察）；
+    DCP payload 位腐静默加载经独立 test oracle 与设计文核对，<b>是设计行为而非 bug</b>。
+  </p>
+</div>
+
+<h2>1. 审计方式（固定 commit，独立场景，非重跑原 1359）</h2>
+<ul>
+  <li><b>受审对象固定</b>：全部结论钉在 <code>df1db8c</code>；worktree 源码与测试零修改，所有 repro 脚本与产物落在 <code>log/audit-df1/</code> 下。</li>
+  <li><b>公开 API 真回调</b>：只用公开 import（<code>gdtensor</code> / <code>builder</code> / <code>io</code> / <code>session</code> / <code>access</code> / <code>tag</code>）；缓存审计只走公开 <code>gio.chain_load</code>，用真实内存 buffer、真实 session、真实回调构造场景。</li>
+  <li><b>独立 bytes oracle</b>：DCP 侧自写 zip 本地头解析（<code>audit_oracle.oracle_chunks</code>）+ dense arange 真值 + <code>os.pread</code> 打在公开 <code>DcpLoadSession.get_file_offset</code> 上；<b>绝不</b> import <code>_raw_payload_bases</code> / <code>_resolve_one_subarchive</code> 等私有实现当真值。</li>
+  <li><b>独立场景与全量门禁分开计数</b>：本报告的 finding 证据来自本轮新建独立场景（API 10 + cache 15 + DCP 18 = 43 个审计场景，跨 scope 互斥、保守取下限 20 个独立有效场景）；全量门禁 1359 passed 是产品测试套件的终态，<b>不</b>计入这 43 个独立场景，也不以「测试全绿」替代审计结论。</li>
+  <li><b>全量门禁终态</b>：<code>scripts/full_check.sh</code> EXIT 0，5 阶段（fmt / lint / ty error-on-warning / pyrefly 0 diag / byte-compile / torch 环境 pytest）全部 terminal passed；明细见第 7 节。</li>
+  <li><b>范围边界</b>：单机 CPU、<code>no_dist</code> 单文件 chunk；未测多机、GPU、torch packed-compression payload。</li>
+</ul>
+
+<h2>2. Finding 总表（P0 / P1 / P2）</h2>
+<table>
+  <thead><tr><th style="width:80px">编号</th><th style="width:62px">级别</th><th style="width:200px">模块</th><th>标题（一句话）</th><th style="width:76px">状态</th></tr></thead>
+  <tbody>
+    <tr><td colspan="5" style="background:var(--panel);font-weight:600;">P0：无</td></tr>
+    <tr>
+      <td><code>P1-1</code></td><td><span class="badge b-p1">P1</span></td><td>DCP / <code>gdtensor_sim/dcp_backend.py</code></td>
+      <td><code>get_file_offset</code> 对内轴分片（列并行 Shard(1)）/ 3-D 跨步槽返回与槽字节不匹配的 Ok 偏移；外部 pread 静默读错字节。</td>
+      <td><span class="badge b-fail">未修</span></td>
+    </tr>
+    <tr>
+      <td><code>P2-2</code></td><td><span class="badge b-p2">P2</span></td><td>DCP CLI / <code>gdtensor_sim/sim.py:210</code></td>
+      <td><code>--format distcp</code> 保存成功后按布局推名汇总字节时 FileNotFoundError，非测试入口每次必崩。</td>
+      <td><span class="badge b-fail">未修</span></td>
+    </tr>
+    <tr>
+      <td><code>A-F1</code></td><td><span class="badge b-p2">P2</span></td><td>公共约束 / <code>constraints.py</code></td>
+      <td><code>PhysicalLayoutTable.check_constraints</code> 不校验 <code>file_paths</code> 键是 leader pos，非 leader 键返假 Ok。</td>
+      <td><span class="badge b-fail">未修</span></td>
+    </tr>
+    <tr>
+      <td><code>A-F2</code></td><td><span class="badge b-p2">P2</span></td><td>公共约束 / <code>constraints.py</code> vs <code>layout.py</code></td>
+      <td>等值不同 list（deepcopy）：约束按 <code>id()</code> 分组、布局按等值分组，口径相反——已批 delta 认可的布局被公共 check 误拒。</td>
+      <td><span class="badge b-fail">未修</span></td>
+    </tr>
+    <tr>
+      <td><code>A-F3</code></td><td><span class="badge b-p2">P2</span></td><td>公共约束 / <code>products.py:63</code></td>
+      <td><code>Err.check_constraints</code> 无条件返 Ok，不校验 <code>Err.value</code> 非空（设计表要求「Err value 非空」）。</td>
+      <td><span class="badge b-fail">未修</span></td>
+    </tr>
+    <tr>
+      <td><code>A-F4</code></td><td><span class="badge b-p2">P2</span></td><td>公共约束 / <code>views.py:82</code></td>
+      <td><code>StorageDTensorsView.check_constraints</code> 对 label 顺序违规 raise 内部 Fail，同方法其余违规返 Err——返回形态不统一。</td>
+      <td><span class="badge b-fail">未修</span></td>
+    </tr>
+    <tr>
+      <td><code>A-F5</code></td><td><span class="badge b-p2">P2</span></td><td>公共约束 / <code>constraints.py</code> vs <code>layout.py</code></td>
+      <td><code>DisjointStorageMeshList</code> 自身 check 不校验 tensor_ids 标签（重复/过短/空串返 Ok）；布局层兜住但 Err 名误标 <code>meshes_disjoint</code>。</td>
+      <td><span class="badge b-fail">未修</span></td>
+    </tr>
+    <tr>
+      <td><code>P2-D1</code></td><td><span class="badge b-p2">P2</span></td><td>审计记录文档准确性 / <code>docs/DTensorsView-design.md</code> vs 云原文</td>
+      <td>早前记录声称设计文档与云原文 md5「字节一致/未改」——经独立核验该声明不实：byte 不等（109406 vs 109401 字节），差异为空白重排 + 2 处等价分号/换行调整（代码示例），未发现设计语义改动。</td>
+      <td><span class="badge b-fail">记录待更正</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>3. Finding 展开证据（command / 实际失败结果 / 状态 / 影响 / 建议）</h2>
+
+<div class="finding p1">
+  <h3>P1-1 · DCP <code>get_file_offset</code> 非连续槽返回错误 Ok 偏移 <span class="badge b-fail">未修</span></h3>
+  <div class="kv">
+    <div class="k">复现命令</div><div><code>cd &lt;repo&gt; &amp;&amp; PYTHONPATH=. .venv/bin/python log/audit-df1/dcp/run_scn.py col_shard</code>（exit=0，但结果错）</div>
+    <div class="k">实际结果</div><div>
+      公开 <code>rank_save</code> 写整张量单 chunk；全局 (2,4) f32 Shard(1) world=2。
+      rank0 <code>get_file_offset=Ok(704)</code>，pread 16 字节得 <code>000000000000803f0000004000004040</code>，
+      槽应有字节 <code>000000000000803f000080400000a040</code>，<b>不匹配</b>；
+      rank1 <code>Ok(712)</code> 同样不匹配。对照 <code>row_shard</code> Shard(0) 偏移 704/728 两 rank pread 均匹配；
+      <code>strided_3d</code> (3,4,11) Shard(1) 同样两 rank 不匹配。
+    </div>
+    <div class="k">根因</div><div>
+      <code>_slot_local_in_chunk</code>（<code>dcp_backend.py:228</code>）只做逐维 containment 检查，并按行主序把局部起点 ravelled 成连续 packed run——内轴分片盒逐维被包含但在打包张量里<b>非连续</b>，连续窗口扫进 peer rank 的列/行间隙。
+      614–620 的 guard 只挡「跨 chunk 文件」的盒，挡不住「被包含但非连续」的盒，于是返回 Ok。
+    </div>
+    <div class="k">影响</div><div>外部零拷贝/分页读器若信任公开契约 pread(slot.nbytes)，将在列并行 / 3-D 跨步槽上<b>静默读错字节</b>（跨进 peer 区）且无报错。进程内 <code>rank_load</code> 数据路径不受影响（按 owned 区间直接索引，各拓扑 round-trip 均 PASS）。</div>
+    <div class="k">建议</div><div>不新增 API：分解槽盒后校验 owned flat 区间为单一连续行主序 run（区间数==1 且盒贯穿尾部维度）；非连续则对<b>现有 pos</b> 返回 <code>InvalidArg('file_offset')</code>。加回归：col_shard 必 Err、row_shard 必 pread-match。</div>
+  </div>
+</div>
+
+<div class="finding">
+  <h3>P2-2 · distcp CLI 保存后必崩 <span class="badge b-fail">未修</span></h3>
+  <div class="kv">
+    <div class="k">复现命令</div><div><code>PYTHONPATH=. .venv/bin/python -m gdtensor_sim.sim --root log/audit-df1/dcp/run/cli-report-repro --layers 1 --hidden 16 --ffn 32 --vocab 64 --tp 2 --format distcp --layout single</code>（不删除任何目录、不写 /tmp；入口 bug 无需 fresh dir 即可复现）</div>
+    <div class="k">实际结果</div><div>exit=1；所有 rank 报 save committed，磁盘只有 <code>__0_0.distcp</code>；<code>sim.py:210</code> <code>sum(os.path.getsize(root/f) for f in index.files)</code> 抛 <code>FileNotFoundError: model.distcp</code>（布局推名，torch no_dist 从不写该名），在 load/verify 之前崩溃。对照 safetensors 同参数 exit=0、load_bytes_verified=true。</div>
+    <div class="k">影响</div><div>文档化的 CLI distcp 示例每次非零退出；pytest 从不触 <code>sim.main()</code> 的报告段，CI 保持绿——非测试入口盲区。</div>
+    <div class="k">建议</div><div>distcp 的数据字节从<b>实际磁盘产物</b>推导（读 <code>.metadata</code> 的 <code>storage_data.relative_path</code> 列表，或 listdir 排除 <code>.metadata</code>），不要用 <code>PayloadIndex.files</code>；CI 加一条 CLI smoke 断言。</div>
+  </div>
+</div>
+
+<div class="finding">
+  <h3>A-F1 · 公共 check 不校验 file_paths 键为 leader pos <span class="badge b-fail">未修</span></h3>
+  <div class="kv">
+    <div class="k">复现命令</div><div><code>PYTHONPATH=. .venv/bin/python log/audit-df1/API/r5b_nonleader_key.py</code></div>
+    <div class="k">实际结果</div><div><code>file_paths</code> 键取非 leader <code>p_u</code> 时 <code>layout.check_constraints()=Ok</code>（假 Ok）；同一布局走 <code>rank_save</code> 则正确返回 <code>Err(InvalidArgumentError,"file_paths key ('u', 0) is not the leader ('w', 0)")</code> 且不开 session。设计表（<code>docs/DTensorsView-design.md</code> 物理布局行）声称「file_paths 的键是 leader pos」；源码中 leader 几何校验只在 <code>layout.py</code> 的 <code>build_payload_index</code>，<code>_check_file_path_keys</code> 只查键∈tensor_entries 且每 list 恰一键。</div>
+    <div class="k">影响</div><div>公共 <code>check_constraints</code> 给假 Ok；leader 违规拖到 IO 才暴露。</div>
+    <div class="k">建议</div><div>在公共 check 补齐 leader 几何校验，或在设计中显式把该责任划归 IO 并修正设计行表述。</div>
+  </div>
+</div>
+
+<div class="finding">
+  <h3>A-F2 · 等值不同 list（deepcopy）分组口径相反 <span class="badge b-fail">未修</span></h3>
+  <div class="kv">
+    <div class="k">复现命令</div><div><code>PYTHONPATH=. .venv/bin/python log/audit-df1/API/r6_equal_distinct_lists.py</code>（r6 唯一 FAIL，EXIT=1）</div>
+    <div class="k">实际结果</div><div>entries={<code>p_w:list_a</code>, <code>p_u:list_b</code>（等值但不同对象）}+单文件路径：<code>constraints.py</code> 按 <code>id(lst)</code> 分组 → <code>check_constraints()=Err(list_has_file_path)</code>；<code>layout.py</code> <code>by_list.setdefault(lst)</code> 按等值分组 → <code>file_path_of</code> 两 pos 同路径，IO 接受。已批 delta 与布局 docstring 明确「value-equal lists (deepcopy) 是同一物理文件」。</div>
+    <div class="k">影响</div><div>delta 认可的 deepcopy 布局被公共 check 误拒；check 与 IO 自相矛盾。</div>
+    <div class="k">建议</div><div>统一两侧分组口径（公共 check 改为按等值分组），并补两不同 pos 指向等值 list 的回归测试。</div>
+  </div>
+</div>
+
+<div class="finding">
+  <h3>A-F3 · <code>Err.check_constraints</code> 无条件 Ok <span class="badge b-fail">未修</span></h3>
+  <div class="kv">
+    <div class="k">复现命令</div><div><code>PYTHONPATH=. .venv/bin/python log/audit-df1/API/r2_products_union.py</code>（r2 唯一 FAIL，EXIT=1）</div>
+    <div class="k">实际结果</div><div><code>Err(None).check_constraints()=Ok(None)</code>；有效 <code>Err(InvalidArgumentError(...)).check_constraints()=Ok</code>（正例）。设计表行：「Err | value 非空」；源码 <code>products.py:63</code> 直返 Ok，<code>constraints.py</code> 的 error hook 只注册 5 个 Error 分支，不含 Ok/Err 本体。</div>
+    <div class="k">影响</div><div>空 Err 通过公共约束检查。</div>
+    <div class="k">建议</div><div><code>Err.check_constraints</code> 校验 <code>value</code> 非空且为 Error 分支，否则返 Err；补 <code>Err(None)</code> 断言。</div>
+  </div>
+</div>
+
+<div class="finding">
+  <h3>A-F4 · 公共 check 对 reversed labels raise Fail（形态不统一）<span class="badge b-fail">未修</span></h3>
+  <div class="kv">
+    <div class="k">复现命令</div><div><code>PYTHONPATH=. .venv/bin/python log/audit-df1/API/r5_reversed_labels_io.py</code>（PROBE 行）</div>
+    <div class="k">实际结果</div><div><code>view.check_constraints()</code> 对 reversed labels 在 <code>views.py:82</code> <code>raise invalid(...)</code>（内部异常外泄）；同方法对 <code>data_accessor=None</code> 返 <code>Err(ConstraintViolationError)</code>。IO 路径本身正确：<code>rank_save</code> 走 @catch 把 reversed labels 在 session 前正确拒为 <code>Err(InvalidArgumentError)</code> 不开 session。注意：现有测试把该 raise Fail 固化为「正确」——pin 行为不等于合规。</div>
+    <div class="k">影响</div><div>公共用户对同一方法需 try/except 与 Result 返回值双处理。</div>
+    <div class="k">建议</div><div>统一为返回 <code>Err</code> 分支；同步修正既有 pin 测试的预期。</div>
+  </div>
+</div>
+
+<div class="finding">
+  <h3>A-F5 · list 自身 check 不校验标签；Err 名误标 <span class="badge b-fail">未修</span></h3>
+  <div class="kv">
+    <div class="k">复现命令</div><div><code>PYTHONPATH=. .venv/bin/python log/audit-df1/API/r4_leader_labels.py</code>（PROBE）</div>
+    <div class="k">实际结果</div><div>重复 / 过短 / 空串三种坏标签的 <code>list.check_constraints()=Ok</code>；<code>PhysicalLayoutTable.check_constraints()</code> 兜住返 <code>Err(constraint_name='meshes_disjoint', msg='labels must be unique')</code>——名不符实。标签校验实际只在 <code>layout.py:_check_tensor_ids</code>，经 <code>list_cells</code> 触发。</div>
+    <div class="k">影响</div><div>独立 list 验收偏弱；错误分类名误导排障。</div>
+    <div class="k">建议</div><div>list 的公共 check 直接做标签唯一性/非空/顺序校验；并修正包装错误的 constraint_name。</div>
+  </div>
+</div>
+
+<div class="finding">
+  <h3>P2-D1 · 「设计文档与云原文字节一致」声明不实 <span class="badge b-fail">记录待更正</span></h3>
+  <div class="kv">
+    <div class="k">核验方式</div><div>只读对比：本地 <code>docs/DTensorsView-design.md</code>（109406 B，md5 <code>f3dc57cc…</code>）与本轮从云只读下载的 <code>log/audit-df1/cloud-DTensorsView-design.md</code>（109401 B，md5 <code>9e0155f…</code>）。</div>
+    <div class="k">实际结果</div><div>byte-equal = False；去除全部空白后仍不相等（stripped 74094 vs 74096 字符，差 2）。SequenceMatcher 定位到同一处代码示例：本地 <code>ok=new_ok()</code> 换行 <code>ok.set_value(3)</code>，云原文写作 <code>ok=new_ok();ok.set_value(3)</code> 同一行（err 同理）——即 2 处分号插入/换行折行差异。</div>
+    <div class="k">定性</div><div>语义等价的代码示例重排（分号/换行分隔），<b>未发现设计语义改动</b>；但「md5 字节一致/未改」的原始声明不实——属审计记录的文档准确性问题，按 P2 列出并更正表述。原文只读，未做任何修改。</div>
+    <div class="k">建议</div><div>审计记录更正为「差异仅为空白重排 + 等价分号/换行，无语义改动」；后续以云原文为设计基准时按 diff 而非 md5 一致性引用。</div>
+  </div>
+</div>
+
+<h2>4. 已通过场景范围矩阵（非全部 PASS）</h2>
+
+<h3>4.1 公共 API / 不变量 · 10 个独立 repro</h3>
+<table>
+  <thead><tr><th>脚本</th><th>场景</th><th>结果</th><th>对应 finding</th></tr></thead>
+  <tbody>
+    <tr><td><code>r1_namespace_mixin_sweep</code></td><td>命名空间/导出/工厂/get-set 访问器全扫</td><td><span class="badge b-ok">378 PASS / 0 FAIL</span></td><td>3 个脚本探针伪影已剔除（非缺陷）</td></tr>
+    <tr><td><code>r2_products_union</code></td><td>产品/联合类型约束</td><td><span class="badge b-fail">21 PASS / 1 FAIL · EXIT=1</span></td><td>A-F3（唯一 FAIL）</td></tr>
+    <tr><td><code>r3_error_fidelity</code></td><td>Error 分支保真 / 异常包装</td><td><span class="badge b-ok">全 PASS</span></td><td>—</td></tr>
+    <tr><td><code>r4_leader_labels</code></td><td>leader 与标签</td><td><span class="badge b-ok">全 PASS + PROBE</span></td><td>A-F5</td></tr>
+    <tr><td><code>r5_reversed_labels_io</code></td><td>反序标签往返</td><td><span class="badge b-ok">全 PASS + PROBE</span></td><td>A-F4</td></tr>
+    <tr><td><code>r5b_nonleader_key</code></td><td>非 leader file_paths 键</td><td><span class="badge b-ok">全 PASS + PROBE</span></td><td>A-F1</td></tr>
+    <tr><td><code>r6_equal_distinct_lists</code></td><td>等值不同 list</td><td><span class="badge b-fail">1 FAIL · EXIT=1，其余 PASS</span></td><td>A-F2</td></tr>
+    <tr><td><code>r7_per_rank_e2e_oracle</code></td><td>world=2 Shard(0) 字节级独立 oracle；缺 slot/截断负例</td><td><span class="badge b-ok">全 PASS</span></td><td>—（未触区保持零；不开 session）</td></tr>
+    <tr><td><code>r8_mutation_hash</code></td><td>可变引用 / ctor 拷贝 / dict hash 稳定</td><td><span class="badge b-ok">全 PASS</span></td><td>—</td></tr>
+    <tr><td><code>r9_chain_public</code></td><td>chain 公开路径 / stats 纯函数</td><td><span class="badge b-ok">全 PASS</span></td><td>—</td></tr>
+  </tbody>
+</table>
+<p class="small">口径：10 个 repro 中 2 个 EXIT=1（r2、r6）；其余脚本 PASS 但内含 PROBE 行钉住 A-F1/A-F4/A-F5，因此「不是全部 PASS」。</p>
+
+<h3>4.2 缓存 cache · 15 个用例（13 PASS / 1 边界 / 1 接线，无实证 bug）</h3>
+<table>
+  <thead><tr><th>用例组</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td>CA C=1 并发字节精确 / CB C=4 并发 / CD 同缓存重复通过 / CF 混合段故障隔离 / CG 随机 shape CRC×6 / CH 节点出入字节 / C07 两层缓存 / C10 慢回调节奏 / CC 缺席 peer 按 Shard 裁剪释放</td><td><span class="badge b-ok">13 PASS</span></td></tr>
+    <tr><td>R1 完整 cohort 故障恢复（gen 0→1，错误清除）；R-replicate 全消费者 ACK（填一次、全部 ack 后释放、dst 字节正确）</td><td><span class="badge b-ok">PASS（正向证据）</span></td></tr>
+    <tr><td>R2 部分 cohort 故障（peer 永不 join 时节点 cohort 不前进）</td><td><span class="badge b-design">设计边界 B1</span></td></tr>
+    <tr><td>等值不同 cache view 复用同一 buffer</td><td><span class="badge b-design">接线观察 B2</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.3 DCP · 18 行 pass-matrix（非全部通过）</h3>
+<table>
+  <thead><tr><th>场景</th><th>结果</th><th>注</th></tr></thead>
+  <tbody>
+    <tr><td>row_shard Shard(0) F32 get_file_offset pread</td><td><span class="badge b-ok">PASS</span></td><td>偏移 704/728，字节==owned</td></tr>
+    <tr><td>col_shard Shard(1) F32 get_file_offset pread</td><td><span class="badge b-fail">FAIL · P1-1</span></td><td>pread 跨进 peer 列；exit=0 但字节错</td></tr>
+    <tr><td>strided_3d (3,4,11) Shard(1) get_file_offset pread</td><td><span class="badge b-fail">FAIL · P1-1</span></td><td>间隙元素混入</td></tr>
+    <tr><td>多 dtype 往返 F32/I64/F16/BF16 字节精确</td><td><span class="badge b-ok">PASS</span></td><td>BF16 无 float32 扩宽</td></tr>
+    <tr><td>空 (0,5) / 复制单例 (1,) get_file_offset</td><td><span class="badge b-ok">PASS</span></td><td>空槽 InvalidArg；单例两 rank Ok</td></tr>
+    <tr><td>未知 tid / 未知 rank get_file_offset</td><td><span class="badge b-ok">PASS</span></td><td>Err（NotFound 分类）</td></tr>
+    <tr><td>各拓扑 rank_load round-trip</td><td><span class="badge b-ok">PASS</span></td><td>与 get_file_offset 路径无关</td></tr>
+    <tr><td>F1 payload 翻位（生产加载）/ F1b 深查</td><td><span class="badge b-design">CONF-1 设计确认</span></td><td>不 raise；独立 oracle 会抓到</td></tr>
+    <tr><td>F2 .metadata pickle 损坏 / F3 缺 <code>__0_0.distcp</code> / F5 改名 / F7 只读根发布</td><td><span class="badge b-ok">PASS（loud）</span></td><td>均包成 Err 抛出</td></tr>
+    <tr><td>F4 同根重复保存（staging 复用）</td><td><span class="badge b-ok">PASS</span></td><td><code>_clear_stage</code> 工作正常</td></tr>
+    <tr><td>包边界：<code>gdtensor/</code> import gdtensor_sim 或 torch</td><td><span class="badge b-ok">PASS</span></td><td>grep 无；方向 business→core</td></tr>
+    <tr><td>非测试入口 CLI distcp smoke</td><td><span class="badge b-fail">FAIL · P2-2</span></td><td>exit=1，sim.py:210 FileNotFoundError</td></tr>
+    <tr><td>非测试入口 CLI safetensors smoke</td><td><span class="badge b-ok">PASS</span></td><td>exit=0，load_bytes_verified=true</td></tr>
+  </tbody>
+</table>
+<p class="small">口径：18 行 = 13 PASS + 3 FAIL 行（col_shard、strided_3d 同属 P1-1；CLI distcp 为 P2-2）+ 2 行 CONF-1 设计确认。</p>
+
+<h2>5. 缓存观察分栏：实证 bug vs 接线/latent（明确分开）</h2>
+<div class="cols3">
+  <div class="col emptybug">
+    <h4>实证 bugs</h4>
+    <p style="margin:0;"><b>空。</b>公开 API 路径下本轮未复现任何数据损坏 / 早释放 / 泄漏；早前 F1「P1」已撤回为过度主张。</p>
+  </div>
+  <div class="col wire">
+    <h4>接线观察（wiring）· 非既定 P2</h4>
+    <p style="margin:0 0 6px;"><b>B2</b>：<code>WeakKeyDictionary</code>（<code>api.py:27</code>）按 <code>__eq__/__hash__</code> 键控，两个等值但不同的 CacheDTensorsView 共用一个 <code>_SlotTable</code>，第二个 view 的 <code>num_ranks_per_node</code>/<code>cap</code> 被忽略。实测 k=2 再 k=1 同 buffer：无错数据、无泄漏，仅 consumers 停留在 2。仅当调用方重建等值 view 却期望独立计数时才有风险。建议按 view 身份建表或复用断言参数一致。</p>
+    <p style="margin:0;"><b>B1（liveness 边界）</b>：部分 cohort 故障时，crash/缺席的 peer 使该节点 cohort 无限等待、不开新 gen——与 docstring 设计一致（同 cohort 晚到 rank 仍见节点级错误），属设计边界而非合同违反。<b>不</b>据此新增 ad-hoc TTL 或 cohort-abandon 路径，除非产品正式决策。</p>
+  </div>
+  <div class="col latent">
+    <h4>latent 观察 · 非既定 P2</h4>
+    <p style="margin:0 0 6px;"><b>L1</b>：<code>_covers</code>（<code>api.py:154</code>）要求单个 acked 区间覆盖 required 区间，互补碎片不会并集释放；公开 chain 几何不可达（fill/drain 按 rank 同裁剪，上层槽从不 set_expected），实测无泄漏。</p>
+    <p style="margin:0;"><b>L2</b>：两层缓存 <code>_recurse</code>（<code>api.py:736</code>）上层槽从未 set_expected，当前 rank 自己 ack 即释放；实测 src.read=8 无放大、无错数据。</p>
+  </div>
+</div>
+<p class="small">口径：PRIVATE snapshot / <code>_covers</code> latent 一律<b>不作为</b>既定 P2 立案；不通过本次审计为 API 新增 TTL 或新行为。</p>
+
+<h2>6. DCP payload CRC 位腐：设计确认，非 bug</h2>
+<div class="finding">
+  <h3>CONF-1 · 位腐静默加载是设计行为 <span class="badge b-design">非缺陷</span></h3>
+  <ul>
+    <li><b>设计依据</b>：README 明确「当前 IO 按 range 搬运字节，测试中的独立 oracle 执行数据校验」；设计文亦规定生产 IO 按 range 忠实搬字节，完整性是独立 oracle 的职责。</li>
+    <li><b>测试依据</b>：<code>tests/checkpoint/test_checkpoint_merge_crc.py</code> 先 <code>corrupt_distcp_payload</code>，断言独立 <code>verify_crc</code> 抛 AssertionError、读回值断言抛 AssertionError——<b>不断言</b>生产 <code>rank_load</code> 抛错；注释明示「repack must copy bytes faithfully」。</li>
+    <li><b>本轮自证</b>：在 704+4 翻一个字节（1.0 → 1.0000304），生产加载 raised=None，max_abs_diff=3.04e-5——与设计一致：生产成功、独立 oracle 抓到。<code>.metadata</code> 损坏则是 loud（unpickle 错误包成 GDTensorIOError），亦符合预期。</li>
+    <li><b>结论</b>：早前「P2-1 CRC 违反」重分类为覆盖注记。<b>不存在「生产必须拒绝位腐 payload」的承诺</b>；若产品未来要 load 侧防篡改，那是新需求而非 bug 修复。</li>
+  </ul>
+</div>
+
+<h2>7. 全量门禁终态与形式化 / CI / warnings 边界</h2>
+
+<h3>7.1 全量门禁终态（本轮真实跑出，非历史数字）</h3>
+<table>
+  <thead><tr><th>项</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td>运行脚本</td><td><code>scripts/full_check.sh</code>，EXIT 0；硬上限 1800s <b>未触</b>，墙钟 841s</td></tr>
+    <tr><td>5 阶段</td><td>fmt check → lint → type check（ty error-on-warning 通过）→ pyrefly 0 diag → byte-compile → 全量 pytest（torch rank 测试真实开启），全部 terminal passed</td></tr>
+    <tr><td>pytest footer</td><td><b>1359 passed, 877 warnings in 839.55s</b>（0 failed / 0 errors / 0 skipped）</td></tr>
+    <tr><td>torch 真实执行证据</td><td>日志中 37 个 distinct torch node id、Gloo init 日志在场、全日志 0 failed/0 error/0 skipped——证明 torch 测试是真跑而非收集后跳过；此为运行证据，非展开后的 torch 计数</td></tr>
+    <tr><td>warnings 校正分组</td><td>单进程 save UserWarning 437 + 单进程 load UserWarning 438 + 覆盖已存在 checkpoint 1 + 非可写 buffer frombuffer 1 = 877；DeprecationWarning 0、NumPy 相关 0；absl mac unsupported / Gloo hostname 日志不计入</td></tr>
+    <tr><td>warnings 处理口径</td><td><b>不按「零 warning」渲染、不把 877 当 benign 全忽略</b>。唯一带安全含义的是 <code>tests/sim/test_sim_runtime.py:150</code> 的 <code>got = _t.frombuffer(bytes(raw), dtype=bfloat16)</code> 非可写 buffer 警告——建议将 buffer <code>.copy()</code> 进可写 bytearray 后再转 tensor（保护数据），并新断言 byte-exact。本轮只读未改测试</td></tr>
+    <tr><td>git 自证</td><td>head/tree before=after = <code>df1db8c</code> / <code>3492c1aa</code>；tracked 源码/测试 diff 为 0；未跟踪项为本报告 <code>整体审计验证记录.html</code> 与 <code>artifacts/</code>（均为记录材料），故不泛称 worktree clean。GitHub main 回读同为 df1db8c（MATCH）；origin 内网镜像 <code>f33760a8</code> 非受审 tip，不作目标</td></tr>
+    <tr><td>门禁与 finding 的关系</td><td>1359 passed 是产品测试在契约层全绿；已实锤的 8 项未修 finding（见第 2/3 节）不在该套件覆盖内，门禁备注亦明确未在门禁范围内复验这些缺陷——<b>全绿不等于「已搞定」</b></td></tr>
+  </tbody>
+</table>
+
+<h3>7.2 形式化与 CI 覆盖边界</h3>
+<ul>
+  <li><b>Lean</b>：仅 ShardAlgebra（分片求和 / 相邻区间 / 地址映射）。</li>
+  <li><b>TLA</b>：CopyPlan 状态变量 layout/savePlan/saveDone/loadPlan/loadDone，AtomicPublish 状态变量 phase/visible/crashed；<b>11 个配置</b>（CopyPlan S=2,3 × N=1,2,3,5,6 共 10 + AtomicPublish 1）全部 No error found——注意是 11 个配置，非 11 个不同模型。</li>
+  <li><b>未覆盖</b>：新 <code>api.py:83-295</code> _NodeState（slot 容量上限、全消费者 ACK 释放、cohort 错误世代、活存阻塞）在形式模型中<b>无</b>对应。形式覆盖未完<b>不等于 bug</b>，但「整体验证」未覆盖该状态机（其正确性由独立 oracle 测试支撑）。</li>
+  <li><b>CI</b>：checks job 仅允许「could not import torch」类 skip，torch job 0 skip；<b>CI 不执行任何 formal 步骤</b>（Lean/TLA 仅本地门禁，存在漂移风险）。</li>
+  <li><b>mutation</b>：9/9 killed（original 串全库唯一命中、baseline 先过），但全部打 core；<b>零 gdtensor_sim 对抗</b>——无 slot-state 变异，也无 DCP fault-offset 变异（出 bug 的 <code>get_file_offset</code> 无 mutation 守护）。</li>
+  <li><b>NoTorch 导入阻断</b>：独立子进程 torch 物理阻断下，core <code>gdtensor{,io,builder,session,access,tag}</code> 与 <code>gdtensor_sim{,models,runner,sim}</code> 全部 import EXIT 0。</li>
+  <li><b>跨 repro 互证</b>：DCP P1-1 与 P2-2 经两路独立 repro 互证成立，不重复立案。</li>
+</ul>
+
+<h2>8. 输入日志索引（相对链接）</h2>
+<p class="small">以下链接按「最终报告置于仓库根目录」的相对路径书写，可直接点开核对原始输入：</p>
+<ul>
+  <li>API：<a href="log/audit-df1/API/findings.json">log/audit-df1/API/findings.json</a></li>
+  <li>DCP：<a href="log/audit-df1/dcp/findings.json">log/audit-df1/dcp/findings.json</a> · <a href="log/audit-df1/dcp/logs/col_shard.log">col_shard.log</a> · <a href="log/audit-df1/dcp/logs/cli_distcp.log">cli_distcp.log</a> · <a href="log/audit-df1/dcp/logs/corrupt_check.log">corrupt_check.log</a></li>
+  <li>cache：<a href="log/audit-df1/cache/artifacts/findings.json">log/audit-df1/cache/artifacts/findings.json</a> · <a href="log/audit-df1/cache/artifacts/case_matrix.json">case_matrix.json</a> · <a href="log/audit-df1/cache/artifacts/evidence_weakkey.txt">evidence_weakkey.txt</a> · <a href="log/audit-df1/cache/artifacts/evidence_epoch2.txt">evidence_epoch2.txt</a></li>
+  <li>分片 D 环境：<a href="log/audit-df1/findings-shardD.json">log/audit-df1/findings-shardD.json</a> · <a href="log/audit-df1/gates/summary.tsv">gates/summary.tsv</a></li>
+  <li>设计文：<a href="docs/DTensorsView-design.md">docs/DTensorsView-design.md</a>（本地 vendored） · <a href="log/audit-df1/cloud-DTensorsView-design.md">log/audit-df1/cloud-DTensorsView-design.md</a>（云只读下载） · <a href="README.md">README.md</a></li>
+  <li>NoTorch 导入阻断证据：<a href="log/audit-df1/no_torch_block_proof.log">log/audit-df1/no_torch_block_proof.log</a></li>
+  <li>全量门禁终态：<a href="log/audit-df1/full-final/result.json">log/audit-df1/full-final/result.json</a> · <a href="log/audit-df1/full-final/full-stdout.log">full-stdout.log</a>（footer：1359 passed, 877 warnings in 839.55s）</li>
+</ul>
+
+<p class="small" style="margin-top:28px;border-top:1px solid var(--line);padding-top:10px;">
+本报告核心结论独立完整，不依赖点开日志即可成立；日志链接仅供回读核对。源码与测试本轮只读未改。
+</p>
+
+</div>
+</body>
+</html>

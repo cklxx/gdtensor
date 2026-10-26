@@ -1,0 +1,3 @@
+# TLC replay traces written on invariant violation; never commit.
+SlotLifecycle_TTrace_*.bin
+SlotLifecycle_TTrace_*.tla
