@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "5ddec0b159b10fbb2a1eb2f0bcd4bbc4d5a7b89e8ccde983f0046aba083f4b3b"
+FROZEN_API_SHA256 = "d8f274eb6b22325e5173daedab5b77e4402ee3aa3e6a1072a72a413e5e5a8d07"
 
 
 def _production_manifest(root=ROOT):
@@ -130,12 +130,23 @@ MUTATIONS = [
         "tests/sim/test_audit_dcp_regressions.py::test_col_shard_get_file_offset_must_raise_invalidarg",
         "torch",
     ),
-    # Cache slot-state guards (cap live>=cap, ACK all(->any(, generation/epoch
-    # isolation) are intentionally NOT wired yet: the serial executor gives no
-    # fill contention, so cap/ACK mutations survive the observer suite; the
-    # threaded detector deadlocked. The epoch/generation mutation was proven
-    # KILLED separately. Resume here once a clean (non-deadlocking) detector
-    # exists. Do NOT fake-wire a mutation with no effective detector.
+    # File-backed C=1 and ACK detectors drive the public chain_load path.
+    # Capacity mutation permits an extra file allocation; ACK mutation forces
+    # a second disk fill of a slot that another consumer still needs.
+    (
+        "gdtensor/internal/api.py",
+        "        if block and self.live >= self.cap:\n            return None\n        self.slots[key] = self._new_slot()\n        self.live += 1\n        return True\n\n    def _begin_existing",
+        "        if False:\n            return None\n        self.slots[key] = self._new_slot()\n        self.live += 1\n        return True\n\n    def _begin_existing",
+        "tests/io/test_cache_mutation_detectors.py::test_cap_guard_allows_one_fill_for_replicate_cohort",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        '        done = all(\n            self._covers(slot["cov"].get(r, set()), iv) for r, iv in required.items()\n        )',
+        '        done = any(\n            self._covers(slot["cov"].get(r, set()), iv) for r, iv in required.items()\n        )',
+        "tests/io/test_cache_mutation_detectors.py::test_ack_releases_slot_only_after_every_cohort_member",
+        "notorch",
+    ),
 ]
 
 

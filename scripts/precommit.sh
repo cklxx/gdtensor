@@ -32,7 +32,7 @@ PY
 
 echo "[precommit] 5/5 API, IO contract, constraints and indentation"
 uv run --locked --extra torch-cpu python -m pytest -v --capture=tee-sys --log-cli-level=INFO -p no:cacheprovider \
-  tests/core tests/io tests/checkpoint/test_parallel_modes.py
+  tests/core tests/io tests/checkpoint/test_parallel_modes.py tests/sim/test_real_file_accessors.py
 
 # The basic path (fmt/lint/compile/imports/contract pytest) is self-contained.
 # The advanced formal gate is a separate opt-in step, independent of basic:

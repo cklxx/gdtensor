@@ -5,8 +5,11 @@ between the TLA+ model `SlotLifecycle.tla` and the implementation, plus the expl
 assumptions under which the model is claimed. The model is a *bounded projection*,
 not a proof of the whole Python.
 
-Pinned implementation: `gdtensor/internal/api.py` at
-`sha256 5ddec0b159b10fbb2a1eb2f0bcd4bbc4d5a7b89e8ccde983f0046aba083f4b3b` (904 lines).
+Pinned slot-runtime baseline: `gdtensor/internal/api.py` at
+`sha256 5ddec0b159b10fbb2a1eb2f0bcd4bbc4d5a7b89e8ccde983f0046aba083f4b3b`.
+The file-range fix retains source paths and slot boundaries in fill jobs;
+`_NodeState` transitions modeled here are unchanged. Current source hashes are
+recorded by `scripts/formal_gate.sh` in its generated manifest.
 
 ## Field map
 

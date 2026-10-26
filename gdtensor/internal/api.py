@@ -14,7 +14,7 @@ from .plan import (
     validate_rank_load,
     validate_rank_save,
 )
-from .ranges import CopyPlan, RangeFromComputeView, RangeFromStorageView
+from .ranges import CopyPlan, RangeFromComputeView
 from .result import catch, invalid, must_ok
 from .views import ComputeDTensorsView, StorageDTensorsView
 from .. import Result
@@ -603,18 +603,20 @@ def _register_fill_runs(reg, view, pairs, eff_src):
     runs = []
     for src_rng, cache_rng in pairs:
         so = src_rng.contiguous_payload_offset
-        if runs and runs[-1][1] == so:
+        path = src_rng.file_path
+        if runs and runs[-1][1] == so and runs[-1][3] == path:
             runs[-1][1] = so + src_rng.size
-            runs[-1][2].append((so, cache_rng))
+            runs[-1][2].append((src_rng, cache_rng))
         else:
-            runs.append([so, so + src_rng.size, [(so, cache_rng)]])
-    for src_start, src_end, sub in runs:
-        job = {
-            "eff_src": eff_src,
-            "rng": RangeFromStorageView("", src_start, src_end - src_start),
-        }
-        for src_off, cache_rng in sub:
-            _append_fill_cells(reg, view, job, src_start, src_off, cache_rng)
+            runs.append([so, so + src_rng.size, [(src_rng, cache_rng)], path])
+    for src_start, _src_end, sub, _path in runs:
+        # Retain each validated physical range. Adjacent payload offsets may
+        # belong to distinct slots, so a file accessor cannot read their union.
+        job = {"eff_src": eff_src, "ranges": [rng for rng, _ in sub]}
+        for src_rng, cache_rng in sub:
+            _append_fill_cells(
+                reg, view, job, src_start, src_rng.contiguous_payload_offset, cache_rng
+            )
 
 
 def _append_fill_cells(reg, view, job, src_start, src_off, cache_rng):
@@ -686,7 +688,8 @@ def _intersect_owned(nd, r, lo, hi):
 def _seg_job_data(seg):
     job = seg["job"]
     if "buffer" not in job:
-        job["buffer"] = _read(job["eff_src"].data_accessor, job["rng"])
+        accessor = job["eff_src"].data_accessor
+        job["buffer"] = b"".join(_read(accessor, rng) for rng in job["ranges"])
     return job["buffer"][seg["buf_off"] : seg["buf_off"] + seg["size"]]
 
 

@@ -415,7 +415,12 @@ def test_lawa_real_ranks(tmp_path, fmt, dim, reverse, world, tensor_count):
         flush=True,
     )
     print(f"[lawa] checkpoint directory={tmp_path}", flush=True)
-    deadline = time.monotonic() + 90
+    # Hosted GitHub runners are slower and more contended than the dedicated
+    # digest host; 32 spawn processes plus per-rank gloo checkpointing need a
+    # larger join budget there. A deadlocked rank still fails once the deadline
+    # passes, so this only removes a flaky false timeout, not the assertion.
+    budget = int(os.environ.get("GDTENSOR_LAWA_JOIN_SECONDS", "180"))
+    deadline = time.monotonic() + budget
     try:
         for proc in procs:
             proc.start()
@@ -425,7 +430,8 @@ def test_lawa_real_ranks(tmp_path, fmt, dim, reverse, world, tensor_count):
             p.name: p.read_text(errors="replace")[-8000:]
             for p in tmp_path.glob("rank*.log")
         }
-        assert all(proc.exitcode == 0 for proc in procs), logs
+        exits = {rank: proc.exitcode for rank, proc in enumerate(procs)}
+        assert all(code == 0 for code in exits.values()), {"exits": exits, "logs": logs}
         _check_saved_average(
             torch, tmp_path, fmt, _checkpoint_values(torch, tensor_count), world
         )

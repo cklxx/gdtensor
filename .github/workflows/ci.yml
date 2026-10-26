@@ -61,16 +61,23 @@ jobs:
           subprocess.run([sys.executable, "-c", code], check=True)
           print("core imports torch: no")
           PY
-      - name: "Behavioral mutations (no-torch: core API guards)"
+      - name: "Behavioral mutations (core API guards + cache cap/ACK)"
         if: matrix.python == '3.12'
-        run: uv run --locked python tests/mutation_check.py --group notorch
+        # The notorch detector set includes distcp detectors that import torch;
+        # install the locked CPU torch extra so no detector silently fails its
+        # baseline. The probe above still proves the core package itself never
+        # imports torch in a torch-free interpreter.
+        run: |
+          uv sync --locked --extra torch-cpu
+          uv run --locked --extra torch-cpu python tests/mutation_check.py --group notorch
 
   torch:
     name: Torch, types and LAWA (CPU)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       GDTENSOR_TORCH_TESTS: "1"
+      GDTENSOR_LAWA_JOIN_SECONDS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
