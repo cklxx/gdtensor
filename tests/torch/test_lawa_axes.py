@@ -242,8 +242,8 @@ def _average_once(torch, rank, root, label, src, dst, coords, stream, k, method)
     )
 
 
-def run_rank(torch, rank, root, label, src, dst, coords, stream):
-    for epoch in range(EPOCHS):
+def run_rank(torch, rank, root, label, src, dst, coords, stream, epochs, k_values):
+    for epoch in range(epochs):
         view = compute_view(torch, src, rank, epoch_values(epoch))
         _ok(
             gio.rank_save(
@@ -252,13 +252,13 @@ def run_rank(torch, rank, root, label, src, dst, coords, stream):
                 _storage(root / f"in{epoch}", src, "per_stage", coords["src"]),
             )
         )
-    _say(stream, rank, f"{label} saved {EPOCHS} checkpoints on source grid {src}")
-    for k in K_VALUES:
+    _say(stream, rank, f"{label} saved {epochs} checkpoints on source grid {src}")
+    for k in k_values:
         for method in ("naive", "welford"):
             _average_once(torch, rank, root, label, src, dst, coords, stream, k, method)
 
 
-def _worker(rank, init_file, root, label, src, dst, coords):
+def _worker(rank, init_file, root, label, src, dst, coords, epochs, k_values):
     import torch
     import torch.distributed as dist
 
@@ -277,7 +277,18 @@ def _worker(rank, init_file, root, label, src, dst, coords):
         timeout=timedelta(seconds=180),
     )
     try:
-        run_rank(torch, rank, Path(root), label, src, dst, coords, stream)
+        run_rank(
+            torch,
+            rank,
+            Path(root),
+            label,
+            src,
+            dst,
+            coords,
+            stream,
+            epochs,
+            k_values,
+        )
     finally:
         _destroy()
         log.close()
@@ -310,6 +321,20 @@ def check_files(root, dst, k, method):
 )
 @pytest.mark.parametrize("label,src,dst", LAWA_CASES, ids=[c[0] for c in LAWA_CASES])
 def test_lawa_four_axes_real_ranks(tmp_path, label, src, dst):
+    _run_case(tmp_path, label, src, dst, EPOCHS, K_VALUES, 240)
+
+
+@pytest.mark.parametrize(
+    "label,src,dst",
+    [("EP_TP", (1, 1, 2, 2), (1, 1, 2, 2))],
+    ids=["EP_TP_k10"],
+)
+def test_lawa_k10_four_axes_real_ranks(tmp_path, label, src, dst):
+    # N5: 10 checkpoints on a four-axis (EP x TP) grid.
+    _run_case(tmp_path, label, src, dst, 10, (1, 10), 300)
+
+
+def _run_case(tmp_path, label, src, dst, epochs, k_values, join_seconds):
     pytest.importorskip("torch")
     world = int(np.prod(src))
     assert world == int(np.prod(dst)), "one torch job serves both grids"
@@ -320,17 +345,27 @@ def test_lawa_four_axes_real_ranks(tmp_path, label, src, dst):
     }
     print(
         f"[lawa-axes] START {label} source={src} target={dst} world={world} "
-        f"tensors={len(axes.SPECS)} k={K_VALUES}",
+        f"tensors={len(axes.SPECS)} epochs={epochs} k={k_values}",
         flush=True,
     )
     procs = [
         ctx.Process(
             target=_worker,
-            args=(r, str(tmp_path / "pg"), str(tmp_path), label, src, dst, coords),
+            args=(
+                r,
+                str(tmp_path / "pg"),
+                str(tmp_path),
+                label,
+                src,
+                dst,
+                coords,
+                epochs,
+                k_values,
+            ),
         )
         for r in range(world)
     ]
-    deadline = time.monotonic() + 240
+    deadline = time.monotonic() + join_seconds
     try:
         for p in procs:
             p.start()
@@ -341,11 +376,10 @@ def test_lawa_four_axes_real_ranks(tmp_path, label, src, dst):
             for p in tmp_path.glob("rank*.log")
         }
         assert all(p.exitcode == 0 for p in procs), logs
-        crcs = [
-            check_files(tmp_path, dst, k, m)
-            for k in K_VALUES
-            for m in ("naive", "welford")
-        ][-1]
+        for k in k_values:
+            for m in ("naive", "welford"):
+                check_files(tmp_path, dst, k, m)
+        crcs = check_files(tmp_path, dst, k_values[-1], "naive")
         print(
             f"[lawa-axes] PASS {label} files decoded, every element once; "
             f"crc(expert0)={crcs[axes.SPECS[4][0]]:08x}",
