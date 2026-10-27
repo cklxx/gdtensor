@@ -5,9 +5,12 @@ import os
 import threading
 from pathlib import Path
 
+import numpy as np
+
 import gdtensor.access as ga
 import gdtensor.builder as gb
 import gdtensor.tag as gt
+from gdtensor import Result
 
 
 class FileCache(ga.DTensorDataAccessor):
@@ -179,3 +182,130 @@ def storage_schema(names, size=4):
         {gb.TensorComponentPos(names[0], 0): "model.safetensors"},
     )
     return gb.DTensorTable(dts), layout
+
+
+def _find_slot(
+    data: dict[str, dict[int, np.ndarray]], tid: str, offset: int, size: int
+) -> tuple[int, np.ndarray] | None:
+    for o, b in data[tid].items():
+        if o <= offset and offset + size <= o + len(b):
+            return o, b
+    return None
+
+
+class ResidentCache(ga.DTensorDataAccessor):
+    """Per-node cache allocator: regions live from write-done to matching-tid ack.
+
+    The test runner sets ``current_rank`` before each ``chain_load``; the
+    owner node is derived as ``rank // num_ranks_per_node``. Live regions are
+    keyed (node, tid, offset) — per-node, per-tensor, never shared.
+    ``peak_by_node[node]`` is that node's max simultaneously-resident bytes.
+    """
+
+    def __init__(self, events: list, num_ranks_per_node: int, name: str = "cache"):
+        self.data: dict[str, dict[int, np.ndarray]] = {}
+        self.events = events
+        self.name = name
+        self.num_ranks_per_node = num_ranks_per_node
+        self._tl = threading.local()
+        self._tl.rank = 0
+        self.live: list[tuple[int, str, int, int]] = []  # (node, tid, off, size)
+        self.peak_by_node: dict[int, int] = {}
+        self._lock = threading.Lock()
+        self._acked: dict[
+            tuple, dict[int, set]
+        ] = {}  # (node,tid,base) -> {rank: covered offsets}
+        self.expected_reads: dict[
+            tuple, dict[int, range]
+        ] = {}  # caller-declared per-rank required coverage
+        self._read_calls = 0
+        self.barriers: dict = {}  # rank -> Event; empty = no read block
+
+    @property
+    def current_rank(self) -> int:
+        return getattr(self._tl, "rank", 0)
+
+    @current_rank.setter
+    def current_rank(self, rank: int) -> None:
+        self._tl.rank = rank
+
+    @property
+    def node(self) -> int:
+        return self.current_rank // self.num_ranks_per_node
+
+    def _snapshot(self):
+        for node in {n for n, _t, _o, _s in self.live}:
+            total = sum(sz for n, _t, _o, sz in self.live if n == node)
+            self.peak_by_node[node] = max(self.peak_by_node.get(node, 0), total)
+
+    def write_from_buffer(self, global_range, write_from_buffer) -> Result[None]:
+        rng = global_range
+        callback = write_from_buffer
+        tid = getattr(rng, "global_tensor_id", "") or "?"
+        offset = getattr(rng, "global_tensor_offset", None)
+        if offset is None:
+            offset = rng.contiguous_payload_offset
+        size = rng.size
+        buf = np.zeros(size, dtype=np.uint8)
+        self.events.append((self.name, "write", tid, offset, size))
+        res = callback(buf.ctypes.data, buf.nbytes)
+        with self._lock:
+            self.data.setdefault(tid, {})[offset] = buf
+            self.live.append((self.node, tid, offset, size))
+            self._snapshot()
+        return res
+
+    def _release(self, node, tid, offset, size):
+        entry = (node, tid, offset, size)
+        with self._lock:
+            self.live = [e for e in self.live if e != entry]
+
+    def _no_slot_err(self, tid, offset, size):
+        return gb.Err(
+            gb.GDTensorIOError(
+                operation="internal",
+                msg=f"no slot covers {tid}@{offset}+{size}",
+            )
+        )
+
+    def _locked_read(
+        self, tid: str, offset: int, size: int
+    ) -> tuple[int, np.ndarray, np.ndarray] | tuple[None, None, None]:
+        with self._lock:
+            found = _find_slot(self.data, tid, offset, size)
+        if found is None:
+            return None, None, None
+        base_off, buf = found
+        view = buf[offset - base_off : offset - base_off + size]
+        return base_off, buf, view
+
+    def read_to_buffer(self, global_range, read_to_buffer) -> Result[None]:
+        rng = global_range
+        callback = read_to_buffer
+        tid = getattr(rng, "global_tensor_id", "") or "?"
+        offset = getattr(rng, "global_tensor_offset", None)
+        if offset is None:
+            offset = rng.contiguous_payload_offset
+        size = rng.size
+        # Per-rank read barrier (cohort delay).
+        if self.current_rank in self.barriers:
+            self.barriers[self.current_rank].wait()
+        self._read_calls += 1
+        base_off, buf, view = self._locked_read(tid, offset, size)
+        if view is None:
+            return self._no_slot_err(tid, offset, size)
+        assert buf is not None and base_off is not None
+        self.events.append((self.name, "read", tid, offset, size))
+        res = callback(view.ctypes.data, view.nbytes)
+        # ACK per-rank required coverage; release only when ALL declared ranks full.
+        key = (self.node, tid, base_off)
+        cov = self._acked.setdefault(key, {})
+        rank_cov = cov.setdefault(self.current_rank, set())
+        rank_cov.update(range(offset, offset + size))
+        expected = self.expected_reads.get(
+            key, {self.current_rank: range(base_off, base_off + len(buf))}
+        )
+        all_done = all(set(expected[r]).issubset(cov.get(r, set())) for r in expected)
+        if all_done:
+            self._release(self.node, tid, base_off, len(buf))
+        return res
