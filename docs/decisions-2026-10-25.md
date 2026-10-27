@@ -10,6 +10,8 @@
 
 ## 待决（不记 pass）
 
+2026-10-27 复核：第 1、2 条的实测值、文档冲突和待定项记录在 `docs/decisions-2026-10-27.md`。
+
 1. **concurrency C 跨 step 实际峰值口径**：§3.4（temporal/concurrency 分片、非副本）与 §5.8（多槽多占一份）存在张力。最终验收以真实 allocator peak 与 accessor 实际 bytes 为准。
 2. **bounded C cache pipeline**：两次实现尝试失败后回退 serial（world4/k2 fill node box off 0:4、rank0 drain 0:2、rank1 drain 2:4，需 node 级 slot state across calls），当前未实现。
 3. **Mixed shared source**：begin1/finish1 同源 identity group 尚无合法 test 验证。

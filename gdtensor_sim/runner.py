@@ -1,8 +1,8 @@
 """Multi-rank runner: one thread (or forked process) per rank.
 
-Threads share one ComputeFabric (device memory of all ranks), so
-compute->compute reshard works. Processes give real OS-level concurrency for
-pwrite; they support save and load only.
+Threads share one ComputeFabric (device memory of all ranks), so a simulated
+collective can read another rank's shard. Processes give real OS-level
+concurrency for pwrite; they support save and load only.
 """
 
 from __future__ import annotations

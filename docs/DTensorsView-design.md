@@ -638,7 +638,9 @@ d_tensors_view_rank_plan_save =
 # Internal key function behind d_tensors_view_rank_chain_load. It returns one
 # CopyPlanChain, isomorphic to the read chain: one CopyPlan per leg, in
 # data-flow order. The tensor/meta precondition is checked per leg, and the
-# plan-less executor stays thin.
+# plan-less executor stays thin. The Assert resolves each tensor id to its row
+# with tensor_order_value_of; tensor_id is never used as a subscript of
+# named_d_tensors (see 5.2).
 d_tensors_view_rank_plan_chain_load =
     Result[CopyPlanChain]
   <- $rank int
@@ -647,8 +649,8 @@ d_tensors_view_rank_plan_chain_load =
     forall leg in legs_of(read_chain):
       leg.src.tensor_ids == leg.dst.tensor_ids
       and forall tensor_id in leg.src.tensor_ids:
-        global_tensor_meta_of(leg.src.d_tensor_table.named_d_tensors[tensor_id])
-        == global_tensor_meta_of(leg.dst.d_tensor_table.named_d_tensors[tensor_id])
+        global_tensor_meta_of(leg.src.d_tensor_table.named_d_tensors[tensor_order_value_of(leg.src.d_tensor_table, tensor_id)])
+        == global_tensor_meta_of(leg.dst.d_tensor_table.named_d_tensors[tensor_order_value_of(leg.dst.d_tensor_table, tensor_id)])
   }]
 ```
 

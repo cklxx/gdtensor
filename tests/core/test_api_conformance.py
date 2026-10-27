@@ -231,6 +231,23 @@ def test_internal_plan_and_check_declarations_match_design_without_importing_the
         assert ast.unparse(node.returns) == result.replace("void", "None")
 
 
+def test_read_chain_assert_indexes_tensor_rows_by_order_not_by_id():
+    design = (ROOT / "docs" / "DTensorsView-design.md").read_text()
+    section = design[design.index("#### B.1.2 Plan APIs") : design.index("#### B.1.4")]
+    assert "named_d_tensors[tensor_id]" not in section
+    assert section.count("tensor_order_value_of(") >= 2
+
+
+def test_readme_io_row_matches_io_exports():
+    import gdtensor.io as gio
+
+    readme = (ROOT / "README.md").read_text()
+    row = re.search(r"^\| `gdtensor\.io` \| (.+) \|$", readme, re.MULTILINE)
+    assert row is not None
+    assert set(re.findall(r"`([^`]+)`", row.group(1))) == set(gio.__all__)
+    assert "rank_reshard" not in readme
+
+
 def test_type_aliases_and_namespace_separation():
     for name in (
         "DTensorsView",
