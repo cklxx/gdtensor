@@ -17,19 +17,20 @@
 #       TLA2TOOLS_JAR="$(scripts/get_tla_tools.sh)" bash formal/tla/run_tlc.sh
 #
 # Pin provenance: official tlaplus/tlaplus GitHub release v1.8.0 asset
-#   tla2tools.jar  -> TLC2 2026.10.24.013619 (rev 2ef2af8)
-# Re-pin by bumping TLA2TOOLS_VERSION and TLA2TOOLS_SHA256 together (download the
-# new release asset first and record its shasum -a 256).
+#   tla2tools.jar -> replacement published 2026-10-26T23:14:30Z.
+# The upstream v1.8.0 asset was replaced in place. This SHA matches the
+# official GitHub release asset digest, verified on 2026-10-27.
+# Re-pin only after verifying the official asset and its digest.
 set -euo pipefail
 
 TLA2TOOLS_VERSION="v1.8.0"
 TLA2TOOLS_URL="https://github.com/tlaplus/tlaplus/releases/download/${TLA2TOOLS_VERSION}/tla2tools.jar"
-TLA2TOOLS_SHA256="d15655eeaff4b3f7b3d65c46b838bc0f35d131b2ef4b1e473689b62c98d4726f"
+TLA2TOOLS_SHA256="78f7e2c6bf9a8b65eda665a23e94431255587e0b43a834a4e2af1723562d9b4a"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 CACHE_DIR="$ROOT/log/tools"
-JAR="$CACHE_DIR/tla2tools-${TLA2TOOLS_VERSION}.jar"
+JAR="$CACHE_DIR/tla2tools-${TLA2TOOLS_VERSION}-${TLA2TOOLS_SHA256:0:12}.jar"
 
 if ! command -v java >/dev/null 2>&1; then
   echo "ERROR: a JRE/JDK (java) is required to run the pinned TLC jar" >&2

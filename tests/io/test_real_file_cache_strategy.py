@@ -20,6 +20,7 @@ from __future__ import annotations
 import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
 
 import numpy as np
 import pytest
@@ -28,6 +29,7 @@ import gdtensor.access as ga
 import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
+from gdtensor import Result
 from gdtensor_sim.formats import make_storage_view
 from gdtensor_sim.iobackend import FileIO
 from tests.support.cache_oracle import ResidentCache, storage_schema
@@ -61,16 +63,20 @@ class ReplicateComputeMemory(ga.DTensorDataAccessor):
     def current_rank(self, rank: int) -> None:
         self._tl.rank = rank
 
-    def write_from_buffer(self, global_range, callback):
+    def write_from_buffer(
+        self, global_range, write_from_buffer: Callable[[int, int], Result[None]]
+    ) -> Result[None]:
         rng = global_range
         data = np.zeros(rng.size, dtype=np.uint8)
-        res = callback(data.ctypes.data, data.nbytes)
+        res = write_from_buffer(data.ctypes.data, data.nbytes)
         if type(res) is gb.Ok:
             buf = self.buffers[self.current_rank]
             buf[rng.global_tensor_offset : rng.global_tensor_offset + rng.size] = data
         return res
 
-    def read_to_buffer(self, global_range, callback):
+    def read_to_buffer(
+        self, global_range, read_to_buffer: Callable[[int, int], Result[None]]
+    ) -> Result[None]:
         raise AssertionError("compute dst must not be read during load")
 
 
@@ -268,7 +274,7 @@ def test_safetensors_direct_vs_cached_source_reads(tmp_path):
     assert cached_bytes < direct_bytes
 
 
-def test_dcp_session_open_full_reads_per_rank(tmp_path):
+def test_dcp_session_open_full_reads_per_rank(tmp_path, monkeypatch):
     st, layout, _path = _save_real(tmp_path, "distcp")
     sv, io = _load_view(tmp_path, st, layout, "distcp")
     dst_mem, cv = _compute_dst()
@@ -284,14 +290,11 @@ def test_dcp_session_open_full_reads_per_rank(tmp_path):
     calls = {"n": 0}
     orig = dcp_backend._real_dcp_load
 
-    def counting_load(table, root):
+    def counting_load(table: gb.DTensorTable, root: str) -> dict[str, object]:
         calls["n"] += 1
         return orig(table, root)
 
-    dcp_backend._real_dcp_load = counting_load
-    try:
-        _run_concurrent(chain, dst_mem, cache_mem)
-    finally:
-        dcp_backend._real_dcp_load = orig
+    monkeypatch.setattr(dcp_backend, "_real_dcp_load", counting_load)
+    _run_concurrent(chain, dst_mem, cache_mem)
     assert calls["n"] == WORLD  # full load per rank, not deduped by the cache
     _assert_delivery(dst_mem)

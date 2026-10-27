@@ -43,9 +43,11 @@ jobs:
       - name: Compile
         run: uv run --locked python -m compileall -q gdtensor gdtensor_sim tests
       - name: Pure core + IO tests (no torch; zero skip)
+        # Real DCP cache cases run in the torch job, with the same zero-skip gate.
         run: |
           set -euo pipefail
-          uv run --locked pytest -v -p no:cacheprovider tests/core tests/io -rs | tee no_torch.txt
+          uv run --locked pytest -v -p no:cacheprovider tests/core tests/io \
+            --ignore=tests/io/test_real_file_cache_strategy.py -rs | tee no_torch.txt
           bad="$(grep '^SKIPPED' no_torch.txt || true)"
           if [ -n "$bad" ]; then
             echo "Unexpected skips in pure no-torch job:" >&2
@@ -95,7 +97,8 @@ jobs:
         run: |
           set -euo pipefail
           uv run --locked --extra torch-cpu pytest -v -s -p no:cacheprovider \
-            tests/torch tests/sim tests/checkpoint tests/demo -rs | tee torch.txt
+            tests/torch tests/sim tests/checkpoint tests/demo \
+            tests/io/test_real_file_cache_strategy.py -rs | tee torch.txt
           if grep -q '^SKIPPED' torch.txt; then
             echo "Unexpected skips in torch job (must be zero):" >&2
             grep '^SKIPPED' torch.txt >&2
