@@ -9,8 +9,11 @@ with global row offsets 0 and 3. Load reads back the real per-rank global slice.
 import multiprocessing as mp
 import os
 import pickle
+import sys
+import time
 from datetime import timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pytest
@@ -62,19 +65,93 @@ def _worker(rank, init_file, root, op):
         _destroy()
 
 
-def _spawn(root, op):
-    init_file = Path(root) / "init"
-    init_file.touch()
-    ctx = mp.get_context("spawn")
-    procs = [
-        ctx.Process(target=_worker, args=(r, str(init_file), str(root), op))
-        for r in range(2)
-    ]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join(180)
-    assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
+def _wait_workers(procs, op, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while any(p.is_alive() for p in procs):
+        codes = [p.exitcode for p in procs]
+        assert all(code in (None, 0) for code in codes), f"{op}: worker failed: {codes}"
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f"{op}: worker timeout: {codes}"
+        for p in procs:
+            p.join(min(0.05, remaining))
+    codes = [p.exitcode for p in procs]
+    assert all(code == 0 for code in codes), f"{op}: worker failed: {codes}"
+
+
+def _stop_workers(procs):
+    started = [p for p in procs if p.pid is not None]
+    for p in started:
+        if p.is_alive():
+            p.terminate()
+    for p in started:
+        p.join(5)
+        if p.is_alive():
+            p.kill()
+            p.join(5)
+        assert not p.is_alive(), f"worker {p.pid} survived cleanup"
+
+
+def _run_workers(procs, op, timeout_seconds):
+    try:
+        for p in procs:
+            p.start()
+        _wait_workers(procs, op, timeout_seconds)
+    finally:
+        _stop_workers(procs)
+
+
+def _spawn(root, op, timeout_seconds=180):
+    # FileStore requires a fresh path for every process-group lifetime.
+    # Keep rendezvous state outside checkpoint data; reap workers before removal.
+    with TemporaryDirectory(prefix="dcp-rendezvous-", dir=Path(root).parent) as tmp:
+        init_file = Path(tmp) / "init"
+        ctx = mp.get_context("spawn")
+        procs = [
+            ctx.Process(target=_worker, args=(r, str(init_file), str(root), op))
+            for r in range(2)
+        ]
+        _run_workers(procs, op, timeout_seconds)
+
+
+def _record_rendezvous(rank, init_file, root, op):
+    if rank == 0:
+        path = Path(init_file)
+        assert not path.exists(), "reused rendezvous state"
+        path.write_bytes(b"stale FileStore state")
+        (Path(root) / f"{op}.txt").write_text(init_file)
+
+
+def _failing_worker(rank, init_file, root, op):
+    if rank == 1:
+        raise RuntimeError("injected worker failure")
+    time.sleep(60)
+
+
+def _hanging_worker(rank, init_file, root, op):
+    time.sleep(60)
+
+
+def test_spawn_uses_fresh_rendezvous_and_removes_stale_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_worker", _record_rendezvous)
+    root = tmp_path / "ckpt"
+    root.mkdir()
+    for op in ("save", "load", "load_again"):
+        _spawn(root, op)
+    paths = [(root / f"{op}.txt").read_text() for op in ("save", "load", "load_again")]
+    assert len(set(paths)) == 3
+    assert all(not Path(path).parent.exists() for path in paths)
+
+
+@pytest.mark.parametrize("fault", ["failure", "timeout"])
+def test_spawn_reaps_workers_on_failure_or_timeout(tmp_path, monkeypatch, fault):
+    target = _failing_worker if fault == "failure" else _hanging_worker
+    monkeypatch.setattr(sys.modules[__name__], "_worker", target)
+    before = {p.pid for p in mp.active_children()}
+    message = "worker failed" if fault == "failure" else "worker timeout"
+    with pytest.raises(AssertionError, match=message):
+        _spawn(tmp_path, fault, timeout_seconds=30 if fault == "failure" else 3)
+    assert {p.pid for p in mp.active_children()} <= before
+    assert not list(tmp_path.parent.glob("dcp-rendezvous-*"))
 
 
 @pytest.mark.skipif(
