@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "d8f274eb6b22325e5173daedab5b77e4402ee3aa3e6a1072a72a413e5e5a8d07"
+FROZEN_API_SHA256 = "b7ca29ea499730c15c1a236e9e490ed5e7fa755bfd0efd553297266f68ccabad"
 
 
 def _production_manifest(root=ROOT):

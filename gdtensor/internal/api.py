@@ -491,19 +491,18 @@ def _run_one_concrete(rank, node, chain, pc, legs, consumers) -> None:
 
 
 def _cache_live_limit(cache_view) -> int:
-    """Bounded in-flight slot count C, derived from the cache mesh's concurrency
-    width axis (internal scheduling bound, no public API)."""
-    try:
-        mesh = cache_view.d_tensor_table.named_d_tensors[0].d_tensor.mesh
-        dims = getattr(getattr(mesh, "concurrency", None), "dims", [])
-        width = next(
-            (getattr(d, "value", None) or getattr(d, "width", None) for d in dims), None
-        )
-        if width:
-            return int(width)
-    except Exception:
-        pass
-    return 1
+    """Bounded in-flight slot count C for a cache view.
+
+    The concurrency width is read via the same mesh helper used by the stats
+    path (``cache_concurrency_width``); it unwraps PermutedMesh and validates
+    the ConcurrencyWidth tag. A malformed cache mesh is a programming error and
+    must surface, not silently degrade to a single buffer (which would make a
+    declared double buffer behave as serial fills).
+    """
+    from .mesh import cache_concurrency_width
+
+    mesh = cache_view.d_tensor_table.named_d_tensors[0].d_tensor.mesh
+    return cache_concurrency_width(mesh)
 
 
 def _split_step(off: int, size: int, step: int):

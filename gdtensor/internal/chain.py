@@ -511,15 +511,16 @@ def _view_node_ids(view):
     return None
 
 
-def _tensor_resident_bytes(nd, node: int, k: int, drain_view) -> int:
+def _tensor_resident_bytes(nd, node: int, k: int, terminal_dst) -> int:
     """Peak resident bytes of one tensor's cache on ``node``.
 
     Each tensor has its own backing region. Temporal reuse serialises steps (a
     step drains before the next fills); the C slots of one step are live
-    together. Which step the node stages is fixed by the ranks that live on it:
-    the node's cache only holds the step box intersecting those ranks' wanted
-    share. Peak = max over steps of (box on this node at that step intersected
-    with the node's ranks' want), in bytes.
+    together. A cache layer is filled only for the ranges consumed by the ranks
+    of the node that owns it; whether the next hop is another cache or the final
+    compute mesh does not change that demand (every cache layer on the node
+    serves the same rank block). Peak = max over steps of the union of this
+    tensor's C step/slot cells intersected with that demand, in bytes.
     """
     naive = naive_of(nd)
     mesh = naive.mesh
@@ -530,28 +531,22 @@ def _tensor_resident_bytes(nd, node: int, k: int, drain_view) -> int:
     isz = naive.global_tensor_meta.itemsize
     n_index = sorted(cache_node_set(mesh)).index(node)
     tid = nd.global_tensor_id
-    drain_nd = named_of(drain_view.d_tensor_table, tid)
+    drain_nd = named_of(terminal_dst.d_tensor_table, tid)
     wants = [
         owned_intervals(drain_nd, "compute", r) for r in range(node * k, (node + 1) * k)
     ]
     want_node = iv_normalize(np.concatenate(wants)) if wants else EMPTY
 
-    def _ranges(iv):
-        out = set()
-        for a, b in iv:
-            out.update(range(a, b))
-        return out
-
     def step_live(s: int) -> int:
         # Real box_of cell (temporal x concurrency shards on dim0; spatial
-        # Replicate does not split). Slots serialise across a node, so peak
-        # resident per tensor is one such cell (times itemsize).
-        union = set()
+        # Replicate does not split). The C cells of one step are the declared
+        # in-flight slots and may overlap under pipelining; union the intervals.
+        union = EMPTY
         for c in range(C):
             lo, hi = box_of(naive, (S, N, C), (s, n_index, c))
             iv = iv_intersect(box_to_intervals(shape, lo, hi), want_node)
-            union.update(_ranges(iv))
-        return len(union) * isz
+            union = iv_normalize(np.concatenate((union, iv)))
+        return iv_total(union) * isz
 
     return max((step_live(s) for s in range(S)), default=0)
 
@@ -620,18 +615,17 @@ def get_stat_inbound_traffic_of_chain_load(read_chain: DTensorsReadChain) -> Lis
 
 
 def _stat_overhead(chain) -> List[int]:
-    """Per-node resident cache bytes.
+    """Per-node resident cache bytes summed over independent cache layers.
 
-    Each tensor owns a distinct backing region. A cache node only stages the step
-    boxes intersecting the ranks that live on it (spatial Replicate gives every
-    node a copy, but each node serves its own rank block — not every node runs
-    every rank's share). Resident per node = sum over tensors of that tensor's
-    per-step peak on the node, taking the node's ranks' want as the intersect.
+    Every leg that lands on a ``CacheDTensorsView`` fills one cache layer. A
+    cache layer is always filled for the ranks on the node that drains it, so
+    demand is taken from the chain's terminal compute view regardless of
+    whether the immediate next hop is another cache. Each cache layer has its
+    own backing region; independent layers on the same node add. Within one
+    layer the executor serialises tensors and temporal steps, so that layer's
+    resident peak is the largest tensor/step contribution.
     """
-    drain_dst: dict = {}
-    for src, dst in legs_of(chain):
-        if type(src) is CacheDTensorsView:
-            drain_dst[src] = dst
+    terminal_dst = chain.dst
     k = getattr(chain, "num_ranks_per_node", 1)
     acc: dict = {}
     for src, dst in legs_of(chain):
@@ -639,16 +633,15 @@ def _stat_overhead(chain) -> List[int]:
         if nodes is None:
             continue
         cache_view = cast(CacheDTensorsView, dst)
-        drain_view = drain_dst.get(cache_view, dst)
         for node in nodes:
             resident = max(
                 (
-                    _tensor_resident_bytes(nd, node, k, drain_view)
+                    _tensor_resident_bytes(nd, node, k, terminal_dst)
                     for nd in cache_view.d_tensor_table.named_d_tensors
                 ),
                 default=0,
             )
-            acc[node] = max(acc.get(node, 0), resident)
+            acc[node] = acc.get(node, 0) + resident
     n = (max(acc) + 1) if acc else 0
     return [acc.get(i, 0) for i in range(n)]
 
