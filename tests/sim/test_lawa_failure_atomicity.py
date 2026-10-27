@@ -1,20 +1,21 @@
-"""E2: a failed LAWA mean save is atomic and safely rerunnable.
+"""E2: a failed LAWA mean save is atomic at the checkpoint level and rerunnable.
 
-Uses the real safetensors save session (gdtensor_sim.formats) and the same
-fault injection as test_sim_formats.py: fsync of the mean shard file fails
-on one fd. The LAWA mean is a brand-new checkpoint; the k input versions
-must never be overwritten. Contract:
+Uses the real safetensors save session (gdtensor_sim.formats). Visibility is
+gated by a single completion marker published by one writer after every
+shard rename; load refuses a directory without a matching marker. The LAWA
+mean is a brand-new checkpoint and must never overwrite its inputs.
 
-1. every rank returns an IO error;
-2. the failing leader's shard is never published (its final file is absent);
+Contract:
+1. every rank returns an IO error when the faulted shard cannot publish;
+2. the failed directory is invisible: a subsequent rank_load fails (no
+   completion marker), even though some peer shards were already renamed;
 3. the k input directories stay byte-for-byte unchanged;
-4. after the fault clears, rerunning the mean save succeeds and independently
-   decodes to the dense mean.
+4. after the fault clears, rerunning the mean save publishes the marker,
+   rank_load succeeds, and verify_crc passes.
 
 On a failed vote the session enters the "commit unknown" state and keeps
-other ranks' already-published payloads rather than deleting them; this is
-the snapshot protocol ("result unknown keeps payload"). The atomic unit
-asserted here is therefore the faulted shard, not every peer shard.
+already-published peer payloads rather than deleting them; checkpoint-level
+atomicity is provided by the marker gate, not by rolling peer shards back.
 """
 
 import os
@@ -25,7 +26,7 @@ import numpy as np
 import gdtensor.builder as gb
 import gdtensor.io as gio
 from gdtensor_sim.coord import ThreadCoordinator
-from gdtensor_sim.formats import make_storage_view
+from gdtensor_sim.formats import COMMIT_MARKER_NAME, make_storage_view
 from gdtensor_sim.models import ParallelConfig, layout_builder, storage_table
 from tests.support.checkpoint import file_bytes
 from tests.support.oracle import ArrayFabric
@@ -85,7 +86,7 @@ def test_lawa_mean_save_failure_is_atomic(tmp_path, monkeypatch):
 
     real_fsync = os.fsync
     staging = mean_root / "__0_0.safetensors.tmp"
-    final_shard = mean_root / "__0_0.safetensors"
+    marker = mean_root / COMMIT_MARKER_NAME
 
     def fail_mean_fsync(fd):
         if staging.exists() and os.fstat(fd).st_ino == staging.stat().st_ino:
@@ -101,14 +102,26 @@ def test_lawa_mean_save_failure_is_atomic(tmp_path, monkeypatch):
         )
     assert all(type(r) is gb.Err for r in results), results
 
-    # The faulted leader shard must never reach its final published name. Its
-    # staging file may linger; peer shards are kept by the unknown-state rule.
-    assert not final_shard.exists(), final_shard
+    # Checkpoint-level atomicity: no marker, so the directory is unloadable.
+    assert not marker.exists(), marker
+    # The faulted shard never reached its final name.
+    assert not (mean_root / "__0_0.safetensors").exists()
+    # A real rank_load against the half-published directory must be rejected.
+    probe = ArrayFabric(ct, points)
+    read_view = _storage(mean_root, ct, False)
+    load_result = gio.rank_load(0, probe.view(0), read_view)
+    assert type(load_result) is gb.Err, load_result
+    # Inputs are untouched.
     for version in range(2):
         assert file_bytes(tmp_path / f"input{version}") == fingerprints[version], (
             version
         )
 
+    # Clear the fault and rerun: marker appears, load + CRC verify pass.
     monkeypatch.undo()
     _save(mean_root, ct, points, mean_values)
+    assert marker.exists(), marker
     verify_crc(mean_root, "safetensors", ct, SRC, "mirror", mean_values)
+    reloaded = ArrayFabric(ct, points)
+    rerun = gio.rank_load(0, reloaded.view(0), _storage(mean_root, ct, False))
+    assert type(rerun) is gb.Ok, rerun

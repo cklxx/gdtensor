@@ -9,7 +9,9 @@ Coordination model (one session per rank, all ranks share one root dir):
   writes the header. Header bytes are a pure function of
   (DTensorTable, PhysicalLayoutTable), so any rank computes the same bytes.
 * commit (after a barrier): the leader rank of each file publishes it.
-  Other ranks only close.
+  Other ranks only close. After all shards are published, a single writer
+  atomically publishes a completion marker; the directory is not loadable
+  until that marker exists (checkpoint-level atomicity).
 
 safetensors file = 8-byte LE header length N | JSON header (space-padded to
 8 bytes) | payload. Tensor entries:
@@ -50,6 +52,10 @@ from .iobackend import FileIO
 from gdtensor.session import StorageLoadSession, StorageSaveSession
 
 HF_INDEX_NAME = "model.safetensors.index.json"
+# Single completion marker for a safetensors checkpoint directory. Readers
+# (SafeTensorsLoadSession) refuse to open the directory until this file is
+# atomically published, so shards renamed ahead of the marker are invisible.
+COMMIT_MARKER_NAME = ".gdtensor_committed"
 
 
 # ------------------------------------------------------------------ headers
@@ -294,11 +300,24 @@ class SafeTensorsSaveSession(SaveSessionBase):
             os.replace(tmp, final)
 
     def _after_barrier(self) -> None:
-        """HF directory: the lowest leader writes model.safetensors.index.json
-        when there are several files and every entry is a whole tensor."""
+        """Single-writer publication point.
+
+        Every shard leader has already renamed its temp file. The lowest
+        leader alone publishes the completion artifacts: the optional HF
+        index, then the commit marker. The marker is the only visibility
+        gate; load refuses the directory until it exists, so a crash or a
+        failed vote between shard rename and marker publish leaves an
+        invisible, rerunnable checkpoint (commit-unknown keeps payloads).
+        """
         leaders = sorted(fp.leader.rank for fp in self.index.files.values())
-        if len(self.index.files) < 2 or self.rank != leaders[0]:
+        if self.rank != leaders[0]:
             return
+        if len(self.index.files) >= 2:
+            self._write_hf_index()
+        self._write_commit_marker()
+
+    def _write_hf_index(self) -> None:
+        """model.safetensors.index.json when every entry is a whole tensor."""
         whole = _whole_tensor_files(self.table, self.index)
         if not all(whole.values()):
             return
@@ -315,6 +334,21 @@ class SafeTensorsSaveSession(SaveSessionBase):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, os.path.join(self.root, HF_INDEX_NAME))
+
+    def _write_commit_marker(self) -> None:
+        """Atomically publish the checkpoint-complete marker.
+
+        The marker records the committed shard file set; a directory whose
+        marker is missing or names a different set is not loadable.
+        """
+        shards = sorted(self.index.files)
+        doc = {"format": "safetensors", "files": shards}
+        tmp = os.path.join(self.root, COMMIT_MARKER_NAME + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(doc, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(self.root, COMMIT_MARKER_NAME))
 
 
 class LoadSessionBase(_Base, StorageLoadSession):
@@ -365,12 +399,45 @@ class LoadSessionBase(_Base, StorageLoadSession):
 
 
 class SafeTensorsLoadSession(LoadSessionBase):
-    """Reads a header (8 B, then N B) before any get_file_offset in that file."""
+    """Reads a header (8 B, then N B) before any get_file_offset in that file.
+
+    The directory is loadable only when the commit marker exists and lists
+    exactly the layout's shard files. Without it the shards are treated as
+    an unpublished (or commit-unknown) checkpoint and open fails.
+    """
 
     def __init__(self, *a, **kw) -> None:
         super().__init__(*a, **kw)
+        self._require_committed()
         for path in self.my_files():
             self._read_file_offsets(path)
+
+    def _require_committed(self) -> None:
+        marker = os.path.join(self.root, COMMIT_MARKER_NAME)
+        doc = self._read_commit_marker(marker)
+        committed = set(doc.get("files", []))
+        if committed != set(self.index.files):
+            raise io_error(
+                "open",
+                "safetensors commit marker does not match the requested layout",
+                self.root,
+            )
+
+    def _read_commit_marker(self, marker: str) -> dict:
+        try:
+            raw = Path(marker).read_text()
+        except OSError as exc:
+            raise io_error(
+                "open",
+                "safetensors checkpoint is not committed: completion marker missing",
+                self.root,
+            ) from exc
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            raise io_error(
+                "open", "safetensors completion marker is corrupt", self.root
+            ) from exc
 
     def _read_file_offsets(self, path: str) -> None:
         full = self.abspath(path)
