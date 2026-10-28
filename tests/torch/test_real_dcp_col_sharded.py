@@ -4,13 +4,20 @@ Global matrix 2x4; rank 0 owns columns [0,2), rank 1 owns [2,4). Each local shar
 is 2x2. The packed chunk stores each shard's columns contiguously, so the slot's
 owned row intervals map to local byte offsets inside the chunk without a global-end
 boundary Error. Public dcp_load reads each rank's shard bytes back correctly.
+
+Rendezvous hygiene: every process-group lifetime uses a fresh FileStore path in a
+temporary directory outside the checkpoint, and init is retried with backoff so a
+spawned peer that is briefly not listening (high-load CI) cannot fail the test.
+Workers are reaped on success, failure, or timeout.
 """
 
 import multiprocessing as mp
 import os
 import pickle
+import time
 from datetime import timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pytest
@@ -20,6 +27,28 @@ torch = pytest.importorskip("torch")
 GLOBAL_ROWS = 2
 GLOBAL_COLS = 4
 COLS_PER_RANK = GLOBAL_COLS // 2
+INIT_RETRIES = 5
+INIT_BACKOFF_SECONDS = 2
+
+
+def _init_process_group(dist, init_file, rank):
+    _init = getattr(dist, "init_process_group")
+    last = None
+    for attempt in range(INIT_RETRIES):
+        try:
+            _init(
+                "gloo",
+                init_method="file://" + init_file,
+                rank=rank,
+                world_size=2,
+                timeout=timedelta(seconds=120),
+            )
+            return
+        except RuntimeError as exc:
+            last = exc
+            time.sleep(INIT_BACKOFF_SECONDS if attempt < INIT_RETRIES - 1 else 0)
+    assert last is not None
+    raise last
 
 
 def _worker(rank, init_file, root, op):
@@ -30,14 +59,8 @@ def _worker(rank, init_file, root, op):
     from torch.distributed.device_mesh import DeviceMesh
 
     torch.set_num_threads(1)
-    # pyrefly-ignore-next-line possibly-missing-attribute
-    getattr(dist, "init_process_group")(
-        "gloo",
-        init_method="file://" + init_file,
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=120),
-    )
+    _destroy = getattr(dist, "destroy_process_group")
+    _init_process_group(dist, init_file, rank)
     try:
         global_t = torch.arange(GLOBAL_ROWS * GLOBAL_COLS, dtype=torch.float32).reshape(
             GLOBAL_ROWS, GLOBAL_COLS
@@ -58,23 +81,55 @@ def _worker(rank, init_file, root, op):
             dcp_load(out, checkpoint_id=root)
             np.save(Path(root) / f"loaded{rank}.npy", out["x"].numpy())
     finally:
-        # pyrefly-ignore-next-line possibly-missing-attribute
-        getattr(dist, "destroy_process_group")()
+        _destroy()
 
 
-def _spawn(root, op):
-    init_file = Path(root) / "init"
-    init_file.touch()
-    ctx = mp.get_context("spawn")
-    procs = [
-        ctx.Process(target=_worker, args=(r, str(init_file), str(root), op))
-        for r in range(2)
-    ]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join(180)
-    assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
+def _wait_workers(procs, op, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while any(p.is_alive() for p in procs):
+        codes = [p.exitcode for p in procs]
+        assert all(code in (None, 0) for code in codes), f"{op}: worker failed: {codes}"
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f"{op}: worker timeout: {codes}"
+        for p in procs:
+            p.join(min(0.05, remaining))
+    codes = [p.exitcode for p in procs]
+    assert all(code == 0 for code in codes), f"{op}: worker failed: {codes}"
+
+
+def _stop_workers(procs):
+    started = [p for p in procs if p.pid is not None]
+    for p in started:
+        if p.is_alive():
+            p.terminate()
+    for p in started:
+        p.join(5)
+        if p.is_alive():
+            p.kill()
+            p.join(5)
+        assert not p.is_alive(), f"worker {p.pid} survived cleanup"
+
+
+def _run_workers(procs, op, timeout_seconds):
+    try:
+        for p in procs:
+            p.start()
+        _wait_workers(procs, op, timeout_seconds)
+    finally:
+        _stop_workers(procs)
+
+
+def _spawn(root, op, timeout_seconds=180):
+    # FileStore requires a fresh path for every process-group lifetime.
+    # Keep rendezvous state outside checkpoint data; reap workers before removal.
+    with TemporaryDirectory(prefix="dcp-rendezvous-", dir=Path(root).parent) as tmp:
+        init_file = Path(tmp) / "init"
+        ctx = mp.get_context("spawn")
+        procs = [
+            ctx.Process(target=_worker, args=(r, str(init_file), str(root), op))
+            for r in range(2)
+        ]
+        _run_workers(procs, op, timeout_seconds)
 
 
 @pytest.mark.skipif(
