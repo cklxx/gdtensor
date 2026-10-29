@@ -263,13 +263,12 @@ def test_stats_return_list_of_int_per_node():
     inb = gio.chain_stat_inbound_traffic(chain)
     assert isinstance(mem, list) and all(isinstance(x, int) for x in mem)
     assert isinstance(out, list) and isinstance(inb, list)
-    # Two nodes; C serialises slots, so resident = one atomic slot (2 elems).
+    # Two nodes; each node needs one 4-byte step cell (C=1).
     assert mem == [4, 4], mem
-    # Each node owns 4 bytes of compute (2 ranks x 2 elems).
-    assert out == [4, 4], out
-    # Each rank independently stages the 4-byte step slice covering its want;
-    # two ranks per node pull it, so inbound = 8 bytes per node (observed).
-    assert inb == [8, 8], inb
+    # Every cache -> rank edge stays on the rank's own node: no outbound.
+    assert out == [0, 0], out
+    # Each node reads its 4 bytes from storage once, shared by its two ranks.
+    assert inb == [4, 4], inb
 
 
 @pytest.mark.parametrize(
@@ -625,13 +624,14 @@ def test_cross_node_observed_bytes_match_per_node_stats():
     chain = gb.OneLayerCachedDTensorsReadChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
-    per_node_write = {0: 0, 1: 0}
+    per_node_read = {0: 0, 1: 0}
     for rank in range(world):
         node = rank // k
-        dst.events.clear()
+        src.events.clear()
         assert type(gio.chain_load(rank, chain)) is gb.Ok
-        per_node_write[node] += sum(s for d, _, s in dst.events if d == "write")
-    out = gio.chain_stat_outbound_traffic(chain)
-    # Each node's outbound = the compute bytes its ranks receive.
-    assert per_node_write[0] == out[0], (per_node_write, out)
-    assert per_node_write[1] == out[1], (per_node_write, out)
+        per_node_read[node] += sum(s for d, _, s in src.events if d == "read")
+    # Cache and ranks share a node, so no byte leaves a node.
+    assert gio.chain_stat_outbound_traffic(chain) == [0, 0]
+    # Inbound = the storage bytes each node actually read (one fill per node).
+    inbound = gio.chain_stat_inbound_traffic(chain)
+    assert [per_node_read[0], per_node_read[1]] == inbound, (per_node_read, inbound)

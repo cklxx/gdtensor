@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "b7ca29ea499730c15c1a236e9e490ed5e7fa755bfd0efd553297266f68ccabad"
+FROZEN_API_SHA256 = "956c077ebb3f4e0992bd3cc1788b456846ce2d64ef326d3348227196238db9d6"
 
 
 def _production_manifest(root=ROOT):
@@ -65,8 +65,8 @@ MUTATIONS = [
     ),
     (
         "gdtensor/internal/api.py",
-        'except BaseException:\n        _cleanup(session, "finish")\n        raise',
-        "except BaseException:\n        raise",
+        '_copy(plan, _session_view(storage_view, session), compute_view)\n    except BaseException:\n        _cleanup(session, "finish")\n        raise',
+        "_copy(plan, _session_view(storage_view, session), compute_view)\n    except BaseException:\n        raise",
         "tests/io/test_io_contract.py::test_io_failure_closes_sessions",
         "notorch",
     ),
@@ -130,20 +130,21 @@ MUTATIONS = [
         "tests/sim/test_audit_dcp_regressions.py::test_col_shard_get_file_offset_must_raise_invalidarg",
         "torch",
     ),
-    # File-backed C=1 and ACK detectors drive the public chain_load path.
-    # Capacity mutation permits an extra file allocation; ACK mutation forces
-    # a second disk fill of a slot that another consumer still needs.
+    # File-backed byte-budget and ACK detectors drive the public chain_load
+    # path. Budget mutation permits an extra file allocation; ACK mutation
+    # releases a segment after the first consumer, which forces a second disk
+    # fill for the consumer that still needs it.
     (
         "gdtensor/internal/api.py",
-        "        if block and self.live >= self.cap:\n            return None\n        self.slots[key] = self._new_slot()\n        self.live += 1\n        return True\n\n    def _begin_existing",
-        "        if False:\n            return None\n        self.slots[key] = self._new_slot()\n        self.live += 1\n        return True\n\n    def _begin_existing",
+        "        return self.resident + size <= self.budget",
+        "        return True",
         "tests/io/test_cache_mutation_detectors.py::test_cap_guard_allows_one_fill_for_replicate_cohort",
         "notorch",
     ),
     (
         "gdtensor/internal/api.py",
-        '        done = all(\n            self._covers(slot["cov"].get(r, set()), iv) for r, iv in required.items()\n        )',
-        '        done = any(\n            self._covers(slot["cov"].get(r, set()), iv) for r, iv in required.items()\n        )',
+        '        if not slot["owed"]:\n            self.release(key)',
+        "        if True:\n            self.release(key)",
         "tests/io/test_cache_mutation_detectors.py::test_ack_releases_slot_only_after_every_cohort_member",
         "notorch",
     ),

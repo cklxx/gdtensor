@@ -10,45 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, cast
 
-import numpy as np
-
 from .builder_mixin import field_hash, make_builder_mixin
-from .dtensor import (
-    EMPTY,
-    box_of,
-    box_to_intervals,
-    iv_intersect,
-    global_tensor_meta_of,
-    iv_normalize,
-    iv_total,
-    named_of,
-    naive_of,
-    owned_intervals,
-)
-from .mesh import (
-    cache_concurrency_width,
-    cache_node_set,
-    cache_num_nodes,
-    cache_num_steps,
-)
-from .plan import (
-    CHECK,
-    _Side,
-    _assert_disjoint,
-    _byte_iv,
-    _pair,
-    _storage_side_within,
-    is_compute,
-)
+from .plan import d_tensors_view_rank_plan_load, validate_rank_load
+from .propagation import build_chain_plan, plan_mem, plan_traffic, rank_copy_plans
 from .ranges import CopyPlan
-from .result import catch, check_failed, invalid
-from .views import (
-    CacheDTensorsView,
-    ComputeDTensorsView,
-    StorageDTensorsView,
-)
+from .result import catch, invalid, must_ok
 from .products import Ok
 from ..chain_types import Result
+
 # ------------------------------------------------------------------ types
 
 
@@ -225,7 +194,7 @@ def get_tensor_ids_of_read_chain(read_chain: DTensorsReadChain) -> List[str]:
         TwoLayerCachedDTensorsReadChain,
     ):
         c = cast(DirectDTensorsReadChain, read_chain)
-        return list(cast("ComputeDTensorsView", c.dst).tensor_ids)
+        return list(c.dst.tensor_ids)
     if t is MixedDTensorsReadChain:
         ids: List[str] = []
         for seg in read_chain.disjoint_tensor_ids_and_read_chain_list:
@@ -261,101 +230,27 @@ def legs_of(read_chain: DTensorsReadChain):
     raise invalid("read_chain", f"unknown chain type {t.__name__}")
 
 
-def _concrete_legs(chain: ConcreteDTensorsReadChain):
-    t = type(chain)
-    if t is DirectDTensorsReadChain:
+def concrete_chains(read_chain: DTensorsReadChain) -> list:
+    """Concrete chains in execution order; Mixed is flattened."""
+    t = type(read_chain)
+    if t in (
+        DirectDTensorsReadChain,
+        OneLayerCachedDTensorsReadChain,
+        TwoLayerCachedDTensorsReadChain,
+    ):
+        return [read_chain]
+    if t is MixedDTensorsReadChain:
         return [
-            {
-                "views": (chain.src, chain.dst),
-                "attr": "src_to_dst",
-            }
+            seg.read_chain for seg in read_chain.disjoint_tensor_ids_and_read_chain_list
         ]
-    if t is OneLayerCachedDTensorsReadChain:
-        return [
-            {"views": (chain.src, chain.cache), "attr": "src_to_cache"},
-            {"views": (chain.cache, chain.dst), "attr": "cache_to_dst"},
-        ]
-    return [
-        {
-            "views": (chain.src, chain.small_cache),
-            "attr": "src_to_small_cache",
-        },
-        {
-            "views": (chain.small_cache, chain.big_cache),
-            "attr": "small_cache_to_big_cache",
-        },
-        {
-            "views": (chain.big_cache, chain.dst),
-            "attr": "big_cache_to_dst",
-        },
-    ]
+    raise invalid("read_chain", f"unknown chain type {t.__name__}")
 
 
-def _wanted_intervals(compute_view: ComputeDTensorsView, tid: str, rank: int):
-    """Global element intervals the rank must finally hold on the compute side.
-    Every leg of the rank's chain moves exactly these elements."""
-    nd = named_of(compute_view.d_tensor_table, tid)
-    return owned_intervals(nd, "compute", rank)
-
-
-def _cache_owned_blocks(nd, tid: str, rank: int, num_ranks_per_node: int, want):
-    """Element intervals the cache on this rank's node offers for ``want``.
-
-    The cache mesh tiles the tensor across (step, slot) participants; only the
-    spatial node expands to ranks. For the rank's wanted share, the cache only
-    needs to stage the slot boxes that actually intersect ``want`` — not the
-    whole S x C union. We pick the real owner coordinate from box_of (never an
-    invented node==step map): every (step, slot) on this node whose box meets
-    the wanted elements is emitted as a full owner block, so ``_pair`` keeps
-    the owner-relative offset. The allocator reuses a step buffer across slots;
-    peak live bytes are the max-step union, computed independently in stats.
-    """
-    naive = naive_of(nd)
-    mesh = naive.mesh
-    S = cache_num_steps(mesh)
-    N = cache_num_nodes(mesh)
-    C = cache_concurrency_width(mesh)
-    nodes = sorted(cache_node_set(mesh))
-    n_index = nodes.index(rank // num_ranks_per_node)
-    shape = global_tensor_meta_of(nd).global_shape
-    isz = global_tensor_meta_of(nd).itemsize
-    out = []
-    slots = ((s, c) for s in range(S) for c in range(C))
-    for s, c in slots:
-        lo, hi = box_of(naive, (S, N, C), (s, n_index, c))
-        iv = box_to_intervals(shape, lo, hi)
-        if iv.size and iv_total(iv_normalize(iv_intersect(iv, want))):
-            out.append((iv, ("compute", tid, isz)))
-    return out
-
-
-def _element_blocks(view, tid: str, rank: int, want, num_ranks_per_node: int):
-    """Full owner blocks (interval, address) this side offers.
-
-    ``_pair`` intersects these blocks with the wanted elements, so each
-    interval here must be the full owner slot. Pre-intersecting would lose
-    the owner-relative offset used to map to a physical file offset.
-
-    Storage maps global elements through physical slots; compute addresses by
-    global tensor offset; a cache view addresses by global offset too but its
-    offered box is its own (step, node, slot) ownership, not the compute share.
-    """
-    if type(view) is StorageDTensorsView:
-        return list(_Side(view).src_candidates(tid, rank))
-    nd = named_of(view.d_tensor_table, tid)
-    if type(view) is CacheDTensorsView:
-        return _cache_owned_blocks(nd, tid, rank, num_ranks_per_node, want)
-    isz = global_tensor_meta_of(nd).itemsize
-    owned = owned_intervals(nd, "compute", rank)
-    return [(owned, ("compute", tid, isz))] if owned.size else []
-
-
-def _plan_leg_tid(
-    rank: int, src, dst, tid: str, want, num_ranks_per_node: int
-) -> CopyPlan:
-    src_blocks = _element_blocks(src, tid, rank, want, num_ranks_per_node)
-    dst_blocks = _element_blocks(dst, tid, rank, want, num_ranks_per_node)
-    return _pair(dst_blocks, src_blocks)
+def rank_direct_plan(rank: int, chain: DirectDTensorsReadChain) -> CopyPlan:
+    """The storage -> compute plan of a direct chain, validated per rank."""
+    plan = must_ok(d_tensors_view_rank_plan_load(rank, chain.dst, chain.src))
+    validate_rank_load(rank, chain.dst, chain.src, plan)
+    return plan
 
 
 # ------------------------------------------------------------------ B.1.2
@@ -371,239 +266,70 @@ def d_tensors_view_rank_plan_chain_load(
     # meta. Checked before any session is opened.
     for src, dst in legs_of(read_chain):
         _check_same_tensors(src, dst)
-    t = type(read_chain)
-    if t in (
-        DirectDTensorsReadChain,
-        OneLayerCachedDTensorsReadChain,
-        TwoLayerCachedDTensorsReadChain,
-    ):
-        return Ok(_plan_concrete_chain(rank, read_chain))
-    if t is MixedDTensorsReadChain:
-        pieces = []
-        for seg in read_chain.disjoint_tensor_ids_and_read_chain_list:
-            pieces.append(
-                DisjointTensorIdsAndCopyPlanChain(
-                    list(seg.tensor_ids),
-                    _plan_concrete_chain(
-                        rank, cast(ConcreteDTensorsReadChain, seg.read_chain)
-                    ),
-                )
+    if type(read_chain) is MixedDTensorsReadChain:
+        return Ok(
+            MixedCopyPlanChain(
+                [
+                    DisjointTensorIdsAndCopyPlanChain(
+                        list(seg.tensor_ids), _plan_concrete(rank, seg.read_chain)
+                    )
+                    for seg in read_chain.disjoint_tensor_ids_and_read_chain_list
+                ]
             )
-        return Ok(MixedCopyPlanChain(pieces))
-    raise invalid("read_chain", f"unknown chain type {t.__name__}")
-
-
-def _chain_leg_plans(rank: int, chain: ConcreteDTensorsReadChain):
-    """CopyPlan per leg, in data-flow order."""
-    k = getattr(chain, "num_ranks_per_node", 1)
-    return [
-        _chain_one_leg(rank, src, dst, chain.dst, k)
-        for src, dst in (spec["views"] for spec in _concrete_legs(chain))
-    ]
-
-
-def _chain_one_leg(rank: int, src, dst, compute_view, k: int) -> CopyPlan:
-    plan: CopyPlan = []
-    for tid in compute_view.tensor_ids:
-        want = _wanted_intervals(compute_view, tid, rank)
-        if iv_total(want):
-            plan.extend(_plan_leg_tid(rank, src, dst, tid, want, k))
-    return plan
-
-
-def _plan_concrete_chain(rank: int, chain: ConcreteDTensorsReadChain):
-    # Every leg moves the same elements: the rank's owned share on the final
-    # compute view. The wanted set is computed once per tensor and reused
-    # across the legs so src->cache and cache->dst carry identical bytes.
-    plans = _chain_leg_plans(rank, chain)
-    t = type(chain)
-    if t is DirectDTensorsReadChain:
-        return DirectCopyPlanChain(plans[0])
-    if t is OneLayerCachedDTensorsReadChain:
-        return OneLayerCachedCopyPlanChain(plans[0], plans[1])
-    return TwoLayerCachedCopyPlanChain(plans[0], plans[1], plans[2])
-
-
-def _storage_leg_out_of_bounds(view, plan: CopyPlan, pairs_side: str):
-    index, by_f = _storage_side_bounds(view, plan, pairs_side)
-    for path, iv in by_f.items():
-        total = index.files[path].payload_size
-        if iv.size and int(iv[:, 1].max()) > total:
-            raise check_failed(CHECK, f"storage {path}: range outside [0, {total})")
-
-
-def _compute_dst_intervals(view, plan: CopyPlan, tid: str):
-    return _byte_iv(
-        [
-            (r.global_tensor_offset, r.size)
-            for r in _chain_ranges(plan, "dst")
-            if is_compute(r) and r.global_tensor_id == tid
-        ]
-    )
-
-
-def validate_chain_leg(plan: CopyPlan, src, dst, tid: str, want) -> None:
-    """One leg must move exactly `want` elements, disjointly and in bounds.
-
-    Storage ranges stay inside their files; compute/cache ranges stay inside
-    the global tensor. The check is element aligned and per leg, so a leg that
-    drops half the shard cannot be masked by another leg.
-    """
-    for view, pairs_side in ((src, "src"), (dst, "dst")):
-        if type(view) is StorageDTensorsView:
-            _storage_leg_out_of_bounds(view, plan, pairs_side)
-        elif pairs_side == "dst":
-            nd = named_of(view.d_tensor_table, tid)
-            itemsize = global_tensor_meta_of(nd).itemsize
-            iv = _compute_dst_intervals(view, plan, tid)
-            _assert_chain_covering(iv, want, itemsize, tid)
-    _assert_src_disjoint(plan, tid)
-
-
-def _assert_src_disjoint(plan: CopyPlan, tid: str) -> None:
-    for r in _chain_ranges(plan, "src"):
-        if is_compute(r) and r.global_tensor_id == tid:
-            iv = _byte_iv([(r.global_tensor_offset, r.size)])
-            _assert_disjoint(iv, f"compute {tid}", CHECK)
-
-
-def _chain_ranges(plan: CopyPlan, which: str):
-    return [src if which == "src" else dst for src, dst in plan]
-
-
-def _storage_side_bounds(view, plan: CopyPlan, which: str):
-
-    return _storage_side_within(view, plan, which)
-
-
-def _assert_chain_covering(byte_iv, want, itemsize: int, tid: str) -> None:
-    _assert_disjoint(byte_iv, f"compute {tid}", CHECK)
-    got = (
-        iv_normalize((byte_iv // itemsize).astype(np.int64)) if byte_iv.size else EMPTY
-    )
-    expected = iv_normalize(want)
-    if not (got.shape == expected.shape and np.array_equal(got, expected)):
-        raise check_failed(
-            CHECK,
-            f"chain leg compute {tid}: covers {iv_total(got)} of "
-            f"{iv_total(expected)} elements",
         )
+    concrete_chains(read_chain)
+    return Ok(_plan_concrete(rank, read_chain))
+
+
+def _plan_concrete(rank: int, chain) -> ConcreteCopyPlanChain:
+    """Per-rank copy plans derived from the node-level propagation plan.
+
+    The fill legs list the cache segments this rank's drains depend on (its
+    closure). A segment shared by several ranks appears in each of their
+    plans, but the executor fills it once per node.
+    """
+    if type(chain) is DirectDTensorsReadChain:
+        return DirectCopyPlanChain(rank_direct_plan(rank, chain))
+    legs = rank_copy_plans(build_chain_plan(chain), rank)
+    if type(chain) is OneLayerCachedDTensorsReadChain:
+        return OneLayerCachedCopyPlanChain(legs[0], legs[1])
+    return TwoLayerCachedCopyPlanChain(legs[0], legs[1], legs[2])
 
 
 # ------------------------------------------------------------------ B.1.6
 #
-# Stats return list[int] indexed by spatial node id, length = number of nodes
-# the chain's caches cover. Accounting is derived from the real meshes:
-#   * mem_overhead: resident cache bytes on each cache node = concurrency_width
-#     copies of the largest single step's slice (temporal reuse shrinks it as
-#     num_steps grows; each concurrency slot adds one copy).
-#   * inbound/outbound: bytes that actually cross a node boundary on the legs,
-#     attributed per node from what that node's rank block owns on the final
-#     compute mesh. Legs whose two ends live on the same node are local memory
-#     motion and carry no traffic. Storage/compute endpoints have no node id.
+# Stats return list[int] indexed by node id, in bytes, from the same
+# node-level propagation plan the executor runs:
+#   * mem_overhead: per node, the sum over cache layers of the layer budget
+#     (the C largest cells that hold demanded bytes). The executor never lets
+#     resident bytes exceed it, so the value is a hard bound.
+#   * inbound / outbound: bytes on node-crossing edges. Storage -> first layer
+#     is inbound of the filling node. Same-node edges carry no traffic. Each
+#     segment crosses each edge once.
 
 
-def _view_node_ids(view):
-    """Sorted spatial node ids a cache view covers; None for storage/compute."""
-    if type(view) is CacheDTensorsView:
-        mesh = view.d_tensor_table.named_d_tensors[0].d_tensor.mesh
-        return cache_node_set(mesh)
-    return None
+def _per_node(acc: dict) -> List[int]:
+    n = (max(acc) + 1) if acc else 0
+    return [int(acc.get(i, 0)) for i in range(n)]
 
 
-def _tensor_resident_bytes(nd, node: int, k: int, terminal_dst) -> int:
-    """Peak resident bytes of one tensor's cache on ``node``.
-
-    Each tensor has its own backing region. Temporal reuse serialises steps (a
-    step drains before the next fills); the C slots of one step are live
-    together. A cache layer is filled only for the ranges consumed by the ranks
-    of the node that owns it; whether the next hop is another cache or the final
-    compute mesh does not change that demand (every cache layer on the node
-    serves the same rank block). Peak = max over steps of the union of this
-    tensor's C step/slot cells intersected with that demand, in bytes.
-    """
-    naive = naive_of(nd)
-    mesh = naive.mesh
-    S = cache_num_steps(mesh)
-    N = cache_num_nodes(mesh)
-    C = cache_concurrency_width(mesh)
-    shape = naive.global_tensor_meta.global_shape
-    isz = naive.global_tensor_meta.itemsize
-    n_index = sorted(cache_node_set(mesh)).index(node)
-    tid = nd.global_tensor_id
-    drain_nd = named_of(terminal_dst.d_tensor_table, tid)
-    wants = [
-        owned_intervals(drain_nd, "compute", r) for r in range(node * k, (node + 1) * k)
+def _cached(read_chain: DTensorsReadChain) -> list:
+    return [
+        c for c in concrete_chains(read_chain) if type(c) is not DirectDTensorsReadChain
     ]
-    want_node = iv_normalize(np.concatenate(wants)) if wants else EMPTY
-
-    def step_live(s: int) -> int:
-        # Real box_of cell (temporal x concurrency shards on dim0; spatial
-        # Replicate does not split). The C cells of one step are the declared
-        # in-flight slots and may overlap under pipelining; union the intervals.
-        union = EMPTY
-        for c in range(C):
-            lo, hi = box_of(naive, (S, N, C), (s, n_index, c))
-            iv = iv_intersect(box_to_intervals(shape, lo, hi), want_node)
-            union = iv_normalize(np.concatenate((union, iv)))
-        return iv_total(union) * isz
-
-    return max((step_live(s) for s in range(S)), default=0)
 
 
-def _node_compute_bytes(dst_view, node: int, k: int) -> int:
-    """Bytes the ranks on ``node`` actually own on the final compute mesh."""
-    total = 0
-    for named in dst_view.d_tensor_table.named_d_tensors:
-        isz = named.d_tensor.global_tensor_meta.itemsize
-        for r in range(node * k, (node + 1) * k):
-            total += iv_total(owned_intervals(named, "compute", r)) * isz
-    return total
-
-
-def _record_inbound(acc, dst, dst_view, nodes, k: int) -> None:
-    if type(dst) is CacheDTensorsView:
-        _acc_cache_pull(acc, dst, dst_view, nodes, k)
-    else:
-        _add_node_bytes(acc, nodes, dst_view, k)
-
-
-def _acc_cache_pull(acc, cache_view, dst_view, nodes, k: int) -> None:
-    for node in nodes:
-        acc[node] = acc.get(node, 0) + _node_cache_pull_bytes(
-            cache_view, dst_view, node, k
-        )
-
-
-def _node_cache_pull_bytes(cache_view, dst_view, node: int, k: int) -> int:
-    """Bytes the ranks on ``node`` pull from source into the cache.
-
-    Each rank's src->cache leg stages the real cache owner block (step/slot box
-    from box_of) that covers that rank's wanted compute share — not the wanted
-    share itself. Ranks on the same node may stage the same step slice, and the
-    executor drives ``chain_load`` per rank, so this sums per-rank pulls rather
-    than unioning the node's owned bytes.
-    """
-    total = 0
-    for cnd, dnd in zip(
-        cache_view.d_tensor_table.named_d_tensors,
-        dst_view.d_tensor_table.named_d_tensors,
-    ):
-        tid = cnd.global_tensor_id
-        isz = cnd.d_tensor.global_tensor_meta.itemsize
-        nd = named_of(cache_view.d_tensor_table, tid)
-        for r in range(node * k, (node + 1) * k):
-            want = owned_intervals(dnd, "compute", r)
-            blocks = _cache_owned_blocks(nd, tid, r, k, want)
-            ivs = [iv for iv, _ in blocks]
-            union = iv_normalize(np.concatenate(ivs)) if ivs else EMPTY
-            total += iv_total(union) * isz
-    return total
+def _add(acc: dict, part: dict) -> None:
+    for node, nbytes in part.items():
+        acc[node] = acc.get(node, 0) + nbytes
 
 
 def get_stat_mem_overhead_of_chain_load(read_chain: DTensorsReadChain) -> List[int]:
-    """Resident cache bytes per node (bytes). No session, no payload read."""
-    return _stat_overhead(read_chain)
+    """Cache bytes each node must reserve (bytes). No session, no payload read."""
+    acc: dict = {}
+    for chain in _cached(read_chain):
+        _add(acc, plan_mem(build_chain_plan(chain, with_storage=False)))
+    return _per_node(acc)
 
 
 def get_stat_outbound_traffic_of_chain_load(read_chain: DTensorsReadChain) -> List[int]:
@@ -614,63 +340,9 @@ def get_stat_inbound_traffic_of_chain_load(read_chain: DTensorsReadChain) -> Lis
     return _stat_traffic(read_chain, outbound=False)
 
 
-def _stat_overhead(chain) -> List[int]:
-    """Per-node resident cache bytes summed over independent cache layers.
-
-    Every leg that lands on a ``CacheDTensorsView`` fills one cache layer. A
-    cache layer is always filled for the ranks on the node that drains it, so
-    demand is taken from the chain's terminal compute view regardless of
-    whether the immediate next hop is another cache. Each cache layer has its
-    own backing region; independent layers on the same node add. Within one
-    layer the executor serialises tensors and temporal steps, so that layer's
-    resident peak is the largest tensor/step contribution.
-    """
-    terminal_dst = chain.dst
-    k = getattr(chain, "num_ranks_per_node", 1)
+def _stat_traffic(read_chain: DTensorsReadChain, outbound: bool) -> List[int]:
     acc: dict = {}
-    for src, dst in legs_of(chain):
-        nodes = _view_node_ids(dst)
-        if nodes is None:
-            continue
-        cache_view = cast(CacheDTensorsView, dst)
-        for node in nodes:
-            resident = max(
-                (
-                    _tensor_resident_bytes(nd, node, k, terminal_dst)
-                    for nd in cache_view.d_tensor_table.named_d_tensors
-                ),
-                default=0,
-            )
-            acc[node] = acc.get(node, 0) + resident
-    n = (max(acc) + 1) if acc else 0
-    return [acc.get(i, 0) for i in range(n)]
-
-
-def _add_node_bytes(acc, nodes, dst_view, k: int) -> None:
-    for node in nodes:
-        acc[node] = acc.get(node, 0) + _node_compute_bytes(dst_view, node, k)
-
-
-def _stat_traffic(chain, outbound: bool) -> List[int]:
-    k = getattr(chain, "num_ranks_per_node", 1)
-    dst_view = chain.dst
-    out_acc: dict = {}
-    in_acc: dict = {}
-    for src, dst in legs_of(chain):
-        src_nodes, dst_nodes = _view_node_ids(src), _view_node_ids(dst)
-        if src_nodes is None and dst_nodes is None:
-            continue
-        if (
-            src_nodes is not None
-            and dst_nodes is not None
-            and set(src_nodes) == set(dst_nodes)
-        ):
-            # Both ends on the same node set: local cache motion, no traffic.
-            continue
-        if dst_nodes is not None:
-            _record_inbound(in_acc, dst, dst_view, dst_nodes, k)
-        if src_nodes is not None:
-            _add_node_bytes(out_acc, src_nodes, dst_view, k)
-    acc = out_acc if outbound else in_acc
-    n = (max(acc) + 1) if acc else 0
-    return [acc.get(i, 0) for i in range(n)]
+    for chain in _cached(read_chain):
+        inbound, out = plan_traffic(build_chain_plan(chain, with_storage=False))
+        _add(acc, out if outbound else inbound)
+    return _per_node(acc)

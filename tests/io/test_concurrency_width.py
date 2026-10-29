@@ -135,13 +135,17 @@ def _run_with_rank0_drain_blocked(chain, cache_mem, hold_seconds):
 
 
 def test_concurrency_width_one_serializes_and_two_pipelines():
-    # Same shape, S=1; the only difference is the declared concurrency width.
+    # Both chains use 4-byte cells (one rank's share). C=1 (S=2) keeps one cell
+    # live, so rank 1 waits for rank 0. C=2 (S=1) keeps two cells live, so
+    # rank 1 fills its own cell while rank 0 is held.
     blocked = ResidentCache([], 2)
-    c1 = _one_layer_chain(8, steps=1, width=1, cache_mem=blocked)
+    c1 = _one_layer_chain(8, steps=2, width=1, cache_mem=blocked)
+    assert gio.chain_stat_mem_overhead(c1) == [4]
     assert _run_with_rank0_drain_blocked(c1, blocked, hold_seconds=2) is False
 
     pipelined = ResidentCache([], 2)
     c2 = _one_layer_chain(8, steps=1, width=2, cache_mem=pipelined)
+    assert gio.chain_stat_mem_overhead(c2) == [8]
     assert _run_with_rank0_drain_blocked(c2, pipelined, hold_seconds=2) is True
 
 
