@@ -9,7 +9,7 @@ uv run --locked ruff check gdtensor gdtensor_sim tests
 uv run --locked pytest -v -p no:cacheprovider tests/core/test_api_conformance.py \
   -k 'code_blocks or exports or function_signatures'
 
-printf '\n[CRC+ARANGE][review 2/7] arange 0..11; one 3x4 tensor; CRC and 2->3 rank load/reshard\n'
+printf '\n[CRC+ARANGE][review 2/7] arange 0..11; one 3x4 tensor; CRC and 2->3 rank load/save\n'
 uv run --locked pytest -v -s --log-cli-level=INFO -p no:cacheprovider tests/demo/test_walkthrough.py
 
 printf '\n[review 3/7] LAWA; 2 real ranks; 3 tensors (3x4, 2x3, 1); naive/Welford; k=1/2/3/5\n'

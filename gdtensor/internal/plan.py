@@ -7,10 +7,9 @@ Who writes what:
                 compute mesh. Replicate dims are deduplicated: one
                 coordinate writes, rotated by tensor order.
 * plan_load   : storage -> compute. The rank fills every element it owns.
-* plan_reshard: any branch pair. The rank fills its destination share
-                (compute: owned elements; storage: content column == rank).
-                Sources: storage slots, or compute owners (own rank first,
-                then the lowest other rank; that read stands for comm).
+
+There is no compute->compute or storage->storage plan: a topology change is
+load into a compute view, then save from it (design 9).
 """
 
 from __future__ import annotations
@@ -266,20 +265,10 @@ def _dst_compute_pairs(plan: CopyPlan, tid: str):
     ]
 
 
-def _compute_sources(plan: CopyPlan) -> Dict[str, np.ndarray]:
-    out: Dict[str, list] = {}
-    for src, _ in plan:
-        if is_compute(src):
-            out.setdefault(src.global_tensor_id, []).append(
-                (src.global_tensor_offset, src.size)
-            )
-    return {tid: _byte_iv(pairs) for tid, pairs in out.items()}
-
-
 def _storage_side_within(view, plan: CopyPlan, which: str):
     """Bounds-check storage ranges on one copy side (src or dst) and return
     payload index plus file -> byte intervals. Each side is inspected alone
-    so an ss reshard reading and writing the same file is not counted twice."""
+    so a plan that reads and writes the same file is not counted twice."""
     ranges = [src for src, _ in plan] if which == "src" else [dst for _, dst in plan]
     by_raw: Dict[str, list] = {}
     for r in ranges:
@@ -390,34 +379,6 @@ def validate_rank_load(rank: int, compute_view, storage_view, plan: CopyPlan) ->
     for path, iv in by_f.items():
         total = index.files[path].payload_size
         if iv.size and (int(iv[:, 0].min()) < 0 or int(iv[:, 1].max()) > total):
-            raise check_failed(
-                CHECK, f"storage {path}: read range outside [0, {total})"
-            )
-
-
-def _validate_compute_to_compute(rank: int, compute_view, plan: CopyPlan) -> None:
-    for nd in compute_view.d_tensor_table.named_d_tensors:
-        tid = nd.global_tensor_id
-        pairs = _dst_compute_pairs(plan, tid)
-        owns = iv_total(owned_intervals(nd, "compute", rank)) > 0
-        _check_rank_writes_only_owned(rank, tid, pairs, owns)
-        if owns:
-            _covers_owned(nd, rank, pairs, CHECK)
-    for tid, iv in _compute_sources(plan).items():
-        _assert_disjoint(iv, f"compute {tid}", CHECK)
-
-
-def _validate_storage_destination(storage_view, plan: CopyPlan) -> None:
-    _, by_f = _storage_side_within(storage_view, plan, "dst")
-    for path, iv in by_f.items():
-        _assert_disjoint(iv, f"storage {path}", CHECK)
-
-
-def _validate_storage_source(storage_view, plan: CopyPlan) -> None:
-    _, by_f = _storage_side_within(storage_view, plan, "src")
-    for path, iv in by_f.items():
-        total = _Side(storage_view).index.files[path].payload_size
-        if iv.size and int(iv[:, 1].max()) > total:
             raise check_failed(
                 CHECK, f"storage {path}: read range outside [0, {total})"
             )

@@ -5,7 +5,7 @@
 | namespace | 导出范围 |
 |---|---|
 | `gdtensor` | `get_tensor_ids`、`get_gd_tensor`、`make_gd_tensor`、`get_d_tensor`、`reset_d_tensor`、`Result`、`Error` |
-| `gdtensor.io` | `rank_load`、`rank_save`、`rank_reshard` |
+| `gdtensor.io` | `rank_load`、`rank_save`、`chain_load`、`chain_stat_mem_overhead`、`chain_stat_outbound_traffic`、`chain_stat_inbound_traffic` |
 | `gdtensor.builder` | C.3 产品类型、BuilderMixin、`new_*`、view map，以及 C.4 的四个 helper |
 | `gdtensor.session` | `StorageSaveSession`、`StorageLoadSession` |
 | `gdtensor.access` | `DTensorDataAccessor` |
@@ -30,7 +30,7 @@ IO 使用 session 的 `init_data_accessor()`。自定义 accessor 不需要内�
 1. 一个 rank 直接调用 `rank_save` 写出串行基线。多个 rank 通过线程屏障同时开始 `rank_save`，写出另一布局的分片文件。
 2. 独立解析两套文件，按全局元素下标重建完整张量。每个元素必须恰好出现一次；并行结果的 shape、dtype、全部字节和 CRC 必须与串行基线一致。
 3. 执行下表的读取组合。每个 rank 的本地字节必须等于串行基线对应的分片。
-4. 用 `rank_reshard` 把并行文件统一为串行基线的单文件布局，再比较整文件字节，包括 header / metadata。读回、合文件期间，源文件字节必须不变。
+4. 用 `rank_load` 把并行文件读到串行基线拓扑的 compute view，再用 `rank_save` 写成单文件布局，然后比较整文件字节，包括 header / metadata。读回、合文件期间，源文件字节必须不变。
 5. 故意交换同一 tensor 的两个 rank 的等长 payload，再由一个 rank 读回。测试要求它与串行基线不一致，并打印拼错前后的值。
 
 | 写入方式 | 读取方式 | 比较内容 |
@@ -61,14 +61,14 @@ rank 由线程模拟。三个阶段使用不同的 PP/DP/TP 组合或 world size
 | 阶段 | 调用与数据去向 | 本阶段检查 |
 |---|---|---|
 | 1. 保存三份 checkpoint | `rank_save`：初始 compute 分片 → 每 rank 多文件；三份输入交替使用 safetensors / distcp | 每份 checkpoint 的字节、CRC 和覆盖次数正确；确实存在同 rank 多文件、同 tensor 跨文件、同文件多 tensor；源 compute 值不变 |
-| 2. 每份输入重排并读回 | `rank_reshard`：原多文件 → 另一格式的共享文件；`rank_load`：共享文件 → 第二组 rank | 新文件仍表示同一份完整张量；新的分片轴和 rank 数下，每个本地元素都正确；load 前后文件字节不变 |
+| 2. 每份输入重排并读回 | `rank_load`：原多文件 → 另一格式的目标 compute view，随后 `rank_save` 写成共享文件；`rank_load`：共享文件 → 第二组 rank | 新文件仍表示同一份完整张量；新的分片轴和 rank 数下，每个本地元素都正确；load 前后文件字节不变 |
 | 3. 调用方合并张量 | 测试在第二组 rank 的本地 buffer 上用 float64 累加，再转回原 dtype | 等权平均期望为 `A+4`；权重 1/2/3 的平均期望为 `A+5.5`；整数结果按 dtype 转换规则截断。期望值由全局公式直接生成，与实际读回路径分开 |
 | 4. 保存数值合并结果 | `rank_save`：合并后的 compute 分片 → 每 rank 多文件 | 全部输出字节、CRC、覆盖次数正确；再次检查多文件分布 |
-| 5. 合并物理文件并读回 | `rank_reshard`：上一步多文件 → 最后一组 rank 协作写一个文件；`rank_load`：单文件 → 最后一组 compute 分片 | 恰好输出一个 payload 文件；数值仍等于阶段 3 的期望；原 checkpoint 和作为合文件输入的目录字节不变 |
+| 5. 合并物理文件并读回 | `rank_load`：上一步多文件 → 最后一组 rank 的 compute view，随后 `rank_save` 由这些 rank 协作写一个文件；`rank_load`：单文件 → 最后一组 compute 分片 | 恰好输出一个 payload 文件；数值仍等于阶段 3 的期望；原 checkpoint 和作为合文件输入的目录字节不变 |
 
 例如，第一个张量是从 0 开始的 I64 arange。普通平均的前三个期望值是 `[4, 5, 6]`；加权平均先得到 `[5.5, 6.5, 7.5]`，转回 I64 后为 `[5, 6, 7]`。日志中的 `base_arange_first12` 展示原始输入，`CHECKPOINT_INPUT` 展示各份 checkpoint；`merged_expected_first12` 和 `loaded_rank0_first12` 分别展示合并后的期望值与实际读回值。
 
-这里有两种 merge。**张量 merge** 是阶段 3 的调用方数值平均。**文件 merge** 是阶段 5 的存储布局转换，保持张量值不变。核心只调用设计中的 `rank_save/load/reshard`；没有新增 merge API。
+这里有两种 merge。**张量 merge** 是阶段 3 的调用方数值平均。**文件 merge** 是阶段 5 的存储布局转换，保持张量值不变：先 `rank_load` 到 compute view，再 `rank_save` 写出（测试里的 `repack_via_compute` 就是这两步），因为设计第 9 节不支持 storage→storage 复制。核心只调用设计中的 `rank_save` / `rank_load`；没有新增 merge API。
 
 CRC 只计算 payload 字节。独立 oracle 同时逐字节比较，并为每个全局元素计数，要求恰好存一次。这能检查丢片、重复写、错 tensor、错 offset 和分片次序错误。仅比较整文件 CRC 会把 header 差异也算进去，因此本测试还会分别检查文件格式、shape、dtype 和数据区域。
 
@@ -98,7 +98,7 @@ CRC 只计算 payload 字节。独立 oracle 同时逐字节比较，并为每�
 | PP+EP+TP | `(2,1,2,2)` | `(3,1,2,2)` |
 | PP+DP+EP+TP | `(2,2,2,2)` | `(2,1,3,2)` |
 
-每个配置包含 11 个 I64 张量，单张量最多 15 个元素，含 5 个 expert、单元素和空张量。值是 `arange + tensor_order * 1000`，用于区分张量。15 个配置覆盖四个轴的全部非空组合。它们 × 2 种格式 × 每 rank 多文件 / 每 stage 文件，共 60 个正常用例。另有一个矩阵守卫检查这 15 种组合没有遗漏或重复。每例执行并发 save、换拓扑 load、compute reshard、跨格式 storage reshard，再统一为单 rank 单文件，与直接串行保存的文件逐字节比较，包含 header 和 metadata。每次落盘还独立检查 CRC、原始字节和每元素恰好存一份，检查读源文件不变。
+每个配置包含 11 个 I64 张量，单张量最多 15 个元素，含 5 个 expert、单元素和空张量。值是 `arange + tensor_order * 1000`，用于区分张量。15 个配置覆盖四个轴的全部非空组合。它们 × 2 种格式 × 每 rank 多文件 / 每 stage 文件，共 60 个正常用例。另有一个矩阵守卫检查这 15 种组合没有遗漏或重复。每例执行并发 save、换拓扑 load、换拓扑后的 load→save 重排、跨格式 load→save 重排，再统一为单 rank 单文件，与直接串行保存的文件逐字节比较，包含 header 和 metadata。每次落盘还独立检查 CRC、原始字节和每元素恰好存一份，检查读源文件不变。
 
 另有 2 个负例故意交换不同文件中的两个 expert payload。要求 CRC 和读回值检查都检出错误，日志标为 `[EXPECTED_MISMATCH]`。正常日志用 `[CRC+ARANGE][PARALLEL_MODES]`，打印拓扑、expert 的 PP/EP 归属、owner ranks、全局元素下标和本地实际值。这些是 checkpoint 分片与搬运测试，rank 由线程模拟；不执行训练、MoE token routing 或梯度通信。
 
@@ -119,7 +119,7 @@ uv run --locked python tests/mutation_check.py
 
 `pyproject.toml` 声明 Python 3.12 和依赖，`uv.lock` 固定版本，`.venv` 由 uv 创建。numpy / safetensors 是运行依赖，pytest / ruff / ty / pyrefly 是开发依赖。两个类型检查器都使用项目 `.venv`，通过 `tests.support` 包解析测试辅助模块；完整类型检查需要安装 torch extra。
 
-`review.sh` 用小数据逐步打印：12 个 arange 元素、完整 header / CRC、2→3 rank 加载及 reshard；LAWA 使用两个真实 rank、三个小张量，打印 checkpoint、实际值与期望值。
+`review.sh` 用小数据逐步打印：12 个 arange 元素、完整 header / CRC、2→3 rank 加载与再存；LAWA 使用两个真实 rank、三个小张量，打印 checkpoint、实际值与期望值。
 随后运行加权 checkpoint 合并、串行/并行文件对照、公开 IO 区间与约束检查，以及 PP+DP+EP+TP 的 16→12 rank 测试。文件测试使用线程 rank；真实 torch 进程测试在 `tests/torch/test_lawa.py`。
 
 `precommit.sh` 检查 fmt、lint、编译、导入和 API 合约。`full_check.sh` 还检查 ty（警告视为失败）和 Pyrefly，启用真实 torch 测试并运行全部 pytest。两者显示测试名称和执行阶段。缩进检查覆盖 core、sim 和 tests，代码块最多三层；括号内的换行对齐不计层级。

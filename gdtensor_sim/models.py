@@ -242,8 +242,8 @@ def storage_table(
 
     ``aggregate_tp`` (hf only): TP-group gather before write. For row
     (dim1) tensors the TP dim becomes Replicate, so one rank of the TP group
-    owns the whole tensor and writes it in one piece; plan_reshard semantics
-    (cross-rank read = comm) supply the other TP shards. The design doc says
+    owns the whole tensor and writes it in one piece; the fabric's cross-rank
+    read (standing for comm) supplies the other TP shards. The design doc says
     the business side does NOT aggregate; this switch shows the difference.
     """
     return DTensorTable(

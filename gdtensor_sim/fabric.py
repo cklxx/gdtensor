@@ -23,7 +23,7 @@ class ComputeFabric:
     ``buffers[rank][tensor_id]`` is the local shard: owned elements in
     ascending global order (= row-major order of the owned box). Reads of
     ranges a rank does not own go through the fabric; this stands for
-    collective communication (compute -> compute reshard).
+    collective communication (reading another rank's shard).
     """
 
     def __init__(self, table: DTensorTable) -> None:
