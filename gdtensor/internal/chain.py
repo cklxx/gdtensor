@@ -194,7 +194,7 @@ def get_tensor_ids_of_read_chain(read_chain: DTensorsReadChain) -> List[str]:
         TwoLayerCachedDTensorsReadChain,
     ):
         c = cast(DirectDTensorsReadChain, read_chain)
-        return list(c.dst.tensor_ids)
+        return list(getattr(c.dst, "tensor_ids"))
     if t is MixedDTensorsReadChain:
         ids: List[str] = []
         for seg in read_chain.disjoint_tensor_ids_and_read_chain_list:
@@ -249,6 +249,7 @@ def concrete_chains(read_chain: DTensorsReadChain) -> list:
 def rank_direct_plan(rank: int, chain: DirectDTensorsReadChain) -> CopyPlan:
     """The storage -> compute plan of a direct chain, validated per rank."""
     plan = must_ok(d_tensors_view_rank_plan_load(rank, chain.dst, chain.src))
+    assert isinstance(plan, list)
     validate_rank_load(rank, chain.dst, chain.src, plan)
     return plan
 

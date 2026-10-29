@@ -512,13 +512,17 @@ def _run_one_concrete(rank: int, chain) -> None:
     storage = chain.src
     if type(storage) is not StorageDTensorsView or storage.begin_load is None:
         raise invalid("read_chain", "chain src must be a StorageDTensorsView")
-    direct = type(chain) is DirectDTensorsReadChain
-    plan = rank_direct_plan(rank, chain) if direct else None
+    plan = (
+        rank_direct_plan(rank, chain)
+        if type(chain) is DirectDTensorsReadChain
+        else None
+    )
     _LOG.info("chain_load rank=%d phase=begin concrete", rank)
     session = must_ok(storage.begin_load(storage, rank))
+    assert session is not None
     try:
         view = _session_view(storage, session)
-        if direct:
+        if plan is not None:
             _copy(plan, view, chain.dst)
         else:
             _run_cached(rank, chain, view)
