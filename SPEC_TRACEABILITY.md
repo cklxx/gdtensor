@@ -58,6 +58,7 @@
 - Mixed：按设计 line 386 "每段自己的源端 session"，删除 `_run_shared_source` 跨段共享，改为 `_run_one_concrete` per-chain session。2 个合法 test（A/B 各自独立 session、B 失败 A bytes 已投递）过。
 - cache observer：14 个独立观察 test 过，per-node slot reference counting，write retain 到同 node 所有 reader ACK 才 free。
 - 缓存读链（2026-10-29）：规划、统计、执行统一为节点级传播计划；修复两层扩散链路执行失败、流量口径、源端读放大、内存低估和缺席消费者挂起。验收：`tests/io/test_cache_propagation.py`。
+- 形式化（2026-10-29）：`formal/tla/CachePropagation.tla` 覆盖新节点级传播计划执行器。正例满足 8 个聚合不变量（字节预算、resident 精确、rank/parent 不提前释放、父子顺序、边合法、错误记录与准入阻断），5 个变异分别被指定不变量检出，peer_down 在 FairSpec 下给出活性反例。映射见 `formal/tla/MAPPING.md`。有界投影，不证明 Python。
 - leg-order feasibility：whole-leg barrier 与 C=1 容量在 temporal=2/world=1 下矛盾，已记录证据 `log/gate/leg-order-feasibility.txt`，推荐 slot 内顺序交错（Main 批准 delta）。
 
 ## 边界（不记 pass）

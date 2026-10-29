@@ -244,6 +244,80 @@ else
 fi
 
 # ============================================================================
+# ============================================================================
+# 4. CachePropagation: node-level plan executor (internal/propagation.py +
+#    internal/api.py). Two-layer fan-out instance, byte budgets, parent/child
+#    ordering, owed-rank and owed-edge release, fill failure, and the bounded
+#    absence-of-consumer liveness boundary.
+# ============================================================================
+echo "########## CachePropagation ##########" | tee -a "$POS_LOG"
+CP_LOG="$OUT/cache_propagation.log"; : > "$CP_LOG"
+
+# $1 cfg name, $2 mutant model value, $3 cfg tail (SPECIFICATION/INVARIANTS).
+cp_cfg() {
+  cat > "$OUT/cfgs/$1.cfg" <<CFG
+CONSTANTS
+MUTANT = "$2"
+$3
+CFG
+}
+
+cp_cfg cp_pos none "SPECIFICATION Spec
+INVARIANTS
+CACHE_INV"
+if tlc CachePropagation.tla "$OUT/cfgs/cp_pos.cfg" "$CP_LOG"; then
+  echo "  ok cp_pos (all plan invariants hold)" | tee -a "$CP_LOG"; PASS=$((PASS+1))
+else
+  echo "  FAIL cp_pos" | tee -a "$CP_LOG"; FAIL=$((FAIL+1))
+fi
+
+cp_cfg cp_live_ok none "SPECIFICATION FairSpec
+PROPERTIES
+LiveGoal"
+rc=0; tlc CachePropagation.tla "$OUT/cfgs/cp_live_ok.cfg" "$CP_LOG" || rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "  ok cp_live_ok (segments drain under complete-cohort fairness)" | tee -a "$CP_LOG"
+  PASS=$((PASS+1))
+else
+  echo "  BAD cp_live_ok (exit $rc)" | tee -a "$CP_LOG"; FAIL=$((FAIL+1))
+fi
+
+# Negative mutants: each must be caught by exactly one named invariant.
+cp_neg() { # $1=name $2=mutant $3=target invariant
+  cp_cfg "$1" "$2" "SPECIFICATION Spec
+INVARIANTS
+$3"
+  local rc=0
+  tlc CachePropagation.tla "$OUT/cfgs/$1.cfg" "$CP_LOG" || rc=$?
+  if [ "$rc" -ne 0 ] && grep -qE "Invariant $3 is violated" "$CP_LOG.run"; then
+    echo "  ok   $1 : caught by $3 (exit $rc)" | tee -a "$CP_LOG"; PASS=$((PASS+1))
+  else
+    echo "  BAD  $1 : $3 did not name the violation (exit $rc)" | tee -a "$CP_LOG"
+    FAIL=$((FAIL+1))
+  fi
+}
+
+cp_neg cp_no_budget no_budget ByteBudget
+cp_neg cp_early_rank early_rank NoEarlyRankRelease
+cp_neg cp_early_parent early_parent NoEarlyParentRelease
+cp_neg cp_no_order no_parent_order ParentReadyBeforeChild
+cp_neg cp_silent_error silent_error ErrorRecorded
+
+# Peer down: node 2 never acks its terminal segment. Under FairSpec LiveGoal
+# must return a temporal counterexample (exit nonzero). The runtime reports
+# the same boundary as cache_wait.
+cp_cfg cp_peer_down peer_down "SPECIFICATION FairSpec
+PROPERTIES
+LiveGoal"
+rc=0; tlc CachePropagation.tla "$OUT/cfgs/cp_peer_down.cfg" "$CP_LOG" || rc=$?
+if [ "$rc" -ne 0 ] && grep -qE "LiveGoal (is|was) violated" "$CP_LOG.run"; then
+  echo "  ok cp_peer_down : missing-consumer boundary reproduces (exit $rc)" | tee -a "$CP_LOG"
+  PASS=$((PASS+1))
+else
+  echo "  BAD cp_peer_down : expected a LiveGoal counterexample (exit $rc)" | tee -a "$CP_LOG"
+  FAIL=$((FAIL+1))
+fi
+
 echo "########## SUMMARY: PASS=$PASS FAIL=$FAIL ##########" | tee -a "$POS_LOG"
 echo "full logs: $POS_LOG"; echo "           $NEG_LOG"; echo "           $LIVE_LOG"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

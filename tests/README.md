@@ -65,15 +65,14 @@ DCP 的读盘发生在 load session 初始化。不能把每次 accessor callbac
 
 ## 本轮实际结果
 
-受测树：`368b036b865b9b54e5eb829238ef1d5834dca2c8`。
+受测树：`42d03d8`（分支 `fix/cache-propagation-plan`，digest 干净归档树）。
 
-- digest 全量 pytest：1413 passed、0 failed、0 skipped；1200.85 秒。
+- digest 全量 pytest：1488 passed、0 failed、0 skipped（含真实 2–32 rank torch/LAWA）。
 - 格式、lint、字节编译通过；ty 与 Pyrefly 均为 0 诊断。
-- 独立变异检测：11 个核心变异及 1 个 DCP 变异全部检出。baseline 必须先成功，超时或收集错误不计检出。
-- 独立形式化复验：Lean 5 个正向文件通过、6 个负向夹具被拒绝；TLA+ 22 个矩阵检查通过。
-- pytest 有 886 条警告。主要为 DCP 单进程 save/load 提示；另含覆盖已有测试 checkpoint 的提示。完整警告保留在原始日志。
+- 独立变异检测：11 个核心变异全部检出（含新的字节预算准入与 owed ACK 释放变异）。
+- 独立形式化复验：Lean 5 个正向文件通过、6 个负向夹具被拒绝；TLA+ 30 个检查通过（CopyPlan 10、AtomicPublish 1、SlotLifecycle 11、CachePropagation 8）。
 
-证据在 `log/real-file-full-launch.log` 与 `log/final-real-file-{core-mutation,dcp-mutation,formal}.log`。日志不作为发布包内容。
+证据在 digest `log/fix-df1/`（pytest、mutation、formal）。日志不作为发布包内容。
 
 ## 证明边界
 
