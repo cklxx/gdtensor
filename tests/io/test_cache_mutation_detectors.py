@@ -20,7 +20,7 @@ from tests.support.cache_oracle import (
 from tests.support.oracle import ArrayFabric
 
 
-def _chain(root, names, exclusive):
+def _chain(root, names, exclusive, steps=1):
     table = compute_table(names, exclusive=exclusive)
     points = {
         rank: {name: _points(rank, i, exclusive) for i, name in enumerate(names)}
@@ -58,7 +58,7 @@ def _chain(root, names, exclusive):
     dst = ArrayFabric(table, points)
     stored = make_storage_view(names, st, layout, str(root / "checkpoint"))
     chain = gb.OneLayerCachedDTensorsReadChain(
-        stored, cache_view(names, cache), dst.view(0), num_ranks_per_node=2
+        stored, cache_view(names, cache, steps=steps), dst.view(0), num_ranks_per_node=2
     )
     return chain, dst, cache, values
 
@@ -86,8 +86,10 @@ def _outputs(dst, values):
             assert zlib.crc32(data.tobytes()) == zlib.crc32(wanted)
 
 
-def test_cap_guard_allows_one_fill_for_replicate_cohort(tmp_path):
-    """Distinct tensors on one node: B cannot allocate while A occupies C=1."""
+def test_cell_budget_sums_all_tensors_of_a_cell(tmp_path):
+    """C=1 cell budget is the (step, slot) cell summed over every tensor.
+    'a' and 'b' share cell (0, 0): both may be resident together, and the
+    full read chain completes without the budget pinning one tensor out."""
     chain, dst, cache, values = _chain(tmp_path, ["a", "b"], True)
     release = threading.Event()
     cache.release, cache.block_rank = release, 0
@@ -96,16 +98,18 @@ def test_cap_guard_allows_one_fill_for_replicate_cohort(tmp_path):
         first = pool.submit(_run, chain, dst, cache, 0)
         assert cache.entered.wait(5), "rank0 did not reach file-cache read"
         second = pool.submit(_run, chain, dst, cache, 1)
-        # Probe the held interval; reaching a second write is observable at the
-        # actual disk boundary, rather than inferred from a private counter.
-        assert not cache.second_write.wait(0.3), "C=1 allowed a concurrent file fill"
+        # While rank0 is blocked on its file-cache read, 'a' (4B) is resident.
+        # The (0, 0) cell budget sums both tensors (4+4=8B), so the concurrent
+        # fill of 'b' is admitted: two files coexist (peak 2), unlike the old
+        # per-tensor budget that pinned it out.
+        assert cache.second_write.wait(1), "cell budget should admit the second tensor"
+        assert cache.peak == 2, cache.writes
         release.set()
         assert type(first.result(timeout=10)) is gb.Ok
         assert type(second.result(timeout=10)) is gb.Ok
     finally:
         release.set()
         pool.shutdown(wait=True)
-    assert cache.peak == 1, cache.writes
     assert len(cache.writes) == 2
     assert not cache.slots
     _outputs(dst, values)

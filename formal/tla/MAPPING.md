@@ -1,15 +1,21 @@
-# SlotLifecycle.tla — mapping to `gdtensor/internal/api.py`
+# Formal TLA+ models — mapping to `gdtensor/internal/`
 
 This document is the field-by-field and transition-by-transition correspondence
-between the TLA+ model `SlotLifecycle.tla` and the implementation, plus the explicit
-assumptions under which the model is claimed. The model is a *bounded projection*,
-not a proof of the whole Python.
+between the TLA+ models and the implementation, plus the explicit assumptions
+under which the models are claimed. Each model is a *bounded projection*, not a
+proof of the whole Python.
 
-Pinned slot-runtime baseline: `gdtensor/internal/api.py` at
-`sha256 5ddec0b159b10fbb2a1eb2f0bcd4bbc4d5a7b89e8ccde983f0046aba083f4b3b`.
-The file-range fix retains source paths and slot boundaries in fill jobs;
-`_NodeState` transitions modeled here are unchanged. Current source hashes are
-recorded by `scripts/formal_gate.sh` in its generated manifest.
+- `SlotLifecycle.tla` covers the cohort/error lifecycle of one cache node.
+- `CachePropagation.tla` covers the node-level propagation plan: byte-budget
+  admission, parent/child order, and release after every owed ack.
+
+Pinned runtime baseline:
+- `gdtensor/internal/api.py`
+  `sha256 a2dc3d8b3ecab3f88a47bdebb4a50b5d3942bfce299efa36225e547561f7b21f`.
+- `gdtensor/internal/propagation.py`
+  `sha256 a1faec351e0e4c016e0efa221146030e941b64d37a0c13a9fc89210da8410506`.
+Current source hashes are recorded by `scripts/formal_gate.sh` in its
+generated manifest.
 
 ## Field map
 
@@ -93,3 +99,99 @@ Scope note: the model's `cov`/`required` abstracts `_covers` as a set of
 interval condition of the production path. It checks the cell-contract shape
 (coverage set empties only when every expected pair is acked) under the bounded
 grid here, not a proof of the Python.
+
+---
+
+# CachePropagation.tla — mapping to `propagation.py` + `api.py`
+
+The fixed instance is the two-layer fan-out fixed by this change: layer 0 is
+node 0 with one 8-byte segment; terminal nodes 1 and 2 each own one 4-byte
+segment and both read the layer-0 segment.
+
+## Plan field map (`internal/propagation.py`)
+
+| plan / executor concept                  | model element                     |
+|------------------------------------------|-----------------------------------|
+| `ChainPlan.nodes` / segments per node    | `Nodes`, one segment per node     |
+| segment byte size                        | `SegSize[n]`                      |
+| `ChainPlan.budget` byte bound            | `Budget[n]`                       |
+| parent edges (`Segment.parents`)         | `Edges[n]` (constant `A`)         |
+| owed rank consumers (`segment.owed()`)   | `owe[n]`                          |
+| unacked parent edges                     | `rem[n]`                          |
+| `_NodeState.resident`                    | `res[n]`                          |
+| `_NodeState.slots[k].filled`             | `st[n]`: admitted → ready         |
+| node-wide generation error               | `nerr[n]`                         |
+| fill admission (`state.resident+size<=budget`) | `Admit(n)` budget guard    |
+
+Bookkeeping variables `seen`, `seen0`, and `p0ready` are model-only history
+latches. They exclude the pre-pass state from "early release" statements and
+remember that the parent reached `ready` at least once (the parent may be
+released while a child keeps its own copied bytes). They have no runtime
+counterpart.
+
+## Transition map
+
+| executor (`api.py`)                                  | model step          |
+|------------------------------------------------------|---------------------|
+| `_NodeState.admit` byte-budget check                 | `Admit(n)`          |
+| fill job completes (`slots[k]["filled"]=True`)       | `Fill(n,TRUE)`      |
+| `_SlotTable._ack` rank piece                         | `RankAck(n)`        |
+| segment released after owed set empties              | `ReleaseTerminal(n)`|
+| child ack of a parent edge                           | `AckEdge(n)`        |
+| parent released after every child acked              | `ReleaseParent`     |
+| `_fail_node` generation error                        | `Fill(n,FALSE)`     |
+
+## Safety invariants (positive cfg must satisfy all)
+
+- `ByteBudget`              — resident bytes never exceed `ChainPlan.budget`.
+- `ResidentExact`           — `resident` equals exactly the admitted and ready
+                              segment sizes.
+- `NoEarlyRankRelease`      — a terminal segment leaves memory only after every
+                              owed rank acked.
+- `NoEarlyParentRelease`    — the layer-0 segment leaves memory only after
+                              every child acked its edge.
+- `ParentReadyBeforeChild`  — a child occupies bytes only after the parent
+                              reached ready once.
+- `EdgesArePlanEdges`       — a remaining ack edge is always a plan edge.
+- `ErrorRecorded`           — a failed fill sets the node-wide generation error.
+- `ErrorStopsAdmit`         — a recorded error blocks new admission in the pass.
+
+## Negative mutants (each must be caught by one named invariant)
+
+| `MUTANT`          | models bug                                       | caught by                  |
+|-------------------|--------------------------------------------------|----------------------------|
+| `no_budget`       | admission skips the byte-budget guard            | `ByteBudget`               |
+| `early_rank`      | release a terminal segment before all rank acks  | `NoEarlyRankRelease`       |
+| `early_parent`    | release the parent before all child acks         | `NoEarlyParentRelease`     |
+| `no_parent_order` | admit a child before the parent is ready         | `ParentReadyBeforeChild`   |
+| `silent_error`    | a failed fill is not recorded node-wide          | `ErrorRecorded`            |
+
+## Bounded liveness (not unconditional)
+
+`LiveGoal == \A n : [](st[n] # "gone" => <>(st[n] = "gone"))` holds under
+`FairSpec`: weak fairness on admit/fill/ack/release, fills succeed, every rank
+acks, and every child acks its parent edge. The `peer_down` config removes the
+rank ack of node 2; TLC returns a temporal counterexample (exit 13). The
+executor exposes the same boundary as `cache_wait` after
+`GDTENSOR_CACHE_WAIT_SECONDS` (default 60 s): an absent consumer is reported,
+not waited on forever.
+
+Scope: one fixed fan-out instance, one segment per node, one byte size per
+segment. Cross-process coordination is a real implementation
+(`_FileSlotTable`, selected by `GDTENSOR_CACHE_COORDINATOR`), but the model
+still projects it away: it checks the shared in-memory table contract shape,
+not file locking. The adversarial fixes sit at these layers:
+
+- Cell budget sums every tensor of a (step, slot) cell: `_budget` keys cells by
+  `(s, c)` and sums segment bytes over all tensors, so `ByteBudget` compares
+  against the aggregated node budget that `ChainPlan.budget` publishes.
+- Absent cohort ranks error, never hang: the executor raises `cache_wait` after
+  `GDTENSOR_CACHE_WAIT_SECONDS` (modeled as the `peer_down` liveness boundary).
+- In-flight fills count as progress: `_block` keeps waiting while `inflight > 0`
+  even when the version is unchanged (a timeout detail, outside the model).
+- The plan cache holds weak references only: `_slots` registers
+  `weakref.finalize(view, _drop_table, key)` so a `ChainPlan` never pins a cache
+  view (lifetime, outside the model).
+- `check_constraints` rejects mixed node sets and out-of-range ranks up front
+  (`ConstraintViolationError` / `InvalidArgumentError`); `CacheDTensorsView` is
+  registered with the constraint checker (construction-time, outside the model).

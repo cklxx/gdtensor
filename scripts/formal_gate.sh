@@ -8,11 +8,14 @@
 #      sorry/admit/axiom or compile error.
 #   2. TLC    -- scripts/get_tla_tools.sh provisions the pinned, sha256-verified
 #      tla2tools.jar (v1.8.0) and formal/tla/run_tlc.sh model-checks the real
-#      CopyPlan / AtomicPublish specs over their S/N grids AND the new
+#      CopyPlan / AtomicPublish specs over their S/N grids, the
 #      formal/tla/SlotLifecycle.tla slot-state model (per-ready-slot success,
-#      invariant violations, peer-down and out-of-generation negatives). Both the
-#      Lean (5 positive files + 6 negative false lemmas, all proof-level rejected)
-#      and TLA (22 cases) suites have passed on the digest host.
+#      invariant violations, peer-down and out-of-generation negatives), and the
+#      formal/tla/CachePropagation.tla node-level propagation-plan model (byte
+#      budget, parent/child order, owed-rank/edge release, fill error, and the
+#      bounded absent-consumer liveness boundary). Both the Lean (5 positive
+#      files + 6 negative false lemmas, all proof-level rejected) and TLA
+#      (30 cases) suites have passed on the digest host.
 #
 # It does NOT modify the owners' entrypoints (formal/lean/check.sh,
 # formal/tla/run_tlc.sh); it only invokes them with the pinned toolchain / jar.

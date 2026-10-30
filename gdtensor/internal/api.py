@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 import ctypes
+import hashlib
 import logging
+import os
+import pickle
+import tempfile
 import threading
+import time
 import weakref
+from typing import Any
 
 from .plan import (
     d_tensors_view_rank_plan_load,
@@ -15,284 +21,18 @@ from .plan import (
     validate_rank_save,
 )
 from .ranges import CopyPlan, RangeFromComputeView
-from .result import catch, invalid, must_ok
+from .result import catch, check_failed, invalid, must_ok
 from .views import ComputeDTensorsView, StorageDTensorsView
 from .. import Result
 from .products import Ok
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl: Any = None
+
 
 _LOG = logging.getLogger(__name__)
-
-
-_view_slots: "weakref.WeakKeyDictionary[object, _SlotTable]" = (
-    weakref.WeakKeyDictionary()
-)
-_table_lock = threading.Lock()
-
-
-def _rng_key(rng) -> tuple:
-    tid = getattr(rng, "global_tensor_id", "")
-    off = getattr(rng, "global_tensor_offset", None)
-    if off is None:
-        off = rng.contiguous_payload_offset
-    return (tid, off, rng.size)
-
-
-def _seg(cache_rng, eff_src, src_rng) -> dict:
-    tid = getattr(cache_rng, "global_tensor_id", "")
-    off = getattr(cache_rng, "global_tensor_offset", None)
-    if off is None:
-        off = cache_rng.contiguous_payload_offset
-    return {
-        "key": (tid, off, cache_rng.size),
-        "eff_src": eff_src,
-        "src_rng": src_rng,
-        "tid": tid,
-        "off": off,
-        "size": cache_rng.size,
-    }
-
-
-def _overlap(rng, seg) -> int:
-    off = getattr(rng, "global_tensor_offset", None)
-    if off is None:
-        off = rng.contiguous_payload_offset
-    end = off + rng.size
-    s_e = seg["off"] + seg["size"]
-    return max(0, min(end, s_e) - max(off, seg["off"]))
-
-
-def _overlap_iv(rng, seg):
-    """Global-offset overlap interval (off, size) between rng and a slot seg."""
-    off = getattr(rng, "global_tensor_offset", None)
-    if off is None:
-        off = rng.contiguous_payload_offset
-    end = off + rng.size
-    s_e = seg["off"] + seg["size"]
-    a, b = max(off, seg["off"]), min(end, s_e)
-    if b <= a:
-        return (off, 0)
-    return (a, b - a)
-
-
-def _rng_to_view_range(view, key):
-    tid, off, size = key
-    return RangeFromComputeView(tid, off, size)
-
-
-class _NodeState:
-    """Per-node, per-cache-view residency for one atomic fill segment.
-
-    A segment is keyed by the global interval (tid, offset, size) it occupies
-    on the cache node. Live segments are bounded by the cache mesh concurrency
-    width C. A fill failure records one node-wide primary error bound to the
-    current cohort generation: every rank sharing that generation raises it; a
-    later generation (next explicit chain_load) starts clean. A segment releases
-    only after every expected consumer rank on this node has ACKed its drain —
-    including replicated ranks that read the same bytes.
-    """
-
-    def __init__(self, cap: int, consumers: int) -> None:
-        self.lock = threading.Lock()
-        self.cond = threading.Condition(self.lock)
-        self.slots: dict[tuple, dict] = {}
-        self.live = 0
-        self.cap = max(1, cap)
-        self.consumers = max(1, consumers)
-        self.error: BaseException | None = None
-        self.error_gen = -1
-        self.gen = 0
-        self.active = 0
-        self.cohort_joined: set = set()
-
-    def generation_start(self, rank: int) -> int:
-        """Join the node's current cohort, or open a fresh one only after the
-        previous cohort's expected ranks have all observed it (so a slightly late
-        same-cohort rank still sees the node-wide error). Per-rank join set, so a
-        same-rank re-entry cannot prematurely advance the epoch."""
-        with self.lock:
-            self._cohort_join(rank)
-        return self.gen
-
-    def _cohort_join(self, rank: int) -> None:
-        if self.active != 0 or len(self.cohort_joined) < self.consumers:
-            self.active += 1
-            self.cohort_joined.add(rank)
-            return
-        self.gen += 1
-        self.error = None
-        self.error_gen = -1
-        self.cohort_joined = set()
-        self.active += 1
-        self.cohort_joined.add(rank)
-
-    def generation_end(self) -> None:
-        with self.lock:
-            self.active = max(0, self.active - 1)
-            self.cond.notify_all()
-
-    @staticmethod
-    def _new_slot():
-        return {
-            "filled": False,
-            "error": None,
-            "error_gen": -1,
-            "required": {},  # rank -> set[(a,b)] it must drain
-            "cov": {},  # rank -> set[(a,b)] acked so far
-        }
-
-    def set_expected(self, key: tuple, required: dict) -> None:
-        with self.lock:
-            self._set_expected_locked(key, required)
-
-    def _set_expected_locked(self, key, required):
-        slot = self.slots.get(key)
-        if slot is not None and not slot["required"]:
-            slot["required"] = {r: set(iv) for r, iv in required.items()}
-        self.cond.notify_all()
-
-    @staticmethod
-    def _covers(ivs, required):
-        merged = set(ivs)
-        return all(any(x <= a and y >= b for x, y in merged) for a, b in required)
-
-    def ack_drain(self, key: tuple, rank: int, off: int, size: int) -> None:
-        with self.lock:
-            self._ack_drain_locked(key, rank, off, size)
-
-    def _ack_drain_locked(self, key, rank, off, size):
-        slot = self.slots.get(key)
-        if slot is None:
-            return
-        slot["cov"].setdefault(rank, set()).add((off, off + size))
-        required = slot["required"] or {rank: {(off, off + size)}}
-        done = all(
-            self._covers(slot["cov"].get(r, set()), iv) for r, iv in required.items()
-        )
-        if done:
-            del self.slots[key]
-            self.live -= 1
-        self.cond.notify_all()
-
-    def begin_fill(self, key: tuple, gen: int, block: bool = True) -> bool:
-        """Return True if the caller must write this segment; False to reuse a
-        resident, already-filled segment. Blocks while C is saturated unless the
-        caller is a downstream-cache pull in the same recursion (block=False)."""
-        with self.lock:
-            return self._begin_fill_locked(key, gen, block)
-
-    def _begin_fill_locked(self, key, gen, block):
-        decision = self._begin_decision(key, gen, block)
-        while decision is None:
-            self.cond.wait()
-            decision = self._begin_decision(key, gen, block)
-        return decision
-
-    def _begin_decision(self, key, gen, block):
-        """Return a value if the loop should exit, None to keep waiting."""
-        if self.error is not None and self.error_gen == gen:
-            raise self.error
-        slot = self.slots.get(key)
-        if slot is not None:
-            return self._begin_existing(slot, key, gen, block)
-        if block and self.live >= self.cap:
-            return None
-        self.slots[key] = self._new_slot()
-        self.live += 1
-        return True
-
-    def _begin_existing(self, slot, key, gen, block):
-        if slot["filled"] and slot["error"] is None:
-            return False
-        if slot["filled"] and slot["error"] is not None:
-            return self._begin_filled_error(slot, key, gen, block)
-        return None
-
-    def _begin_filled_error(self, slot, key, gen, block):
-        if slot["error_gen"] == gen:
-            raise slot["error"]
-        del self.slots[key]
-        if block and self.live >= self.cap:
-            return None
-        self.slots[key] = self._new_slot()
-        self.live += 1
-        return True
-
-    def finish_fill(
-        self, key: tuple, ok: bool, gen: int, exc: BaseException | None = None
-    ) -> None:
-        with self.lock:
-            self._finish_locked(key, ok, gen, exc)
-            self.cond.notify_all()
-
-    def _finish_locked(self, key, ok, gen, exc):
-        slot = self.slots.get(key)
-        if slot is not None:
-            self._apply_finish(slot, ok, gen, exc)
-
-    def _apply_finish(self, slot, ok, gen, exc):
-        if ok:
-            slot["filled"] = True
-            return
-        self.error = exc
-        self.error_gen = gen
-        slot["error"] = exc
-        slot["error_gen"] = gen
-        slot["filled"] = True
-        self.live -= 1
-
-    def wait_filled(self, key: tuple, gen: int) -> None:
-        with self.lock:
-            decision = self._wait_loop(key, gen)
-        if decision is not False:
-            raise decision
-
-    def _wait_loop(self, key, gen):
-        decision = self._wait_decision(key, gen)
-        while decision is None:
-            self.cond.wait()
-            decision = self._wait_decision(key, gen)
-        return decision
-
-    def _wait_decision(self, key, gen):
-        """None = keep waiting; an error instance = raise; False = proceed."""
-        if self.error is not None and self.error_gen == gen:
-            return self.error
-        slot = self.slots.get(key)
-        if slot is None:
-            return False
-        if not slot["filled"]:
-            return None
-        if slot["error"] is not None and slot["error_gen"] == gen:
-            return slot["error"]
-        return False
-
-
-class _SlotTable:
-    def __init__(self, cap: int, consumers: int) -> None:
-        self.nodes: dict[int, _NodeState] = {}
-        self.cap = cap
-        self.consumers = consumers
-        self._lock = threading.Lock()
-
-    def node(self, node: int) -> _NodeState:
-        state = self.nodes.get(node)
-        if state is None:
-            state = self._locked_get(node)
-        return state
-
-    def _locked_get(self, node):
-        with self._lock:
-            return self.nodes.setdefault(node, _NodeState(self.cap, self.consumers))
-
-
-def _slots(cache_view, consumers: int, live_limit: int) -> _SlotTable:
-    with _table_lock:
-        table = _view_slots.get(cache_view)
-        if table is None:
-            table = _SlotTable(live_limit, consumers)
-            _view_slots[cache_view] = table
-        return table
 
 
 def _read(src_acc, src) -> bytes:
@@ -416,491 +156,764 @@ def d_tensors_view_rank_load(
 
 
 # ---------------------------------------------------------------- B.1.1 chain load
+#
+# Cached legs run from one node-level propagation plan (propagation.py). Every
+# segment of a (layer, node) is filled once, stays resident until every
+# consumer (a rank drain or a child segment fill) has ACKed its bytes, and is
+# admitted only while the layer's resident bytes stay inside the plan budget.
+# The stat function reports the same budget, so it is a hard bound.
+#
+# Coordination state lives in a _SlotTable per concrete chain. The default
+# table is in-process (threads). Another process model replaces it through
+# CACHE_COORDINATOR_FACTORY with the same method contract.
+
+_WAIT_ENV = "GDTENSOR_CACHE_WAIT_SECONDS"
+_DEFAULT_WAIT_SECONDS = 60.0
 
 
-def _finish_chain_sessions(opened):
-    """finish load sessions; keep and return the first error."""
-    primary = None
-    for session in reversed(opened):
-        primary = _finish_one_session(session, primary)
-    return primary
+class _NodeState:
+    """Residency of one (cache layer, node): segments, bytes, generation."""
+
+    def __init__(self, budget: int, cohort: set) -> None:
+        self.budget = budget
+        self.cohort = set(cohort)
+        self.slots: dict = {}  # key -> {"filled", "owed"}
+        self.resident = 0
+        self.gen = 0
+        self.active = 0
+        self.joined: set = set()
+        self.error: tuple | None = None  # (check_name, msg), pickle-safe
+
+    def join(self, rank: int) -> int:
+        """Join the current generation, or open a new one when the previous
+        generation is idle and either complete or re-entered by this rank."""
+        idle = self.active == 0 and self.joined
+        if idle and (rank in self.joined or self.cohort <= self.joined):
+            self.gen += 1
+            self.slots, self.resident, self.error = {}, 0, None
+            self.joined = set()
+        self.active += 1
+        self.joined.add(rank)
+        return self.gen
+
+    def fits(self, size: int) -> bool:
+        return self.resident + size <= self.budget
+
+    def admit(self, key, size: int) -> bool:
+        if not self.fits(size):
+            return False
+        self.slots[key] = {"filled": False, "owed": None}
+        self.resident += size
+        return True
+
+    def release(self, key) -> None:
+        self.slots.pop(key, None)
+        self.resident -= key[2]
+
+    def check(self, gen: int) -> None:
+        """Raise the error recorded for this generation, if any."""
+        if self.error is not None and self.gen == gen:
+            name, msg = self.error
+            raise check_failed(name, msg)
+
+    def reserve(self, segs: list) -> bool:
+        """Admit all segments or none; each starts unfilled with its owed set."""
+        if any(s.key in self.slots for s in segs):
+            return False
+        if not self.fits(sum(s.size for s in segs)):
+            return False
+        for s in segs:
+            self.admit(s.key, s.size)
+            self.slots[s.key]["owed"] = s.owed()
+        return True
+
+    def ack(self, key, piece) -> None:
+        slot = self.slots.get(key)
+        if slot is None:
+            raise check_failed("cache_ack", f"segment {key} released before {piece}")
+        slot["owed"].discard(piece)
+        if not slot["owed"]:
+            self.release(key)
+
+    def fail(self, exc: BaseException, key) -> None:
+        if key is not None:
+            self.release(key)
+        if self.error is None:
+            name = getattr(exc, "check_name", None) or type(exc).__name__
+            self.error = (name, str(exc) or name)
+
+    def owed_to(self) -> list:
+        owed = {c for slot in self.slots.values() for c, _o, _n in slot["owed"] or ()}
+        return sorted(owed, key=str)
 
 
-def _finish_one_session(session, primary):
-    try:
-        must_ok(session.finish())
-    except BaseException as exc:
-        if primary is None:
-            return exc
-    return primary
+class _SlotTable:
+    """In-process coordinator for one concrete chain: one lock, one version."""
+
+    def __init__(self, plan, key: str | None = None) -> None:
+        self.plan = plan
+        self.key = key
+        self.cond = threading.Condition()
+        self.version = 0
+        self.inflight = 0
+        self.nodes = {
+            (layer, node): _NodeState(budget, plan.cohort[layer][node])
+            for layer, budgets in enumerate(plan.budget)
+            for node, budget in budgets.items()
+        }
+
+    def node(self, layer: int, node: int) -> _NodeState:
+        return self.nodes[(layer, node)]
+
+    def bump(self) -> None:
+        self.version += 1
+        self.cond.notify_all()
+
+    def mark_touched(self, key) -> None:
+        """No-op: this table shares one in-memory state, so there is no
+        snapshot merge to protect."""
 
 
-def _collect_concrete_chains(read_chain, plan_chain, legs_for):
-    """(read chain, plan chain, legs) tuples in data-flow order."""
-    from .chain import (
-        DirectDTensorsReadChain,
-        MixedDTensorsReadChain,
-        OneLayerCachedDTensorsReadChain,
-        TwoLayerCachedDTensorsReadChain,
-    )
+# ---------------------------------------------------------------- process-safe table
+#
+# The real deployment shape is one process per rank. _SlotTable cannot see
+# another process's state, so the default coordinator is _FileSlotTable: the
+# plan state lives in one pickle file guarded by fcntl.flock, and any process
+# that builds the same concrete chain (same content fingerprint) shares it.
+# Threads of one process serialize on an RLock before taking the flock; the
+# cond contract (enter/exit/wait_for) is duck-typed by _FileCond.
 
-    t = type(read_chain)
-    if t in (
-        DirectDTensorsReadChain,
-        OneLayerCachedDTensorsReadChain,
-        TwoLayerCachedDTensorsReadChain,
-    ):
-        return [(read_chain, plan_chain, legs_for(read_chain))]
-    if t is MixedDTensorsReadChain:
-        return [
-            (seg.read_chain, seg_pc, legs_for(seg.read_chain))
-            for seg, seg_pc in zip(
-                read_chain.disjoint_tensor_ids_and_read_chain_list,
-                plan_chain.disjoint_tensor_ids_and_copy_plan_chain_list,
+_COORD_ENV = "GDTENSOR_CACHE_COORDINATOR"
+_COORD_DIR_ENV = "GDTENSOR_CACHE_DIR"
+_MAGIC = "gdtensor-coord-v1"
+
+
+def _DBG(*parts) -> None:
+    if _DBG_ENABLED:
+        print("[coord]", " ".join(map(str, parts)), flush=True)
+
+
+_DBG_ENABLED = os.environ.get("GDTENSOR_CACHE_COORD_DEBUG") == "1"
+
+
+class _FileCond:
+    """threading.Condition contract over _FileSlotTable.
+
+    `with cond:` takes the thread lock and the file lock, then refreshes the
+    local state. wait_for drops both locks, sleeps briefly, re-locks and
+    re-reads, so writers in other processes can make progress.
+    """
+
+    def __init__(self, table) -> None:
+        self.t = table
+
+    def __enter__(self):
+        _DBG("enter", threading.current_thread().name)
+        self.t._enter()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        _DBG("exit", threading.current_thread().name)
+        self.t._exit()
+
+    def notify_all(self) -> None:
+        pass
+
+    def wait_for(self, predicate, timeout=None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        result = None
+        while result is None:
+            result = self._wait_step(predicate, deadline)
+        return result
+
+    def _wait_step(self, predicate, deadline):
+        action = self._wait_ready(predicate, deadline)
+        if action == "poll":
+            _DBG("wfdrop", threading.current_thread().name)
+            self.t._drop()
+            self._poll()
+            return None
+        return action == "ready"
+
+    def _wait_ready(self, predicate, deadline) -> str:
+        if predicate():
+            return "ready"
+        if deadline is not None and time.monotonic() >= deadline:
+            return "timeout"
+        return "poll"
+
+    def _poll(self) -> None:
+        try:
+            time.sleep(self.t._POLL)
+        finally:
+            _DBG("wfreq", threading.current_thread().name)
+            self.t._reacquire()
+
+
+class _FileSlotTable:
+    """Process-safe coordinator for one concrete chain (content fingerprint).
+
+    The state is {magic, version, inflight, nodes: {(layer, node): _NodeState}}.
+    Every mutation runs under a process RLock and an exclusive flock on the
+    state file, then bumps the version and writes the file atomically
+    (temp file + os.replace). Waits poll the file version.
+    """
+
+    _POLL = 0.005
+
+    def __init__(self, plan, key: str) -> None:
+        if fcntl is None:
+            raise invalid("read_chain", "file coordinator needs POSIX fcntl")
+        self.plan = plan
+        self.key = key
+        base = os.path.join(
+            os.environ.get(_COORD_DIR_ENV, tempfile.gettempdir()),
+            f"gdtensor-coord-{key}",
+        )
+        self._path = base + ".state"
+        self._fd = open(base + ".lock", "a+b")
+        self._thread_lock = threading.RLock()
+        self._held = False
+        self._dirty = False
+        self.version = 0
+        self.inflight = 0
+        self.nodes = {}
+        self._touched: set = set()
+        self.cond = _FileCond(self)
+        self._reacquire()
+        self._drop()  # load the initial state, then release both locks
+
+    def node(self, layer: int, node: int) -> _NodeState:
+        return self.nodes[(layer, node)]
+
+    def bump(self) -> None:
+        """Mark this critical section as a write: __exit__ persists the new
+        version and state. Read-only sections (e.g. wait_for polling) do not
+        bump, so a peer's version change is the only wake-up signal."""
+        self._dirty = True
+
+    def mark_touched(self, key) -> None:
+        """Record one (layer, node) state this critical section changed; the
+        writer merges exactly these states into the latest on-disk version,
+        avoiding a stale snapshot from rolling back a peer's update."""
+        self._touched.add(key)
+
+    def _enter(self) -> None:
+        _DBG("t_enter", threading.current_thread().name, "held", self._held)
+        self._thread_lock.acquire()
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX)  # type: ignore[possibly-missing-attribute]
+            self._refresh()
+            self._check_reentrant()
+            self._held = True
+            self._dirty = False
+        except BaseException:
+            self._unlock()
+            raise
+
+    def _check_reentrant(self) -> None:
+        if self._held:
+            raise RuntimeError("_FileSlotTable.cond is not reentrant")
+
+    def _unlock(self) -> None:
+        self._thread_lock.release()
+
+    def _exit(self) -> None:
+        _DBG(
+            "t_exit",
+            threading.current_thread().name,
+            "v",
+            self.version,
+            "d",
+            self._dirty,
+        )
+        if self._dirty:
+            self.version += 1
+            latest = self._read_state()
+            latest["nodes"].update({k: self.nodes[k] for k in self._touched})
+            latest["version"] = self.version
+            latest["inflight"] = self.inflight
+            self._write_state(latest)
+        self._held = False
+        fcntl.flock(self._fd, fcntl.LOCK_UN)  # type: ignore[possibly-missing-attribute]
+        self._thread_lock.release()
+
+    def _drop(self) -> None:
+        _DBG("t_drop", threading.current_thread().name)
+        self._held = False
+        fcntl.flock(self._fd, fcntl.LOCK_UN)  # type: ignore[possibly-missing-attribute]
+        self._thread_lock.release()
+
+    def _reacquire(self) -> None:
+        _DBG("t_reacq", threading.current_thread().name)
+        self._thread_lock.acquire()
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX)  # type: ignore[possibly-missing-attribute]
+            self._refresh()
+            self._held = True
+        except BaseException:
+            self._thread_lock.release()
+            raise
+
+    def _refresh(self) -> None:
+        state = self._read_state()
+        self.nodes = state["nodes"]
+        self.version = state["version"]
+        self.inflight = state["inflight"]
+        self._touched = set()
+
+    def _read_state(self) -> dict:
+        try:
+            state = self._read_raw()
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError, ValueError):
+            state = None
+        if not state or state.get("magic") != _MAGIC:
+            return {
+                "magic": _MAGIC,
+                "version": 0,
+                "inflight": 0,
+                "nodes": self._initial_nodes(),
+            }
+        return state
+
+    def _read_raw(self) -> dict:
+        size = os.path.getsize(self._path)
+        if size > 1 << 20:
+            _LOG.error("coordinator state oversized: %d bytes at %s", size, self._path)
+        with open(self._path, "rb") as fh:
+            return pickle.load(fh)
+
+    def _initial_nodes(self) -> dict:
+        return {
+            (layer, node): _NodeState(budget, self.plan.cohort[layer][node])
+            for layer, budgets in enumerate(self.plan.budget)
+            for node, budget in budgets.items()
+        }
+
+    def _write_state(self, state: dict) -> None:
+        try:
+            blob = pickle.dumps(state, protocol=5)
+        except BaseException:
+            _LOG.error(
+                "coordinator state not picklable: %r", state.get("nodes", {}).keys()
             )
+            raise
+        tmp = self._path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(blob)
+        os.replace(tmp, self._path)
+
+
+def _coordinator_factory():
+    mode = os.environ.get(_COORD_ENV, "file")
+    if mode == "thread":
+        return _SlotTable
+    if mode == "file":
+        return _FileSlotTable
+    raise invalid(_COORD_ENV, "must be 'file' or 'thread'")
+
+
+_view_slots: dict = {}
+_table_lock = threading.RLock()
+
+
+def _chain_fingerprint(chain) -> str:
+    """Content hash of a concrete chain: identical chains in different
+    processes share one coordinator file. Views (which hold accessors) are
+    excluded, so the key never retains them."""
+    from .propagation import cache_layers
+
+    tables = [view.d_tensor_table for view in cache_layers(chain)]
+    tables += [chain.src.d_tensor_table, chain.dst.d_tensor_table]
+    payload = (tables, chain.src.physical_layout, chain.num_ranks_per_node)
+    return hashlib.sha256(pickle.dumps(payload, protocol=5)).hexdigest()[:20]
+
+
+def _drop_table(key) -> None:
+    # Pop under the lock, drop the table outside it: dropping the table can
+    # run another view finalizer that takes the same lock.
+    with _table_lock:
+        table = _view_slots.pop(key, None)
+    del table
+
+
+def _slots(chain):
+    from .propagation import build_chain_plan, cache_layers
+
+    key = _chain_fingerprint(chain)
+    with _table_lock:
+        table = _view_slots.get(key)
+    if table is not None:
+        return table
+    table = _coordinator_factory()(build_chain_plan(chain), key)
+    with _table_lock:
+        table = _view_slots.setdefault(key, table)
+    for view in cache_layers(chain):
+        weakref.finalize(view, _drop_table, key)
+    return table
+
+
+def _wait_seconds() -> float:
+    raw = os.environ.get(_WAIT_ENV, "")
+    if not raw:
+        return _DEFAULT_WAIT_SECONDS
+    value = float(raw)
+    if value <= 0:
+        raise invalid(_WAIT_ENV, "must be a positive number of seconds")
+    return value
+
+
+class _RankRun:
+    """One rank's pass over a cached concrete chain.
+
+    Methods stay flat (no nested blocks) so that each step reads as one unit:
+    drain what is filled, otherwise fill what fits, otherwise wait.
+    """
+
+    def __init__(self, table, rank: int, caches, storage, dst) -> None:
+        from .propagation import rank_closure
+
+        self.t, self.plan, self.rank = table, table.plan, rank
+        self.caches, self.storage, self.dst = caches, storage, dst
+        self.last = len(caches) - 1
+        closure = rank_closure(self.plan, rank)
+        self.gens = dict.fromkeys(sorted({(lay, n) for lay, n, _k in closure}), 0)
+        self.wait = _wait_seconds()
+
+    def run(self) -> None:
+        with self.t.cond:
+            self.gens = {ln: self.t.node(*ln).join(self.rank) for ln in self.gens}
+            [self.t.mark_touched(ln) for ln in self.gens]
+            self.t.bump()
+        try:
+            self._wait_cohort()
+            self._loop(list(self.plan.drains[self.rank]))
+        finally:
+            self._leave()
+
+    def _wait_cohort(self) -> None:
+        """Wait for missing consumers of a node whose budget cannot hold the
+        whole demand. After the wait limit this is a clear error, not a hang."""
+        deadline = time.monotonic() + self.wait
+        while not self._cohort_round(deadline):
+            pass
+
+    def _cohort_round(self, deadline: float) -> bool:
+        """One wait round; True when the cohort is complete."""
+        with self.t.cond:
+            gaps = self._cohort_gaps()
+        if gaps:
+            return self._cohort_wait_or_timeout(deadline, gaps)
+        return True
+
+    def _cohort_wait_or_timeout(self, deadline: float, gaps: list) -> bool:
+        if self._cohort_expired(deadline, gaps):
+            raise self._cohort_timeout(gaps)
+        with self.t.cond:
+            version = self.t.version
+            left = deadline - time.monotonic()
+            self.t.cond.wait_for(
+                lambda: self.t.version != version, timeout=min(left, 0.05)
+            )
+        return False
+
+    def _cohort_expired(self, deadline: float, gaps: list) -> bool:
+        return time.monotonic() >= deadline
+
+    def _cohort_timeout(self, gaps: list):
+        layer, node = gaps[0]
+        state = self.t.node(layer, node)
+        missing = [("rank", r) for r in sorted(state.cohort - state.joined)]
+        return check_failed(
+            "cache_wait",
+            f"rank {self.rank}: cache layer {layer} node {node} "
+            f"demands {self.plan.demand[layer][node]} bytes but budget "
+            f"is {state.budget}; missing consumers {missing} must call "
+            f"chain_load concurrently (one thread or process per rank)",
+        )
+
+    def _cohort_gaps(self) -> list:
+        """(layer, node) pairs that miss a consumer while over their budget.
+        A node needs its whole cohort online only when some segment is
+        consumed by more than one rank: a missing consumer would keep that
+        segment resident forever. Purely sharded segments make serial callers
+        safe."""
+        return [
+            (layer, node)
+            for layer, node in self.gens
+            if self._cohort_needs_wait(layer, node)
         ]
-    raise invalid("read_chain", f"unknown read chain type {t.__name__}")
+
+    def _cohort_needs_wait(self, layer: int, node: int) -> bool:
+        state = self.t.node(layer, node)
+        missing = state.cohort - state.joined
+        if not missing or self.plan.demand[layer][node] <= state.budget:
+            return False
+        mine = {key for _ln, key, _o, _s in self.plan.drains[self.rank]}
+        return any(
+            c[0][0] == "rank" and c[0][1] != self.rank
+            for seg in self.plan.segments[layer][node].values()
+            if seg.key in mine
+            for c in seg.owed()
+        )
+
+    def _leave(self) -> None:
+        with self.t.cond:
+            _ = [self._dec(ln) for ln in self.gens]
+            self.t.bump()
+
+    def _dec(self, ln) -> None:
+        self.t.node(*ln).active -= 1
+        self.t.mark_touched(ln)
+
+    def _loop(self, pending: list) -> None:
+        """The wait limit restarts after every unit of progress."""
+        deadline = time.monotonic() + self.wait
+        while pending:
+            version = self._version_checked()
+            moved = self._step(pending)
+            deadline = time.monotonic() + self.wait if moved else deadline
+            _ = moved or self._block(version, deadline, pending)
+
+    def _step(self, pending: list) -> bool:
+        """Drain every filled piece; else fill one segment. True on progress."""
+        done = [p for p in pending if self._filled(self.last, p[0], p[1])]
+        for piece in done:
+            self._drain(piece)
+            pending.remove(piece)
+        return bool(done) or any(
+            self._ensure(self.last, n, k) for n, k, _o, _s in pending
+        )
+
+    def _version_checked(self) -> int:
+        with self.t.cond:
+            _ = [self.t.node(*ln).check(gen) for ln, gen in self.gens.items()]
+            return self.t.version
+
+    def _block(self, version: int, deadline: float, pending: list) -> None:
+        """Wait for a version change or for the in-flight work to finish. A
+        pass with no own progress times out only when nothing is in flight:
+        a slow fill or drain counts as progress, so healthy peers never hit
+        the wait limit."""
+        with self.t.cond:
+            moved = self._wait_deadline(version, deadline)
+            done = moved or self._wait_inflight(version)
+        if not done:
+            raise self._timeout(pending)
+
+    def _wait_deadline(self, version: int, deadline: float) -> bool:
+        ready = False
+        while not ready and time.monotonic() < deadline:
+            ready = self._deadline_once(version, deadline) is not None
+        return ready
+
+    def _deadline_once(self, version: int, deadline: float):
+        left = deadline - time.monotonic()
+        ready = self._wait_version(version, left)
+        if self.t.inflight == 0:
+            return ready
+        return ready or None
+
+    def _wait_version(self, version: int, timeout: float) -> bool:
+        return timeout > 0 and self.t.cond.wait_for(
+            lambda: self.t.version != version, timeout=timeout
+        )
+
+    def _wait_inflight(self, version: int) -> bool:
+        done = False
+        while not done and self.t.inflight > 0:
+            done = self.t.cond.wait_for(
+                lambda: self.t.version != version or self.t.inflight == 0,
+                timeout=0.05,
+            )
+        return done
+
+    def _timeout(self, pending: list):
+        node, key = pending[0][0], pending[0][1]
+        state = self.t.node(self.last, node)
+        owed = state.owed_to()
+        msg = (
+            f"rank {self.rank}: no progress for {self.wait}s on cache layer "
+            f"{self.last} node {node} segment {key}; resident {state.resident} of "
+            f"budget {state.budget} bytes owed to {owed}"
+        )
+        return check_failed("cache_wait", msg)
+
+    def _filled(self, layer: int, node: int, key) -> bool:
+        with self.t.cond:
+            slot = self.t.node(layer, node).slots.get(key)
+            return slot is not None and slot["filled"]
+
+    def _ensure(self, layer: int, node: int, key) -> bool:
+        """Try to make one segment resident; True when this call filled it.
+
+        Upstream segments are requested only while this layer has room, so a
+        full layer does not pin upstream budget for a segment it cannot admit.
+        """
+        seg = self.plan.segments[layer][node][key]
+        if not self._room(layer, node, seg):
+            return False
+        if layer > 0 and not self._parents_ready(layer, node, seg):
+            return False
+        if not self._reserve(layer, node, [seg]):
+            return False
+        self._fill(layer, node, seg)
+        return True
+
+    def _room(self, layer: int, node: int, seg) -> bool:
+        with self.t.cond:
+            state = self.t.node(layer, node)
+            state.check(self.gens[(layer, node)])
+            return seg.key not in state.slots and state.fits(seg.size)
+
+    def _reserve(self, layer: int, node: int, segs: list) -> bool:
+        """Admit all segments or none; each starts unfilled with its owed set."""
+        with self.t.cond:
+            state = self.t.node(layer, node)
+            state.check(self.gens[(layer, node)])
+            ok = state.reserve(segs)
+            self.t.mark_touched((layer, node))
+            self.t.bump() if ok else None
+        return ok
+
+    def _parents_ready(self, layer: int, node: int, seg) -> bool:
+        """Fill the missing parent segments; True when all are filled.
+
+        The plan gives every child segment exactly one parent segment, and a
+        segment never exceeds the parent budget, so an empty parent layer
+        always admits it.
+        """
+        pnode = self.plan.parent[layer][node]
+        psegs = self.plan.segments[layer - 1][pnode]
+        keys = sorted({pkey for pkey, _o, _n in seg.parents})
+        if all(self._filled(layer - 1, pnode, k) for k in keys):
+            return True
+        missing = [psegs[k] for k in keys if not self._resident(layer - 1, pnode, k)]
+        if not missing or not self._reserve(layer - 1, pnode, missing):
+            return False
+        for pseg in missing:
+            self._fill(layer - 1, pnode, pseg)
+        return True
+
+    def _resident(self, layer: int, node: int, key) -> bool:
+        with self.t.cond:
+            return key in self.t.node(layer, node).slots
+
+    def _fill(self, layer: int, node: int, seg) -> None:
+        self._inflight(1)
+        try:
+            data = self._source_bytes(layer, seg)
+            _write(self.caches[layer].data_accessor, _crange(seg.key), data)
+        except BaseException as exc:
+            self._inflight(-1)
+            self._fail(layer, node, exc, seg.key)
+            raise
+        with self.t.cond:
+            self.t.node(layer, node).slots[seg.key]["filled"] = True
+            self.t.inflight -= 1
+            self.t.mark_touched((layer, node))
+            self.t.bump()
+        if layer > 0:
+            self._ack_parents(layer, node, seg)
+
+    def _ack_parents(self, layer: int, node: int, seg) -> None:
+        pnode = self.plan.parent[layer][node]
+        consumer = ("seg", layer, node, seg.key)
+        for pkey, off, size in seg.parents:
+            self._ack(layer - 1, pnode, pkey, (consumer, off, size))
+
+    def _source_bytes(self, layer: int, seg) -> bytes:
+        if layer == 0:
+            acc = self.storage.data_accessor
+            return b"".join(_read(acc, rng) for rng, _off in seg.storage)
+        acc = self.caches[layer - 1].data_accessor
+        return b"".join(
+            _read(acc, RangeFromComputeView(seg.tid, off, size))
+            for _k, off, size in seg.parents
+        )
+
+    def _drain(self, piece) -> None:
+        node, key, off, size = piece
+        rng = RangeFromComputeView(key[0], off, size)
+        self._inflight(1)
+        try:
+            data = _read(self.caches[self.last].data_accessor, rng)
+            _write(self.dst.data_accessor, rng, data)
+        except BaseException as exc:
+            self._inflight(-1)
+            self._fail(self.last, node, exc, None)
+            raise
+        self._inflight(-1)
+        self._ack(self.last, node, key, (("rank", self.rank), off, size))
+
+    def _inflight(self, delta: int) -> None:
+        """Mark a fill or drain as in flight: waiting peers treat in-flight
+        work as progress and do not time out. The delta is persisted so a peer
+        in another process observes it."""
+        with self.t.cond:
+            self.t.inflight += delta
+            self.t.bump()
+
+    def _fail(self, layer: int, node: int, exc: BaseException, key) -> None:
+        """Record one node-wide error for this generation; every rank of the
+        generation that reads this node raises the same error object."""
+        with self.t.cond:
+            self.t.node(layer, node).fail(exc, key)
+            self.t.mark_touched((layer, node))
+            self.t.bump()
+
+    def _ack(self, layer: int, node: int, key, piece) -> None:
+        with self.t.cond:
+            self.t.node(layer, node).ack(key, piece)
+            self.t.mark_touched((layer, node))
+            self.t.bump()
 
 
-def _run_one_concrete(rank, node, chain, pc, legs, consumers) -> None:
-    """Open (and finish) one load session for a single concrete chain.
+def _crange(key) -> RangeFromComputeView:
+    return RangeFromComputeView(key[0], key[1], key[2])
 
-    Per design line 386, each Mixed segment has its own source session; we do
-    NOT group segments by storage-view identity and share one session across
-    disjoint tensor-id segments."""
+
+def _run_cached(rank: int, chain, storage_session_view) -> None:
+    from .propagation import cache_layers
+
+    table = _slots(chain)
+    if rank not in table.plan.ranks:
+        raise invalid("rank", f"rank {rank} not in read-chain ranks {table.plan.ranks}")
+    _RankRun(table, rank, cache_layers(chain), storage_session_view, chain.dst).run()
+
+
+def _run_one_concrete(rank: int, chain) -> None:
+    """Open and finish one load session for one concrete chain (design 5.8:
+    each Mixed segment has its own source session)."""
+    from .chain import DirectDTensorsReadChain, rank_direct_plan
+
     storage = chain.src
-    assert type(storage) is StorageDTensorsView
-    assert storage.begin_load is not None
+    if type(storage) is not StorageDTensorsView or storage.begin_load is None:
+        raise invalid("read_chain", "chain src must be a StorageDTensorsView")
+    plan = (
+        rank_direct_plan(rank, chain)
+        if type(chain) is DirectDTensorsReadChain
+        else None
+    )
     _LOG.info("chain_load rank=%d phase=begin concrete", rank)
     session = must_ok(storage.begin_load(storage, rank))
     assert session is not None
-    storage_session_view = _session_view(storage, session)
     try:
-        _execute_chain_legs(
-            pc, legs, storage, storage_session_view, node, consumers, rank
-        )
-    except BaseException:
-        primary = _finish_chain_sessions([session])
-        if primary is not None:
-            raise primary from None
-        raise
-    primary = _finish_chain_sessions([session])
-    if primary is not None:
-        raise primary
-    _LOG.info("chain_load rank=%d phase=finished concrete", rank)
-
-
-def _cache_live_limit(cache_view) -> int:
-    """Bounded in-flight slot count C for a cache view.
-
-    The concurrency width is read via the same mesh helper used by the stats
-    path (``cache_concurrency_width``); it unwraps PermutedMesh and validates
-    the ConcurrencyWidth tag. A malformed cache mesh is a programming error and
-    must surface, not silently degrade to a single buffer (which would make a
-    declared double buffer behave as serial fills).
-    """
-    from .mesh import cache_concurrency_width
-
-    mesh = cache_view.d_tensor_table.named_d_tensors[0].d_tensor.mesh
-    return cache_concurrency_width(mesh)
-
-
-def _split_step(off: int, size: int, step: int):
-    """Yield (off, size) chunks covering [off, off+size) aligned to the step grid."""
-    if step <= 0:
-        yield off, size
-        return
-    end = off + size
-    c = (off // step) * step
-    o = off
-    while o < end:
-        chunk_end = min(c + step, end)
-        yield o, chunk_end - o
-        c += step
-        o = chunk_end
-
-
-def _rng_slice(rng, offset_delta: int, size: int):
-    """Clone a range shifted by offset_delta with a new size (cache vs storage)."""
-    if hasattr(rng, "global_tensor_offset"):
-        return replace(
-            rng, global_tensor_offset=rng.global_tensor_offset + offset_delta, size=size
-        )
-    return replace(
-        rng,
-        contiguous_payload_offset=rng.contiguous_payload_offset + offset_delta,
-        size=size,
-    )
-
-
-def _slot_cells(view, cache_rng):
-    """Yield (off, size) atomic mesh cells covering cache_rng.
-
-    The atomic slot is the real box_of cell for (temporal step s, concurrency c)
-    on this node: the two Shard axes (temporal dim0 and concurrency dim0) split
-    dim0; spatial is Replicate and does NOT split. Cells are clipped to the
-    requested range. Falls back to the whole range when the mesh is unknown."""
-    co0 = cache_rng.global_tensor_offset
-    csz = cache_rng.size
-    try:
-        tid = cache_rng.global_tensor_id
-        found = _find_slot(view, tid, co0, csz)
-        if found is not None:
-            return found
-    except Exception:
-        pass
-    return [(co0, csz)]
-
-
-def _find_slot(view, tid, co0, csz):
-    for nd in view.d_tensor_table.named_d_tensors:
-        out = _slot_for_nd(nd, tid, co0, csz)
-        if out is not None:
-            return out
-    return None
-
-
-def _slot_for_nd(nd, tid, co0, csz):
-    if nd.global_tensor_id != tid:
-        return None
-    out = _cells_for_nd(nd, co0, co0 + csz)
-    if out:
-        return sorted(out)
-    return None
-
-
-def _cells_for_nd(nd, lo_r, hi_r):
-    from .dtensor import box_of, naive_of
-    from .mesh import cache_concurrency_width, cache_num_nodes, cache_num_steps
-
-    naive = naive_of(nd)
-    S = cache_num_steps(naive.mesh)
-    C = cache_concurrency_width(naive.mesh)
-    N = cache_num_nodes(naive.mesh)
-    shape = naive.global_tensor_meta.global_shape
-    out = []
-    for s in range(S):
-        for c in range(C):
-            lo, hi = box_of(naive, (S, N, C), (s, 0, c))
-            out.extend(_clip_cell(shape, lo, hi, lo_r, hi_r))
-    return out
-
-
-def _clip_cell(shape, lo, hi, lo_r, hi_r):
-    from .dtensor import box_to_intervals
-
-    iv = box_to_intervals(shape, lo, hi)
-    out = []
-    for a, b in iv:
-        ca, cb = max(int(a), lo_r), min(int(b), hi_r)
-        if cb > ca:
-            out.append((ca, cb - ca))
-    return out
-
-
-def _register_fill_runs(reg, view, pairs, eff_src):
-    runs = []
-    for src_rng, cache_rng in pairs:
-        so = src_rng.contiguous_payload_offset
-        path = src_rng.file_path
-        if runs and runs[-1][1] == so and runs[-1][3] == path:
-            runs[-1][1] = so + src_rng.size
-            runs[-1][2].append((src_rng, cache_rng))
+        view = _session_view(storage, session)
+        if plan is not None:
+            _copy(plan, view, chain.dst)
         else:
-            runs.append([so, so + src_rng.size, [(src_rng, cache_rng)], path])
-    for src_start, _src_end, sub, _path in runs:
-        # Retain each validated physical range. Adjacent payload offsets may
-        # belong to distinct slots, so a file accessor cannot read their union.
-        job = {"eff_src": eff_src, "ranges": [rng for rng, _ in sub]}
-        for src_rng, cache_rng in sub:
-            _append_fill_cells(
-                reg, view, job, src_start, src_rng.contiguous_payload_offset, cache_rng
-            )
-
-
-def _append_fill_cells(reg, view, job, src_start, src_off, cache_rng):
-    for co, cs in _slot_cells(view, cache_rng):
-        reg.append(
-            {
-                "key": (cache_rng.global_tensor_id, co, cs),
-                "job": job,
-                "buf_off": src_off + (co - cache_rng.global_tensor_offset) - src_start,
-                "size": cs,
-                "tid": cache_rng.global_tensor_id,
-                "off": co,
-                "size2": cs,
-            }
-        )
-
-
-def _covering_segments(fill_source, view, rng):
-    tid = getattr(rng, "global_tensor_id", "")
-    off = getattr(rng, "global_tensor_offset", None)
-    if off is None:
-        off = rng.contiguous_payload_offset
-    end = off + rng.size
-    out = []
-    for seg in fill_source.get(id(view), ()):
-        if seg["tid"] == tid and _seg_overlap(seg, off, end):
-            out.append(seg)
-    return out
-
-
-def _seg_overlap(seg, off, end):
-    s_e = seg["off"] + seg["size"]
-    return seg["off"] < end and off < s_e
-
-
-def _slot_expected(node, consumers, rank, view, tid, off, size):
-    # Ranks on this node whose compute dst want overlaps [off,off+size); each
-    # rank's required intersection intervals (global coords) must all ACK.
-    try:
-        from .dtensor import named_of
-
-        nd = named_of(view.d_tensor_table, tid)
-        return _required_for_ranks(nd, node, consumers, rank, off, size)
-    except Exception:
-        return {rank: [(off, off + size)]}
-
-
-def _required_for_ranks(nd, node, consumers, rank, off, size):
-    required = {}
-    lo, hi = off, off + size
-    for r in range(node * consumers, (node + 1) * consumers):
-        ivs = _intersect_owned(nd, r, lo, hi)
-        if ivs:
-            required[r] = ivs
-    return required or {rank: [(lo, hi)]}
-
-
-def _intersect_owned(nd, r, lo, hi):
-    from .dtensor import owned_intervals
-
-    ivs = []
-    for a, b in owned_intervals(nd, "compute", r):
-        ca, cb = max(int(a), lo), min(int(b), hi)
-        if cb > ca:
-            ivs.append((ca, cb))
-    return ivs
-
-
-def _seg_job_data(seg):
-    job = seg["job"]
-    if "buffer" not in job:
-        accessor = job["eff_src"].data_accessor
-        job["buffer"] = b"".join(_read(accessor, rng) for rng in job["ranges"])
-    return job["buffer"][seg["buf_off"] : seg["buf_off"] + seg["size"]]
-
-
-def _execute_chain_legs(
-    pc, legs, storage, storage_session_view, node, consumers, rank
-) -> None:
-    leg_plans = _chain_plans(pc)
-    cache_names = "CacheDTensorsView"
-    fill_source: dict[int, list] = {}
-    gens: dict[int, int] = {}
-    used_states: list = []
-
-    def cap_of(view):
-        return _cache_live_limit(view)
-
-    def table_of(view):
-        return _slots(view, consumers, cap_of(view))
-
-    def gen_for(state) -> int:
-        g = gens.get(id(state))
-        if g is None:
-            g = state.generation_start(rank)
-            gens[id(state)] = g
-            used_states.append(state)
-        return g
-
-    def covering(view, rng):
-        return _covering_segments(fill_source, view, rng)
-
-    def expected(view, tid, off, size):
-        return _slot_expected(node, consumers, rank, view, tid, off, size)
-
-    def ensure_segment(view, seg, block=True) -> None:
-        state = table_of(view).node(node)
-        gen = gen_for(state)
-        key = seg["key"]
-        if not state.begin_fill(key, gen, block=block):
-            return
-        try:
-            data = _seg_job_data(seg) if "job" in seg else _recurse(view, seg)
-            _write(view.data_accessor, _rng_to_view_range(view, key), data)
-            state.finish_fill(key, ok=True, gen=gen)
-        except BaseException as exc:
-            state.finish_fill(key, ok=False, gen=gen, exc=exc)
-            raise
-
-    def _recurse(view, seg):
-        eff_src, src_rng = seg["eff_src"], seg["src_rng"]
-        for up_seg in covering(eff_src, src_rng):
-            ensure_segment(eff_src, up_seg, block=False)
-        up = table_of(eff_src).node(node)
-        up.wait_filled(_rng_key(src_rng), gen_for(up))
-        data = _read(eff_src.data_accessor, src_rng)
-        for up_seg in covering(eff_src, src_rng):
-            off2, sz2 = _overlap_iv(src_rng, up_seg)
-            up.ack_drain(up_seg["key"], rank, off2, sz2)
-        return data
-
-    def handle_fill(dst, plan, eff_src):
-        reg = fill_source.setdefault(id(dst), [])
-        pairs = sorted(plan, key=lambda p: p[0].contiguous_payload_offset)
-        _register_fill_runs(reg, dst, pairs, eff_src)
-
-    def drain_cell(src, dst, plan, state, gen):
-        for cache_rng, dst_rng in plan:
-            _drain_plan(
-                src,
-                dst,
-                cache_rng,
-                dst_rng,
-                state,
-                gen,
-                covering,
-                expected,
-                rank,
-                ensure_segment,
-            )
-
-    try:
-        for (src, dst), plan in zip(legs, leg_plans):
-            eff_src = storage_session_view if src is storage else src
-            run_leg(
-                src,
-                dst,
-                plan,
-                eff_src,
-                cache_names,
-                handle_fill,
-                fill_source,
-                table_of,
-                node,
-                gen_for,
-                drain_cell,
-            )
-    finally:
-        for state in used_states:
-            state.generation_end()
-
-
-def run_leg(
-    src,
-    dst,
-    plan,
-    eff_src,
-    cache_names,
-    handle_fill,
-    fill_source,
-    table_of,
-    node,
-    gen_for,
-    drain_cell,
-):
-    src_cache = type(src).__name__ == cache_names
-    dst_cache = type(dst).__name__ == cache_names
-    if dst_cache and not src_cache:
-        handle_fill(dst, plan, eff_src)
-        return
-    if src_cache and not dst_cache:
-        state = table_of(src).node(node)
-        drain_cell(src, dst, plan, state, gen_for(state))
-        return
-    if src_cache and dst_cache:
-        reg = fill_source.setdefault(id(dst), [])
-        for cache_rng, out_rng in plan:
-            reg.append(_seg(out_rng, src, cache_rng))
-        return
-    _copy(plan, eff_src, dst)
-
-
-def _drain_plan(
-    src, dst, cache_rng, dst_rng, state, gen, covering, expected, rank, ensure_segment
-):
-    for co, cs in _slot_cells(src, cache_rng):
-        _drain_cell(
-            src,
-            dst,
-            cache_rng,
-            dst_rng,
-            state,
-            gen,
-            co,
-            cs,
-            covering,
-            expected,
-            rank,
-            ensure_segment,
-        )
-
-
-def _drain_cell(
-    src,
-    dst,
-    cache_rng,
-    dst_rng,
-    state,
-    gen,
-    co,
-    cs,
-    covering,
-    expected,
-    rank,
-    ensure_segment,
-):
-    rel = co - cache_rng.global_tensor_offset
-    c_chunk = _rng_slice(cache_rng, rel, cs)
-    for seg in covering(src, c_chunk):
-        ensure_segment(src, seg)
-        state.set_expected(
-            seg["key"], expected(dst, seg["tid"], seg["off"], seg["size"])
-        )
-    state.wait_filled(_rng_key(c_chunk), gen)
-    _write(
-        dst.data_accessor,
-        _rng_slice(dst_rng, rel, cs),
-        _read(src.data_accessor, c_chunk),
-    )
-    for seg in covering(src, c_chunk):
-        off2, sz2 = _overlap_iv(c_chunk, seg)
-        state.ack_drain(seg["key"], rank, off2, sz2)
+            _run_cached(rank, chain, view)
+    except BaseException:
+        _cleanup(session, "finish")
+        raise
+    must_ok(session.finish())
+    _LOG.info("chain_load rank=%d phase=finished concrete", rank)
 
 
 @catch
 def d_tensors_view_rank_chain_load(rank: int, read_chain) -> Result[None]:
-    from .chain import d_tensors_view_rank_plan_chain_load, legs_of
+    from .chain import concrete_chains
 
-    plan_chain = must_ok(d_tensors_view_rank_plan_chain_load(rank, read_chain))
-    chains = _collect_concrete_chains(read_chain, plan_chain, legs_of)
-    consumers = getattr(read_chain, "num_ranks_per_node", 1)
-    node = rank // consumers
-    for chain, pc, legs in chains:
-        _run_one_concrete(rank, node, chain, pc, legs, consumers)
-
-
-def _chain_plans(plan_chain):
-    from .chain import (
-        DirectCopyPlanChain,
-        DisjointTensorIdsAndCopyPlanChain,
-        OneLayerCachedCopyPlanChain,
-        TwoLayerCachedCopyPlanChain,
-    )
-
-    if type(plan_chain) is DisjointTensorIdsAndCopyPlanChain:
-        plan_chain = plan_chain.copy_plan_chain
-    t = type(plan_chain)
-    if t is DirectCopyPlanChain:
-        return [plan_chain.src_to_dst]
-    if t is OneLayerCachedCopyPlanChain:
-        return [plan_chain.src_to_cache, plan_chain.cache_to_dst]
-    if t is TwoLayerCachedCopyPlanChain:
-        return [
-            plan_chain.src_to_small_cache,
-            plan_chain.small_cache_to_big_cache,
-            plan_chain.big_cache_to_dst,
-        ]
-    raise invalid("copy_plan_chain", f"unknown plan chain type {t.__name__}")
+    for chain in concrete_chains(read_chain):
+        _run_one_concrete(rank, chain)
