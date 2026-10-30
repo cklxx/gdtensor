@@ -20,9 +20,16 @@ Terms:
   reads one storage range); a lower layer splits at its parent's segments (one
   segment has one parent segment).
 * budget: the C largest cells of a (layer, node), summed over all tensors of
-  the layer. C is the concurrency width. The executor admits a segment only
-  while the resident bytes stay inside this budget, so the stat is a hard
-  bound. A segment never exceeds its cell, so one segment always fits.
+  the layer. A cell is one (temporal step, concurrency slot) box of every
+  tensor of the layer: one step-slot of a multi-tensor layer counts once, so
+  S=1 holds the whole step. C is the concurrency width. The executor admits a
+  segment only while the resident bytes stay inside this budget, so the stat
+  is a hard bound. A segment never exceeds its cell, so one segment always
+  fits.
+* cohort: the ranks that read a (layer, node). When a node's budget cannot
+  hold the node demand, every cohort rank must be present at the same time;
+  the executor reports a missing consumer instead of hanging (api.py
+  _wait_cohort).
 """
 
 from __future__ import annotations
@@ -89,7 +96,7 @@ class Segment:
 
 @dataclass
 class ChainPlan:
-    caches: list
+    tids: List[List[str]]
     k: int
     layer_nodes: List[List[int]]
     parent: List[Dict[int, int]]
@@ -97,6 +104,7 @@ class ChainPlan:
     ranks: List[int]
     segments: List[Dict[int, Dict[SegKey, Segment]]] = field(default_factory=list)
     budget: List[Dict[int, int]] = field(default_factory=list)
+    demand: List[Dict[int, int]] = field(default_factory=list)
     drains: Dict[int, list] = field(default_factory=dict)
     cohort: List[Dict[int, set]] = field(default_factory=list)
 
@@ -125,7 +133,9 @@ def build_chain_plan(chain, with_storage: bool = True) -> ChainPlan:
     parent: List[Dict[int, int]] = [{}]
     for layer in range(1, len(caches)):
         parent.append(parent_map(layer_nodes[layer], layer_nodes[layer - 1]))
-    plan = ChainPlan(caches, k, layer_nodes, parent, serve, ranks)
+    plan = ChainPlan(
+        [list(view.tensor_ids) for view in caches], k, layer_nodes, parent, serve, ranks
+    )
     demand = _demands(plan, chain.dst)
     side = _Side(chain.src) if with_storage else None
     for layer, view in enumerate(caches):
@@ -140,6 +150,13 @@ def build_chain_plan(chain, with_storage: bool = True) -> ChainPlan:
     plan.budget = [
         {n: _budget(view, segs) for n, segs in plan.segments[layer].items()}
         for layer, view in enumerate(caches)
+    ]
+    plan.demand = [
+        {
+            n: sum(seg.size for seg in segs.values())
+            for n, segs in plan.segments[layer].items()
+        }
+        for layer in range(len(caches))
     ]
     if side is not None:
         _link_storage(plan, side)
@@ -210,7 +227,7 @@ def _demands(plan: ChainPlan, dst) -> List[Dict[int, Dict[str, np.ndarray]]]:
     ]
     for rank in plan.ranks:
         _merge(demand[-1][plan.serve[rank // plan.k]], _rank_wants(dst, rank))
-    for layer in range(len(plan.caches) - 1, 0, -1):
+    for layer in range(len(plan.tids) - 1, 0, -1):
         for child, want in demand[layer].items():
             _merge(demand[layer - 1][plan.parent[layer][child]], want)
     return demand
@@ -230,7 +247,7 @@ def _cuts(plan: ChainPlan, side, layer: int, node: int) -> Dict[str, set]:
         return cuts
     if side is None:
         return cuts
-    for tid in plan.caches[0].tensor_ids:
+    for tid in plan.tids[0]:
         for iv, _path, _cpo, isz in side.storage_pieces(tid):
             points = cuts.setdefault(tid, set())
             points.update(int(x) * isz for x in iv.ravel())
@@ -290,9 +307,11 @@ def _tensor_segments(view, layer: int, node: int, tid: str, want) -> List[Segmen
 
 
 def _budget(view, segs: Dict[SegKey, Segment]) -> int:
+    """The C largest (step, slot) cells, each summed over every tensor."""
     cells: Dict[tuple, int] = {}
     for seg in segs.values():
-        cells[seg.cell] = cells.get(seg.cell, 0) + seg.size
+        key = (seg.cell[1], seg.cell[2])
+        cells[key] = cells.get(key, 0) + seg.size
     return sum(sorted(cells.values(), reverse=True)[: _view_width(view)])
 
 
@@ -369,7 +388,7 @@ def _rank_pieces(index, dst, tid: str, iv, rank: int) -> list:
 
 def rank_closure(plan: ChainPlan, rank: int) -> set:
     """Every (layer, node, key) segment the rank reads, directly or upstream."""
-    todo = [(len(plan.caches) - 1, n, key) for n, key, _o, _s in plan.drains[rank]]
+    todo = [(len(plan.tids) - 1, n, key) for n, key, _o, _s in plan.drains[rank]]
     seen: set = set()
     while todo:
         item = todo.pop()
@@ -413,7 +432,7 @@ def _fill_pairs(seg: Segment) -> list:
 
 def rank_copy_plans(plan: ChainPlan, rank: int) -> list:
     """One CopyPlan per leg: the rank's fill closure, then its own drains."""
-    legs: list = [[] for _ in range(len(plan.caches) + 1)]
+    legs: list = [[] for _ in range(len(plan.tids) + 1)]
     for layer, node, key in sorted(rank_closure(plan, rank)):
         legs[layer].extend(_fill_pairs(plan.segments[layer][node][key]))
     legs[-1] = [
@@ -445,7 +464,7 @@ def plan_traffic(plan: ChainPlan) -> Tuple[Dict[int, int], Dict[int, int]]:
     outbound = {n: 0 for n in nodes}
     for node, segs in plan.segments[0].items():
         inbound[node] += sum(seg.size for seg in segs.values())
-    for layer in range(1, len(plan.caches)):
+    for layer in range(1, len(plan.tids)):
         _edge_traffic(plan, layer, inbound, outbound)
     for rank, pieces in plan.drains.items():
         _drain_traffic(rank // plan.k, pieces, inbound, outbound)

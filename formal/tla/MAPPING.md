@@ -11,7 +11,7 @@ proof of the whole Python.
 
 Pinned runtime baseline:
 - `gdtensor/internal/api.py`
-  `sha256 4c8e5a173549627feb994787f3600384383d5f98437a3482408df1c809c7c452`.
+  `sha256 a2dc3d8b3ecab3f88a47bdebb4a50b5d3942bfce299efa36225e547561f7b21f`.
 - `gdtensor/internal/propagation.py`
   `sha256 a1faec351e0e4c016e0efa221146030e941b64d37a0c13a9fc89210da8410506`.
 Current source hashes are recorded by `scripts/formal_gate.sh` in its
@@ -177,5 +177,21 @@ executor exposes the same boundary as `cache_wait` after
 not waited on forever.
 
 Scope: one fixed fan-out instance, one segment per node, one byte size per
-segment. Cross-process coordination is a declared replacement point
-(`CACHE_COORDINATOR_FACTORY`) and is not modeled.
+segment. Cross-process coordination is a real implementation
+(`_FileSlotTable`, selected by `GDTENSOR_CACHE_COORDINATOR`), but the model
+still projects it away: it checks the shared in-memory table contract shape,
+not file locking. The adversarial fixes sit at these layers:
+
+- Cell budget sums every tensor of a (step, slot) cell: `_budget` keys cells by
+  `(s, c)` and sums segment bytes over all tensors, so `ByteBudget` compares
+  against the aggregated node budget that `ChainPlan.budget` publishes.
+- Absent cohort ranks error, never hang: the executor raises `cache_wait` after
+  `GDTENSOR_CACHE_WAIT_SECONDS` (modeled as the `peer_down` liveness boundary).
+- In-flight fills count as progress: `_block` keeps waiting while `inflight > 0`
+  even when the version is unchanged (a timeout detail, outside the model).
+- The plan cache holds weak references only: `_slots` registers
+  `weakref.finalize(view, _drop_table, key)` so a `ChainPlan` never pins a cache
+  view (lifetime, outside the model).
+- `check_constraints` rejects mixed node sets and out-of-range ranks up front
+  (`ConstraintViolationError` / `InvalidArgumentError`); `CacheDTensorsView` is
+  registered with the constraint checker (construction-time, outside the model).

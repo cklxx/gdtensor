@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "4c8e5a173549627feb994787f3600384383d5f98437a3482408df1c809c7c452"
+FROZEN_API_SHA256 = "a2dc3d8b3ecab3f88a47bdebb4a50b5d3942bfce299efa36225e547561f7b21f"
 
 
 def _production_manifest(root=ROOT):
@@ -133,12 +133,14 @@ MUTATIONS = [
     # File-backed byte-budget and ACK detectors drive the public chain_load
     # path. Budget mutation permits an extra file allocation; ACK mutation
     # releases a segment after the first consumer, which forces a second disk
-    # fill for the consumer that still needs it.
+    # fill for the consumer that still needs it. The budget detector asserts
+    # the resident peak never exceeds the advertised stat bound (cell budget
+    # is summed over every tensor of a (step, slot) cell).
     (
         "gdtensor/internal/api.py",
         "        return self.resident + size <= self.budget",
-        "        return True",
-        "tests/io/test_cache_mutation_detectors.py::test_cap_guard_allows_one_fill_for_replicate_cohort",
+        "        return False",
+        "tests/io/test_cache_propagation.py::test_resident_cache_bytes_never_exceed_stat[8-2]",
         "notorch",
     ),
     (

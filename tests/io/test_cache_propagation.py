@@ -17,7 +17,11 @@ Covered defects (all failed before the node-level propagation plan):
 
 from __future__ import annotations
 
+import gc
+import multiprocessing as mp
 import threading
+import time
+import weakref
 
 import numpy as np
 import pytest
@@ -31,10 +35,11 @@ from tests.support.memory import Memory
 class Probe(Memory):
     """Accessor that records (op, offset, size) and the live cache bytes."""
 
-    def __init__(self, data):
+    def __init__(self, data, delay=0.0):
         super().__init__(data)
         self.lock = threading.Lock()
         self.events: list = []
+        self.delay = delay
 
     @staticmethod
     def _off(rng):
@@ -43,6 +48,8 @@ class Probe(Memory):
         return rng.contiguous_payload_offset
 
     def read_to_buffer(self, global_range, read_to_buffer):
+        if self.delay:
+            time.sleep(self.delay)
         with self.lock:
             self.events.append(("read", self._off(global_range), global_range.size))
         return super().read_to_buffer(global_range, read_to_buffer)
@@ -258,7 +265,9 @@ def _live_peak(cache: Probe) -> int:
     return peak
 
 
-@pytest.mark.parametrize("steps,width", [(1, 1), (2, 1), (4, 1), (2, 2), (4, 2)])
+@pytest.mark.parametrize(
+    "steps,width", [(1, 1), (2, 1), (4, 1), (2, 2), (4, 2), (8, 2)]
+)
 def test_resident_cache_bytes_never_exceed_stat(steps, width):
     size, world = 16, 2
     chain, _src, cache, dst = _one_layer(size, world, 2, (0,), steps, width)
@@ -301,3 +310,305 @@ def test_wait_seconds_must_be_positive(monkeypatch):
     result = gio.chain_load(0, chain)
     assert type(result) is gb.Err
     assert result.value.argument_name == "GDTENSOR_CACHE_WAIT_SECONDS"
+
+
+# ---------------------------------------------------------------- adversarial regressions
+#
+# The six adversarial findings (budget unit, absent-cohort semantics, process
+# coordination, in-flight progress, plan-cache liveness, up-front checks) each
+# have a regression here. Every case uses only public APIs and failed against
+# the pre-fix code:
+# * budget was per (tid, s, c); two tensors sharing one cell double-counted;
+# * a missing cohort rank hung forever instead of a clear cache_wait;
+# * one process per rank could not coordinate (the plan state was in-memory);
+# * a slow fill counted as no progress and timed out healthy peers;
+# * the plan cache pinned every cache view for the lifetime of the process;
+# * mixed node sets and out-of-range ranks passed check_constraints silently.
+
+
+def _dt(tid, size, world, placement=None):
+    return gb.NamedDTensor(
+        tid,
+        gb.NaiveDTensor(
+            gb.GlobalTensorMeta([size], "U8", 1),
+            [placement or gb.Shard(0)],
+            gb.ArrangedMesh(gt.WorldSize(world)),
+        ),
+    )
+
+
+def _storage_mt(acc, tids, size, world):
+    mesh = gb.SlotOuterProductMesh(
+        gb.ArrangedMesh(gt.ConstantOne(1)), gb.ArrangedMesh(gt.WorldSize(world))
+    )
+    named = [
+        gb.NamedDTensor(
+            t,
+            gb.NaiveDTensor(
+                gb.GlobalTensorMeta([size], "U8", 1),
+                [gb.Replicate(), gb.Shard(0)],
+                mesh,
+            ),
+        )
+        for t in tids
+    ]
+    group = gb.DisjointStorageMeshList(
+        [
+            gb.SlotOuterProductMesh(
+                gb.ArrangedMesh(gt.TensorCount(len(tids))),
+                gb.ArrangedMesh(gt.WorldSize(world)),
+            )
+        ],
+        list(tids),
+    )
+    entries = {gb.TensorComponentPos(t, r): group for t in tids for r in range(world)}
+    layout = gb.PhysicalLayoutTable(
+        "safetensors", entries, {gb.TensorComponentPos(tids[0], 0): "mem"}
+    )
+
+    class _Load:
+        def get_file_offset(self, pos):
+            return gb.Ok(
+                tids.index(pos.tensor_id) * size if hasattr(pos, "tensor_id") else 0
+            )
+
+        def init_data_accessor(self):
+            return gb.Ok(acc)
+
+        def finish(self):
+            return gb.Ok(None)
+
+    return gb.StorageDTensorsView(
+        list(tids),
+        gb.DTensorTable(named),
+        Memory([0]),
+        layout,
+        lambda _v, _r: gb.Ok(_Load()),
+        lambda _v, _r: gb.Ok(_Load()),
+    )
+
+
+def _compute_mt(acc, tids, size, world, placement=None):
+    return gb.ComputeDTensorsView(
+        list(tids),
+        gb.DTensorTable([_dt(t, size, world, placement) for t in tids]),
+        acc,
+    )
+
+
+def _cache_mesh(steps, nodes, width):
+    return gb.StCacheOuterProductMesh(
+        temporal=gb.ArrangedMesh(gt.NumSteps(steps)),
+        spatial=gb.LiteralMesh(list(nodes), gt.NumNodes(len(nodes))),
+        concurrency=gb.ArrangedMesh(gt.ConcurrencyWidth(width)),
+    )
+
+
+def _cache_mt(acc, tids, size, steps, nodes, width, per_tid_nodes=None):
+    named = []
+    for t in tids:
+        nd = (per_tid_nodes or {}).get(t, nodes)
+        named.append(
+            gb.NamedDTensor(
+                t,
+                gb.NaiveDTensor(
+                    gb.GlobalTensorMeta([size], "U8", 1),
+                    [gb.Shard(0), gb.Replicate(), gb.Shard(0)],
+                    _cache_mesh(steps, nd, width),
+                ),
+            )
+        )
+    return gb.CacheDTensorsView(list(tids), gb.DTensorTable(named), acc)
+
+
+def _one_layer_mt(
+    tids=("w",),
+    size=8,
+    world=2,
+    k=2,
+    nodes=(0,),
+    steps=2,
+    width=1,
+    placement=None,
+    per_tid_nodes=None,
+    src_delay=0.0,
+):
+    placement = gb.Replicate() if placement == "rep" else placement
+    tids = list(tids)
+    n = len(tids)
+    src = Probe(np.tile(np.arange(size, dtype=np.uint8), n), src_delay)
+    cache_mem = Probe(np.zeros(size, np.uint8))
+    dst = Probe(np.zeros(size, np.uint8))
+    chain = gb.OneLayerCachedDTensorsReadChain(
+        src=_storage_mt(src, tids, size, world),
+        cache=_cache_mt(cache_mem, tids, size, steps, nodes, width, per_tid_nodes),
+        dst=_compute_mt(dst, tids, size, world, placement),
+        num_ranks_per_node=k,
+    )
+    return chain, src, cache_mem, dst
+
+
+def _mp_coord_worker(rank, cfg, q):
+    """One process per rank: the real deployment shape of the file coordinator."""
+    chain, _src, _cache_mem, _dst = _one_layer_mt(**cfg)
+    r = gio.chain_load(rank, chain)
+    q.put((rank, type(r) is gb.Ok))
+
+
+def test_one_process_per_rank_coordinates_via_shared_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "3")
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_mp_coord_worker,
+            args=(r, dict(steps=2, width=1, placement="rep", world=2), q),
+        )
+        for r in range(2)
+    ]
+    for p in procs:
+        p.start()
+    out = [q.get(timeout=120) for _ in procs]
+    for p in procs:
+        p.join(30)
+    assert sorted(out) == [(0, True), (1, True)]
+
+
+def test_one_process_per_rank_multi_tensor_coordinates(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "3")
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_mp_coord_worker,
+            args=(
+                r,
+                dict(tids=("a", "b"), steps=1, width=1, placement="rep", world=2),
+                q,
+            ),
+        )
+        for r in range(2)
+    ]
+    for p in procs:
+        p.start()
+    out = [q.get(timeout=120) for _ in procs]
+    for p in procs:
+        p.join(30)
+    assert sorted(out) == [(0, True), (1, True)]
+
+
+@pytest.mark.parametrize("steps,width", [(1, 1), (2, 1), (2, 2)])
+def test_multi_tensor_budget_aggregates_all_tensors_of_a_cell(
+    tmp_path, monkeypatch, steps, width
+):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    # Two 8B tensors share one (s, c) cell. The budget must be their sum, not
+    # one tensor's cell bytes: 16 for S=1, 8 for S=2 at any concurrency width.
+    chain, *_ = _one_layer_mt(
+        tids=("a", "b"), size=8, world=2, k=2, nodes=(0,), steps=steps, width=width
+    )
+    assert gio.chain_stat_mem_overhead(chain) == [16 // steps]
+    _ok(_load_all(chain, 2, threaded=True))
+
+
+def test_rank_outside_read_chain_fails_clearly(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    chain, *_ = _one_layer_mt(nodes=(0,), world=2)
+    r = gio.chain_load(99, chain)
+    assert type(r) is gb.Err, r
+    assert r.value.argument_name == "rank", r.value
+    assert "not in read-chain ranks" in r.value.msg, r.value.msg
+
+
+def test_mixed_node_sets_rejected_up_front(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    size, world, k = 8, 4, 2
+    src = Probe(np.tile(np.arange(size, dtype=np.uint8), 2))
+    cv = _cache_mt(
+        Probe(np.zeros(size, np.uint8)),
+        ["a", "b"],
+        size,
+        1,
+        (0, 1),
+        1,
+        per_tid_nodes={"a": (0, 1), "b": (0,)},
+    )
+    chain = gb.OneLayerCachedDTensorsReadChain(
+        src=_storage_mt(src, ["a", "b"], size, world),
+        cache=cv,
+        dst=_compute_mt(Probe(np.zeros(size, np.uint8)), ["a", "b"], size, world),
+        num_ranks_per_node=k,
+    )
+    check = chain.check_constraints()
+    assert type(check) is gb.Err, check
+    assert "all tensors of a cache view must cover one node set" in check.value.msg
+    r = gio.chain_load(0, chain)
+    assert type(r) is gb.Err, r
+    assert "all tensors of a cache view must cover one node set" in r.value.msg
+
+
+def test_serial_missing_cohort_rank_fails_every_rank(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "0.5")
+    # Replicate dst with S=2, C=1: the budget holds one cell, both ranks need
+    # both cells, so each rank must be present while the other runs.
+    chain, *_ = _one_layer_mt(
+        size=8, world=2, k=2, nodes=(0,), steps=2, width=1, placement="rep"
+    )
+    for rank in (0, 1):
+        r = gio.chain_load(rank, chain)
+        assert type(r) is gb.Err, r
+        assert r.value.check_name == "cache_wait", r.value
+
+
+def test_inflight_slow_fill_counts_as_progress(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "1")
+    # Rank 0 fills the only segment for 2.5s (> the 1s wait limit). Rank 1 must
+    # treat the in-flight fill as progress instead of timing out.
+    chain, src, _c, _d = _one_layer_mt(
+        size=8,
+        world=2,
+        k=2,
+        nodes=(0,),
+        steps=1,
+        width=1,
+        placement="rep",
+        src_delay=2.5,
+    )
+    _ok(_load_all(chain, 2, threaded=True))
+    assert bytes(_d.data) == bytes(np.arange(8, dtype=np.uint8))
+    assert src.total("read") == 8
+
+
+def test_concurrent_slow_fill_full_budget_two_ranks_ok(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "1")
+    # S=2, C=1 with both ranks online: two slow fills back to back, every rank
+    # drains both cells. A healthy peer must never hit the wait limit.
+    chain, src, _c, _d = _one_layer_mt(
+        size=8,
+        world=2,
+        k=2,
+        nodes=(0,),
+        steps=2,
+        width=1,
+        placement="rep",
+        src_delay=2.5,
+    )
+    _ok(_load_all(chain, 2, threaded=True))
+    assert bytes(_d.data) == bytes(np.arange(8, dtype=np.uint8))
+    assert src.total("read") == 8
+
+
+def test_plan_cache_does_not_pin_cache_views(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    chain, *_ = _one_layer_mt(size=8, world=2, k=2, nodes=(0,), steps=1, width=1)
+    _ok(_load_all(chain, 2, threaded=True))
+    view = chain.cache
+    ref = weakref.ref(view)
+    del chain, view
+    gc.collect()
+    assert ref() is None, "the plan cache must not pin cache views"

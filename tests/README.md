@@ -56,10 +56,10 @@ DCP 的读盘发生在 load session 初始化。不能把每次 accessor callbac
 
 `io/test_cache_mutation_detectors.py` 有 2 个真实文件缓存用例。
 
-- 字节预算：第一个 rank 持有真实读取时，第二个 tensor 不能新增 slot 文件。
+- 单元预算按 (step, slot) 单元格对全部张量求和：同一单元格的两个张量可同时驻留（peak 2），验证修复①的聚合语义。
 - ACK：两个 rank 分别读取同一 slot。第一个完成后保留文件，全部完成后释放，且只 fill 一次。
 
-`io/test_cache_propagation.py` 用独立 oracle 检查节点级传播计划：两层扩散链路逐 rank 投递、节点间流量按边计算、同节点源端读取去重、常驻字节不超过统计值、源端读单位不超过一个 segment、缺席消费者按超时报错。
+`io/test_cache_propagation.py` 用独立 oracle 检查节点级传播计划：两层扩散链路逐 rank 投递、节点间流量按边计算、同节点源端读取去重、常驻字节不超过统计值、源端读单位不超过一个 segment、缺席消费者按超时报错；另有对抗式回归：多张量预算按 (s,c) 聚合、缺席消费者 join 缺员即明确报错（不挂起）、每 rank 一进程经共享文件协调（`GDTENSOR_CACHE_COORDINATOR`）、在途慢填充计为进展、计划缓存弱引用不 pin cache view、`check_constraints` 前置校验 mixed_nodes 与 rank 越界。
 
 这些测试检出缓存 fill job 丢失 file_path 的缺陷。修复保留源文件路径及每个合法 range，逐 slot 读取，避免跨 slot 合并成非法文件范围。修复未新增公开 API。
 

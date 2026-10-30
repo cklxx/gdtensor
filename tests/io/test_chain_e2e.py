@@ -480,9 +480,9 @@ def test_multi_tensor_a6_b2_c1_peak_resident():
     )
     assert type(chain.check_constraints()) is gb.Ok, chain.check_constraints()
     mem = gio.chain_stat_mem_overhead(chain)
-    # C serialises slots across a node; peak is the largest single tensor slot
-    # staged on the node (A=3 both nodes, B/C do not raise the max).
-    assert mem == [3, 3], mem
+    # Budgets aggregate per (step, slot) cell across tensors: node 0 stages
+    # the A+B+C step-0 segments (3+1+1), node 1 the A+B step-1 segments (3+1).
+    assert mem == [5, 4], mem
 
 
 def test_mixed_b_segment_fails_a_still_loads_same_error():
