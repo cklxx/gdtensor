@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "a2dc3d8b3ecab3f88a47bdebb4a50b5d3942bfce299efa36225e547561f7b21f"
+FROZEN_API_SHA256 = "416609763880c3e2415bf9b9bfb334233150d001000ae33e1222c88d23726cb4"
 
 
 def _production_manifest(root=ROOT):
@@ -148,6 +148,13 @@ MUTATIONS = [
         '        if not slot["owed"]:\n            self.release(key)',
         "        if True:\n            self.release(key)",
         "tests/io/test_cache_mutation_detectors.py::test_ack_releases_slot_only_after_every_cohort_member",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "        return self.rank in self.plan.fill_ranks[(layer, node, key)]",
+        "        return True",
+        "tests/io/test_colocated_cluster_sim.py::test_missing_local_filler_returns_error_without_remote_write",
         "notorch",
     ),
 ]

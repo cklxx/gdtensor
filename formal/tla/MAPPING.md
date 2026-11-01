@@ -11,9 +11,9 @@ proof of the whole Python.
 
 Pinned runtime baseline:
 - `gdtensor/internal/api.py`
-  `sha256 a2dc3d8b3ecab3f88a47bdebb4a50b5d3942bfce299efa36225e547561f7b21f`.
+  `sha256 416609763880c3e2415bf9b9bfb334233150d001000ae33e1222c88d23726cb4`.
 - `gdtensor/internal/propagation.py`
-  `sha256 a1faec351e0e4c016e0efa221146030e941b64d37a0c13a9fc89210da8410506`.
+  `sha256 db555b6f0d4333c59ba00d0bcad82414ae380c88627c45c7fcec8d1d1f8ff8ad`.
 Current source hashes are recorded by `scripts/formal_gate.sh` in its
 generated manifest.
 
@@ -140,6 +140,20 @@ counterpart.
 | child ack of a parent edge                           | `AckEdge(n)`        |
 | parent released after every child acked              | `ReleaseParent`     |
 | `_fail_node` generation error                        | `Fill(n,FALSE)`     |
+
+## DN fill ownership
+
+`ChainPlan.fill_ranks` permits only local consumer ranks to fill a segment.
+When no local consumer needs a segment, `services` assigns it to a local rank.
+The helper remains in its execution closure until its service work completes.
+The runtime's completed set prevents released segments from being filled again
+within one generation. The public cache-subset constraint remains unchanged.
+
+`CachePropagation.tla` now records the rank that performs `Fill(n, rank, ok)`.
+Its bounded instance has one rank per node, so `FillOnDN` requires `rank = n`.
+The `remote_fill` mutant relaxes that guard and must violate `FillOnDN`.
+This model verifies placement only for that bounded instance. Python service
+queues, multiple ranks per node and separate processes are checked by tests.
 
 ## Safety invariants (positive cfg must satisfy all)
 

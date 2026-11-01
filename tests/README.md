@@ -76,7 +76,9 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 
 `io/test_colocated_cluster_sim.py` 使用每节点独立缓存内存、有效位和 NIC，以及每 rank 独立计算内存。它检查每 rank 的 arange 分片与未写入保护字节。NIC 计数只记录跨节点传输，全覆盖场景要求网络为零。
 
-部分覆盖、单 DN 和两层场景的四项流量断言保留 `xfail(strict=True, raises=AssertionError)`。已知原因是远端 rank 代替 DN 填充，执行流量与规划统计不一致。此批提交增加模拟与正确性测试，不宣称修复填充归属，也不证明多物理机器部署。
+部分覆盖、单 DN 和两层场景的四项流量 xfail 已移除。段填充只由本节点的消费 rank 执行；没有本地消费者时指派本节点 rank 服务未消费段。内部缓存 range 携带 `cache_node`，让 accessor 定位节点，公开 range 字段不变。缓存节点不属于 rank 节点集合时，保留原 `cache_subset` 拒绝条件，不扩展公开部署范围。
+
+服务 rank 在自己分片完成后继续填充服务段。完成段按 generation 留痕，避免段释放后被晚到 helper 重填。缺席本地 filler 有界报错，不退回远端填充。新增小预算、串行、缺席 filler、非法 DN 拒绝与多进程共享内存测试。内存/NIC 模拟不证明多物理机器部署。
 
 ## 本轮实际结果
 

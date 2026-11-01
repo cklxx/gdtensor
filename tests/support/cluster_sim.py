@@ -104,6 +104,7 @@ class NodeCache(ga.DTensorDataAccessor):
         self.mem: dict = {}  # (node, tid) -> (bytes, valid mask)
         self.lock = threading.Lock()
         self.wrong_node = 0
+        self.writes = []
 
     def _buf(self, node: int, tid: str):
         key = (node, tid)
@@ -112,12 +113,13 @@ class NodeCache(ga.DTensorDataAccessor):
             self.mem[key] = (np.zeros(size, np.uint8), np.zeros(size, bool))
         return self.mem[key]
 
-    def _ends(self):
+    def _ends(self, rng):
         actor = self.cluster.node_of_rank(self.cluster.rank)
-        return actor, self.target_of_rank(self.cluster.rank)
+        target = getattr(rng, "cache_node", self.target_of_rank(self.cluster.rank))
+        return actor, target
 
     def write_from_buffer(self, global_range, write_from_buffer):
-        actor, target = self._ends()
+        actor, target = self._ends(global_range)
         tid, off, size = (
             global_range.global_tensor_id,
             _offset(global_range),
@@ -129,13 +131,14 @@ class NodeCache(ga.DTensorDataAccessor):
             return res
         self.cluster.transfer(actor, target, size)
         with self.lock:
+            self.writes.append((actor, target, off, size))
             data, valid = self._buf(target, tid)
             data[off : off + size] = tmp
             valid[off : off + size] = True
         return res
 
     def read_to_buffer(self, global_range, read_to_buffer):
-        actor, target = self._ends()
+        actor, target = self._ends(global_range)
         tid, off, size = (
             global_range.global_tensor_id,
             _offset(global_range),
@@ -179,11 +182,13 @@ class StorageMem(ga.DTensorDataAccessor):
 class RankMem(ga.DTensorDataAccessor):
     """Compute memory of every rank: one flat buffer, local to its rank."""
 
-    def __init__(self, cluster: Cluster, size: int) -> None:
+    def __init__(self, cluster: Cluster, size: int, world: int | None = None) -> None:
         self.cluster = cluster
         self.buffers = {
             rank: np.full(size, 0xA5, np.uint8)
-            for rank in range(len(cluster.nics) * cluster.k)
+            for rank in range(
+                world if world is not None else len(cluster.nics) * cluster.k
+            )
         }
 
     @property

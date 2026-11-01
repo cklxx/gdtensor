@@ -302,6 +302,7 @@ cp_neg cp_early_rank early_rank NoEarlyRankRelease
 cp_neg cp_early_parent early_parent NoEarlyParentRelease
 cp_neg cp_no_order no_parent_order ParentReadyBeforeChild
 cp_neg cp_silent_error silent_error ErrorRecorded
+cp_neg cp_remote_fill remote_fill FillOnDN
 
 # Peer down: node 2 never acks its terminal segment. Under FairSpec LiveGoal
 # must return a temporal counterexample (exit nonzero). The runtime reports

@@ -5,6 +5,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import pytest
 import safetensors.numpy
 
 import gdtensor.builder as gb
@@ -18,6 +19,13 @@ from tests.support.cache_oracle import (
     storage_schema,
 )
 from tests.support.oracle import ArrayFabric
+
+
+@pytest.fixture(autouse=True)
+def isolated_coordinator(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path / "coord"))
+    (tmp_path / "coord").mkdir()
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "2")
 
 
 def _chain(root, names, exclusive, steps=1):
@@ -115,8 +123,9 @@ def test_cell_budget_sums_all_tensors_of_a_cell(tmp_path):
     _outputs(dst, values)
 
 
-def test_ack_releases_slot_only_after_every_cohort_member(tmp_path):
+def test_ack_releases_slot_only_after_every_cohort_member(tmp_path, monkeypatch):
     """Shared file slot: first ACK must not delete the slot needed by rank1."""
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "0.5")
     chain, dst, cache, values = _chain(tmp_path, ["w"], False)
     assert type(_run(chain, dst, cache, 0)) is gb.Ok
     assert len(cache.slots) == 1

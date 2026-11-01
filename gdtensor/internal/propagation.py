@@ -107,6 +107,8 @@ class ChainPlan:
     demand: List[Dict[int, int]] = field(default_factory=list)
     drains: Dict[int, list] = field(default_factory=dict)
     cohort: List[Dict[int, set]] = field(default_factory=list)
+    fill_ranks: Dict[tuple, tuple] = field(default_factory=dict)
+    services: Dict[int, list] = field(default_factory=dict)
 
 
 # ------------------------------------------------------------------ build
@@ -163,6 +165,7 @@ def build_chain_plan(chain, with_storage: bool = True) -> ChainPlan:
     for layer in range(1, len(caches)):
         _link_parents(plan, layer)
     _link_drains(plan, chain.dst)
+    _link_fill_ranks(plan)
     _link_cohorts(plan)
     return plan
 
@@ -406,10 +409,42 @@ def _parent_items(plan: ChainPlan, layer: int, node: int, key) -> list:
     return [(layer - 1, pnode, pkey) for pkey, _o, _s in seg.parents]
 
 
+def execution_closure(plan: ChainPlan, rank: int) -> set:
+    """Drain dependencies plus DN service work assigned to this rank."""
+    todo = list(plan.services.get(rank, ()))
+    seen = rank_closure(plan, rank)
+    while todo:
+        item = todo.pop()
+        if item not in seen:
+            seen.add(item)
+            todo.extend(_parent_items(plan, *item))
+    return seen
+
+
+def _link_fill_ranks(plan: ChainPlan) -> None:
+    closures = {r: rank_closure(plan, r) for r in plan.ranks}
+    plan.services = {r: [] for r in plan.ranks}
+    for layer, nodes in enumerate(plan.segments):
+        for node, segments in nodes.items():
+            _assign_node_fills(plan, closures, layer, node, segments)
+
+
+def _assign_node_fills(plan, closures, layer, node, segments) -> None:
+    local = [r for r in plan.ranks if r // plan.k == node]
+    for key in sorted(segments):
+        item = (layer, node, key)
+        consumers = [r for r in plan.ranks if item in closures[r]]
+        eligible = [r for r in local if r in consumers]
+        helper = (local or plan.ranks)[0]
+        plan.fill_ranks[item] = tuple(eligible or [helper])
+        if not eligible:
+            plan.services[helper].append(item)
+
+
 def _link_cohorts(plan: ChainPlan) -> None:
     plan.cohort = [{n: set() for n in nodes} for nodes in plan.layer_nodes]
     for rank in plan.ranks:
-        for layer, node, _key in rank_closure(plan, rank):
+        for layer, node, _key in execution_closure(plan, rank):
             plan.cohort[layer][node].add(rank)
 
 
@@ -433,8 +468,9 @@ def _fill_pairs(seg: Segment) -> list:
 def rank_copy_plans(plan: ChainPlan, rank: int) -> list:
     """One CopyPlan per leg: the rank's fill closure, then its own drains."""
     legs: list = [[] for _ in range(len(plan.tids) + 1)]
-    for layer, node, key in sorted(rank_closure(plan, rank)):
-        legs[layer].extend(_fill_pairs(plan.segments[layer][node][key]))
+    for layer, node, key in sorted(execution_closure(plan, rank)):
+        if rank in plan.fill_ranks[(layer, node, key)]:
+            legs[layer].extend(_fill_pairs(plan.segments[layer][node][key]))
     legs[-1] = [
         (_crange(key[0], off, size), _crange(key[0], off, size))
         for _node, key, off, size in plan.drains[rank]
@@ -454,16 +490,19 @@ def plan_mem(plan: ChainPlan) -> Dict[int, int]:
 def plan_traffic(plan: ChainPlan) -> Tuple[Dict[int, int], Dict[int, int]]:
     """(inbound, outbound) bytes per node.
 
-    Storage -> layer 0 counts as inbound of the filling node (storage has no
-    node id). A cache -> cache edge or cache -> rank edge counts only when the
-    two ends are on different nodes. Every segment moves once per edge.
+    Storage reads count on the assigned filler node. Cache fills count the
+    parent-to-filler and filler-to-DN hops; a local filler reduces these to
+    the parent-to-DN edge. Only cross-node hops count. Drains count DN-to-rank.
     """
     nodes = {n for layer in plan.layer_nodes for n in layer}
     nodes.update(plan.serve)
     inbound = {n: 0 for n in nodes}
     outbound = {n: 0 for n in nodes}
     for node, segs in plan.segments[0].items():
-        inbound[node] += sum(seg.size for seg in segs.values())
+        for seg in segs.values():
+            actor = plan.fill_ranks[(0, node, seg.key)][0] // plan.k
+            inbound[actor] += seg.size
+            _hop(actor, node, seg.size, inbound, outbound)
     for layer in range(1, len(plan.tids)):
         _edge_traffic(plan, layer, inbound, outbound)
     for rank, pieces in plan.drains.items():
@@ -474,10 +513,16 @@ def plan_traffic(plan: ChainPlan) -> Tuple[Dict[int, int], Dict[int, int]]:
 def _edge_traffic(plan: ChainPlan, layer: int, inbound, outbound) -> None:
     for node, segs in plan.segments[layer].items():
         pnode = plan.parent[layer][node]
-        if pnode != node:
-            nbytes = sum(seg.size for seg in segs.values())
-            outbound[pnode] += nbytes
-            inbound[node] += nbytes
+        for seg in segs.values():
+            actor = plan.fill_ranks[(layer, node, seg.key)][0] // plan.k
+            _hop(pnode, actor, seg.size, inbound, outbound)
+            _hop(actor, node, seg.size, inbound, outbound)
+
+
+def _hop(src: int, dst: int, size: int, inbound, outbound) -> None:
+    if src != dst:
+        outbound[src] += size
+        inbound[dst] += size
 
 
 def _drain_traffic(rank_node: int, pieces, inbound, outbound) -> None:

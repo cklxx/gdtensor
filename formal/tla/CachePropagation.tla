@@ -18,7 +18,7 @@
 
    MUTANT is the only constant, assigned by the cfg:
      none / no_budget / early_rank / early_parent / no_parent_order /
-     silent_error / peer_down.
+     silent_error / peer_down / remote_fill.
    =========================================================================== *)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -35,7 +35,7 @@ SegSize == [n \in Nodes |-> IF n = 0 THEN 8 ELSE 4]
 Budget ==
   [n \in Nodes |-> IF MUTANT = "no_budget" THEN 4 ELSE 8]
 
-VARIABLES st, res, owe, rem, nerr, seen0, seen, p0ready
+VARIABLES st, res, owe, rem, nerr, seen0, seen, p0ready, filler
 
 Init ==
   /\ st  = [n \in Nodes |-> "gone"]
@@ -46,6 +46,7 @@ Init ==
   /\ seen0 = FALSE
   /\ seen = [n \in Nodes |-> FALSE]
   /\ p0ready = FALSE
+  /\ filler = [n \in Nodes |-> 3]
 
 IsUp(n) == st[n] \in {"admitted", "ready"}
 
@@ -64,13 +65,15 @@ Admit(n) ==
   /\ res' = [res EXCEPT ![n] = @ + SegSize[n]]
   /\ seen0' = (seen0 \/ n = 0)
   /\ seen' = [seen EXCEPT ![n] = TRUE]
-  /\ UNCHANGED <<p0ready, owe, rem, nerr>>
+  /\ UNCHANGED <<p0ready, owe, rem, nerr, filler>>
 
 (* A failed fill is reachable only in the silent-error injection; every other
    configuration has success-only fills, which is the executor's healthy
    contract (a real failure is broadcast and aborts the pass). *)
-Fill(n, ok) ==
+Fill(n, rank, ok) ==
   /\ st[n] = "admitted"
+  /\ (rank = n \/ MUTANT = "remote_fill")
+  /\ filler' = [filler EXCEPT ![n] = rank]
   /\ (ok = FALSE => MUTANT = "silent_error")
   /\ st' = [st EXCEPT ![n] = IF ok THEN "ready" ELSE "error"]
   /\ p0ready' = (p0ready \/ (ok /\ n = 0))
@@ -84,7 +87,7 @@ RankAck(n) ==
   /\ n \in Terminal /\ st[n] = "ready" /\ owe[n] > 0
   /\ (MUTANT # "peer_down" \/ n # 2)
   /\ owe' = [owe EXCEPT ![n] = @ - 1]
-  /\ UNCHANGED <<seen0, seen, p0ready, st, res, rem, nerr>>
+  /\ UNCHANGED <<seen0, seen, p0ready, st, res, rem, nerr, filler>>
 
 ReleaseTerminal(n) ==
   /\ n \in Terminal /\ st[n] = "ready"
@@ -92,7 +95,7 @@ ReleaseTerminal(n) ==
   /\ (MUTANT = "early_rank" \/ owe[n] = 0)
   /\ st' = [st EXCEPT ![n] = "gone"]
   /\ res' = [res EXCEPT ![n] = @ - SegSize[n]]
-  /\ UNCHANGED <<seen0, seen, p0ready, owe, rem, nerr>>
+  /\ UNCHANGED <<seen0, seen, p0ready, owe, rem, nerr, filler>>
 
 (* ---- child ack of a parent edge and parent release ---------------------- *)
 
@@ -101,7 +104,7 @@ AckEdge(n) ==
   /\ st[n] = "ready"
   /\ A \in rem[n] /\ st[0] = "ready"
   /\ rem' = [rem EXCEPT ![n] = @ \ {A}]
-  /\ UNCHANGED <<seen0, seen, p0ready, st, res, owe, nerr>>
+  /\ UNCHANGED <<seen0, seen, p0ready, st, res, owe, nerr, filler>>
 
 ChildrenStillOwing ==
   {n \in Terminal : A \in rem[n]}
@@ -111,17 +114,17 @@ ReleaseParent ==
   /\ (MUTANT = "early_parent" \/ ChildrenStillOwing = {})
   /\ st' = [st EXCEPT ![0] = "gone"]
   /\ res' = [res EXCEPT ![0] = @ - SegSize[0]]
-  /\ UNCHANGED <<seen0, seen, p0ready, owe, rem, nerr>>
+  /\ UNCHANGED <<seen0, seen, p0ready, owe, rem, nerr, filler>>
 
 Next ==
   \/ \E n \in Nodes : Admit(n)
-  \/ \E n \in Nodes, ok \in BOOLEAN : Fill(n, ok)
+  \/ \E n \in Nodes, rank \in Nodes, ok \in BOOLEAN : Fill(n, rank, ok)
   \/ \E n \in Terminal : RankAck(n)
   \/ \E n \in Terminal : ReleaseTerminal(n)
   \/ \E n \in Terminal : AckEdge(n)
   \/ ReleaseParent
 
-vars == <<st, res, owe, rem, nerr, seen0, seen, p0ready>>
+vars == <<st, res, owe, rem, nerr, seen0, seen, p0ready, filler>>
 Spec == Init /\ [][Next]_vars
 
 (* ===========================================================================
@@ -166,7 +169,10 @@ ErrorRecorded ==
 ErrorStopsAdmit ==
   \A n \in Nodes : nerr[n] = "e" => st[n] # "admitted"
 
+FillOnDN == \A n \in Nodes : filler[n] = 3 \/ filler[n] = n
+
 CACHE_INV ==
+  /\ FillOnDN
   /\ ByteBudget /\ ResidentExact /\ NoEarlyRankRelease
   /\ NoEarlyParentRelease /\ ParentReadyBeforeChild
   /\ EdgesArePlanEdges /\ ErrorRecorded /\ ErrorStopsAdmit
@@ -182,7 +188,7 @@ CACHE_INV ==
 FairSpec ==
   Spec
   /\ (\A n1 \in Nodes : WF_vars(Admit(n1)))
-  /\ (\A n2 \in Nodes : WF_vars(Fill(n2, TRUE)))
+  /\ (\A n2 \in Nodes : WF_vars(Fill(n2, n2, TRUE)))
   /\ (\A n3 \in Terminal : WF_vars(RankAck(n3)))
   /\ (\A n4 \in Terminal : WF_vars(ReleaseTerminal(n4)))
   /\ (\A n5 \in Terminal : WF_vars(AckEdge(n5)))

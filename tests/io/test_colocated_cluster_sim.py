@@ -6,6 +6,7 @@ hits the node the plan says, (3) the stat traffic functions equal the bytes
 the simulated NICs move, and (4) a slow NIC does not stall the executor.
 """
 
+import multiprocessing as mp
 import threading
 
 import numpy as np
@@ -21,6 +22,12 @@ from tests.support.cluster_sim import (
     StorageMem,
     layer_targets,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_coordinator(tmp_path, monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "3")
 
 
 def _storage(acc, size, world):
@@ -64,9 +71,10 @@ def _storage(acc, size, world):
 
 
 def _cache(acc, size, steps, nodes, width):
+    spatial = gb.LiteralMesh(list(nodes), gt.NumNodes(max(nodes) + 1))
     mesh = gb.StCacheOuterProductMesh(
         temporal=gb.ArrangedMesh(gt.NumSteps(steps)),
-        spatial=gb.LiteralMesh(list(nodes), gt.NumNodes(len(nodes))),
+        spatial=spatial,
         concurrency=gb.ArrangedMesh(gt.ConcurrencyWidth(width)),
     )
     dt = gb.NaiveDTensor(
@@ -90,11 +98,11 @@ def _compute(acc, size, world):
 
 def _build(layers, size=16, world=8, k=2, steps=1, width=1, bandwidth=0.0):
     """layers: node tuples in data-flow order (one or two cache layers)."""
-    cluster = Cluster(world // k, k, bandwidth)
+    cluster = Cluster(max(world // k, max(max(n) for n in layers) + 1), k, bandwidth)
     targets = layer_targets(cluster, [list(n) for n in layers])
     caches = [NodeCache(cluster, {"w": size}, t) for t in targets]
     src = StorageMem(cluster, np.arange(size, dtype=np.uint8))
-    dst = RankMem(cluster, size)
+    dst = RankMem(cluster, size, world)
     views = [_cache(c, size, steps, n, width) for c, n in zip(caches, layers)]
     common = dict(
         src=_storage(src, size, world),
@@ -140,6 +148,11 @@ def _check(chain, cluster, caches, dst, size, world):
         want[start:stop] = expected[start:stop]
         np.testing.assert_array_equal(data, want, err_msg=f"rank {rank}")
     assert [c.wrong_node for c in caches] == [0] * len(caches)
+    for cache in caches:
+        assert all(
+            actor == target or target >= world // cluster.k
+            for actor, target, _off, _size in cache.writes
+        )
     return cluster.nic_bytes()
 
 
@@ -164,9 +177,6 @@ CASES = {
 }
 
 
-REMOTE_FILL = "remote rank fills a cache node: storage bytes go to the rank node, then over the NIC to the DN"
-
-
 @pytest.mark.parametrize("name", sorted(CASES))
 @pytest.mark.parametrize("steps,width", [(1, 1), (2, 2)])
 def test_colocated_delivery_hits_planned_nodes(name, steps, width):
@@ -175,38 +185,10 @@ def test_colocated_delivery_hits_planned_nodes(name, steps, width):
     _check(chain, cluster, caches, dst, size, world)
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "full_cover_one_layer",
-        pytest.param(
-            "partial_one_layer",
-            marks=pytest.mark.xfail(
-                strict=True, raises=AssertionError, reason=REMOTE_FILL
-            ),
-        ),
-        pytest.param(
-            "single_dn_one_layer",
-            marks=pytest.mark.xfail(
-                strict=True, raises=AssertionError, reason=REMOTE_FILL
-            ),
-        ),
-        pytest.param(
-            "two_layer_fanout",
-            marks=pytest.mark.xfail(
-                strict=True, raises=AssertionError, reason=REMOTE_FILL
-            ),
-        ),
-        pytest.param(
-            "two_layer_partial",
-            marks=pytest.mark.xfail(
-                strict=True, raises=AssertionError, reason=REMOTE_FILL
-            ),
-        ),
-    ],
-)
-def test_colocated_nic_bytes_match_stats(name):
-    chain, cluster, caches, dst = _build(CASES[name])
+@pytest.mark.parametrize("name", sorted(CASES))
+@pytest.mark.parametrize("steps,width", [(1, 1), (2, 2), (8, 2)])
+def test_colocated_nic_bytes_match_stats(name, steps, width):
+    chain, cluster, caches, dst = _build(CASES[name], steps=steps, width=width)
     _check(chain, cluster, caches, dst, 16, 8)
     (stat_in, obs_in), (stat_out, tx) = _stat_vs_nic(chain, cluster)
     assert stat_out == tx, (stat_out, tx)
@@ -226,3 +208,88 @@ def test_slow_nic_does_not_time_out(monkeypatch):
     # 64 B/s link: one 4 B remote piece takes about 0.06 s.
     chain, cluster, caches, dst = _build([(0,)], bandwidth=64.0)
     _check(chain, cluster, caches, dst, 16, 8)
+
+
+@pytest.mark.parametrize("layers", [[(4,)], [(4,), (0, 1, 2, 3)]])
+def test_dn_outside_rank_nodes_is_rejected(layers):
+    chain, cluster, caches, _dst = _build(layers)
+    result = chain.check_constraints()
+    assert type(result) is gb.Err, result
+    assert result.value.constraint_name == "cache_subset"
+    assert sum(cluster.storage_in.values()) == 0
+    assert all(not cache.writes for cache in caches)
+
+
+def test_missing_local_filler_returns_error_without_remote_write(monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "0.2")
+    chain, cluster, caches, _dst = _build([(0,)])
+    cluster.rank = 2
+    result = gio.chain_load(2, chain)
+    assert type(result) is gb.Err, result
+    assert result.value.check_name == "cache_wait"
+    assert not caches[0].writes
+    assert sum(cluster.storage_in.values()) == 0
+
+
+@pytest.mark.parametrize("layers", [[(0, 1, 2, 3)], [(0,)], [(0,), (0, 1, 2, 3)]])
+def test_serial_calls_preserve_completed_fills(layers):
+    chain, cluster, caches, _dst = _build(layers)
+    for rank in range(8):
+        cluster.rank = rank
+        assert type(gio.chain_load(rank, chain)) is gb.Ok
+    pairs = _stat_vs_nic(chain, cluster)
+    assert all(stat == observed for stat, observed in pairs), pairs
+    assert all(actor == target for c in caches for actor, target, _o, _s in c.writes)
+
+
+def _shared_cache_worker(rank, buffers, lock, queue):
+    chain, cluster, caches, dst = _build([(0,)], size=8, world=4, steps=2)
+    data, valid = buffers
+    caches[0].mem[(0, "w")] = (
+        np.frombuffer(data, np.uint8),
+        np.frombuffer(valid, np.uint8),
+    )
+    caches[0].lock = lock
+    cluster.rank = rank
+    result = gio.chain_load(rank, chain)
+    want = np.full(8, 0xA5, np.uint8)
+    want[rank * 2 : (rank + 1) * 2] = np.arange(8, dtype=np.uint8)[
+        rank * 2 : (rank + 1) * 2
+    ]
+    ok = type(result) is gb.Ok and np.array_equal(dst.buffers[rank], want)
+    queue.put((rank, ok, cluster.nic_bytes(), cluster.storage_in, caches[0].writes))
+
+
+def _finish_process(process):
+    if process.is_alive():
+        process.terminate()
+    process.join(5)
+
+
+def test_one_process_per_rank_uses_local_dn_and_shared_cache():
+    ctx = mp.get_context("spawn")
+    queue, lock = ctx.Queue(), ctx.RLock()
+    buffers = (ctx.RawArray("B", 8), ctx.RawArray("B", 8))
+    processes = [
+        ctx.Process(target=_shared_cache_worker, args=(r, buffers, lock, queue))
+        for r in range(4)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        results = [queue.get(timeout=60) for _ in processes]
+        for process in processes:
+            process.join(10)
+        assert all(p.exitcode == 0 for p in processes)
+    finally:
+        for process in processes:
+            _finish_process(process)
+        queue.close()
+    assert sorted((r, ok) for r, ok, *_ in results) == [(r, True) for r in range(4)]
+    rx = [sum(item[2][0][n] for item in results) for n in range(2)]
+    tx = [sum(item[2][1][n] for item in results) for n in range(2)]
+    storage = [sum(item[3][n] for item in results) for n in range(2)]
+    assert rx == [0, 4] and tx == [4, 0] and storage == [8, 0]
+    assert all(
+        actor == target == 0 for item in results for actor, target, _o, _s in item[4]
+    )

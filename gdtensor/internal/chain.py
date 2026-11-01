@@ -285,9 +285,9 @@ def d_tensors_view_rank_plan_chain_load(
 def _plan_concrete(rank: int, chain) -> ConcreteCopyPlanChain:
     """Per-rank copy plans derived from the node-level propagation plan.
 
-    The fill legs list the cache segments this rank's drains depend on (its
-    closure). A segment shared by several ranks appears in each of their
-    plans, but the executor fills it once per node.
+    Fill legs list only work the rank may perform: local consumer fills plus
+    assigned DN service work. Shared local fills may appear in several plans;
+    the coordinator admits each segment once per generation.
     """
     if type(chain) is DirectDTensorsReadChain:
         return DirectCopyPlanChain(rank_direct_plan(rank, chain))

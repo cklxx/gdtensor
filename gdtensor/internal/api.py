@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import ctypes
 import hashlib
 import logging
@@ -178,6 +178,7 @@ class _NodeState:
         self.budget = budget
         self.cohort = set(cohort)
         self.slots: dict = {}  # key -> {"filled", "owed"}
+        self.completed: set = set()  # filled this generation, including released slots
         self.resident = 0
         self.gen = 0
         self.active = 0
@@ -191,6 +192,7 @@ class _NodeState:
         if idle and (rank in self.joined or self.cohort <= self.joined):
             self.gen += 1
             self.slots, self.resident, self.error = {}, 0, None
+            self.completed = set()
             self.joined = set()
         self.active += 1
         self.joined.add(rank)
@@ -218,7 +220,7 @@ class _NodeState:
 
     def reserve(self, segs: list) -> bool:
         """Admit all segments or none; each starts unfilled with its owed set."""
-        if any(s.key in self.slots for s in segs):
+        if any(s.key in self.slots or s.key in self.completed for s in segs):
             return False
         if not self.fits(sum(s.size for s in segs)):
             return False
@@ -285,7 +287,7 @@ class _SlotTable:
 
 _COORD_ENV = "GDTENSOR_CACHE_COORDINATOR"
 _COORD_DIR_ENV = "GDTENSOR_CACHE_DIR"
-_MAGIC = "gdtensor-coord-v1"
+_MAGIC = "gdtensor-coord-v2"
 
 
 def _DBG(*parts) -> None:
@@ -571,12 +573,13 @@ class _RankRun:
     """
 
     def __init__(self, table, rank: int, caches, storage, dst) -> None:
-        from .propagation import rank_closure
+        from .propagation import execution_closure
 
         self.t, self.plan, self.rank = table, table.plan, rank
         self.caches, self.storage, self.dst = caches, storage, dst
         self.last = len(caches) - 1
-        closure = rank_closure(self.plan, rank)
+        closure = execution_closure(self.plan, rank)
+        self.services = list(self.plan.services.get(rank, ()))
         self.gens = dict.fromkeys(sorted({(lay, n) for lay, n, _k in closure}), 0)
         self.wait = _wait_seconds()
 
@@ -669,7 +672,7 @@ class _RankRun:
     def _loop(self, pending: list) -> None:
         """The wait limit restarts after every unit of progress."""
         deadline = time.monotonic() + self.wait
-        while pending:
+        while pending or self.services:
             version = self._version_checked()
             moved = self._step(pending)
             deadline = time.monotonic() + self.wait if moved else deadline
@@ -681,9 +684,25 @@ class _RankRun:
         for piece in done:
             self._drain(piece)
             pending.remove(piece)
-        return bool(done) or any(
-            self._ensure(self.last, n, k) for n, k, _o, _s in pending
+        return (
+            bool(done)
+            or self._service_step()
+            or any(self._ensure(self.last, n, k) for n, k, _o, _s in pending)
         )
+
+    def _service_step(self) -> bool:
+        ready = next(
+            (
+                item
+                for item in self.services
+                if self._completed(*item) or self._ensure(*item)
+            ),
+            None,
+        )
+        if ready is None:
+            return False
+        self.services.remove(ready)
+        return True
 
     def _version_checked(self) -> int:
         with self.t.cond:
@@ -729,15 +748,21 @@ class _RankRun:
         return done
 
     def _timeout(self, pending: list):
-        node, key = pending[0][0], pending[0][1]
-        state = self.t.node(self.last, node)
+        layer, node, key = (
+            (self.last, pending[0][0], pending[0][1]) if pending else self.services[0]
+        )
+        state = self.t.node(layer, node)
         owed = state.owed_to()
         msg = (
             f"rank {self.rank}: no progress for {self.wait}s on cache layer "
-            f"{self.last} node {node} segment {key}; resident {state.resident} of "
+            f"{layer} node {node} segment {key}; resident {state.resident} of "
             f"budget {state.budget} bytes owed to {owed}"
         )
         return check_failed("cache_wait", msg)
+
+    def _completed(self, layer: int, node: int, key) -> bool:
+        with self.t.cond:
+            return key in self.t.node(layer, node).completed
 
     def _filled(self, layer: int, node: int, key) -> bool:
         with self.t.cond:
@@ -751,6 +776,8 @@ class _RankRun:
         full layer does not pin upstream budget for a segment it cannot admit.
         """
         seg = self.plan.segments[layer][node][key]
+        if not self._can_fill(layer, node, key):
+            return False
         if not self._room(layer, node, seg):
             return False
         if layer > 0 and not self._parents_ready(layer, node, seg):
@@ -760,11 +787,18 @@ class _RankRun:
         self._fill(layer, node, seg)
         return True
 
+    def _can_fill(self, layer: int, node: int, key) -> bool:
+        return self.rank in self.plan.fill_ranks[(layer, node, key)]
+
     def _room(self, layer: int, node: int, seg) -> bool:
         with self.t.cond:
             state = self.t.node(layer, node)
             state.check(self.gens[(layer, node)])
-            return seg.key not in state.slots and state.fits(seg.size)
+            return (
+                seg.key not in state.completed
+                and seg.key not in state.slots
+                and state.fits(seg.size)
+            )
 
     def _reserve(self, layer: int, node: int, segs: list) -> bool:
         """Admit all segments or none; each starts unfilled with its owed set."""
@@ -789,6 +823,8 @@ class _RankRun:
         if all(self._filled(layer - 1, pnode, k) for k in keys):
             return True
         missing = [psegs[k] for k in keys if not self._resident(layer - 1, pnode, k)]
+        if any(not self._can_fill(layer - 1, pnode, s.key) for s in missing):
+            return False
         if not missing or not self._reserve(layer - 1, pnode, missing):
             return False
         for pseg in missing:
@@ -800,16 +836,21 @@ class _RankRun:
             return key in self.t.node(layer, node).slots
 
     def _fill(self, layer: int, node: int, seg) -> None:
+        if not self._can_fill(layer, node, seg.key):
+            raise check_failed(
+                "cache_fill_owner", f"rank {self.rank} cannot fill node {node}"
+            )
         self._inflight(1)
         try:
             data = self._source_bytes(layer, seg)
-            _write(self.caches[layer].data_accessor, _crange(seg.key), data)
+            _write(self.caches[layer].data_accessor, _cache_range(seg.key, node), data)
         except BaseException as exc:
             self._inflight(-1)
             self._fail(layer, node, exc, seg.key)
             raise
         with self.t.cond:
             self.t.node(layer, node).slots[seg.key]["filled"] = True
+            self.t.node(layer, node).completed.add(seg.key)
             self.t.inflight -= 1
             self.t.mark_touched((layer, node))
             self.t.bump()
@@ -828,7 +869,10 @@ class _RankRun:
             return b"".join(_read(acc, rng) for rng, _off in seg.storage)
         acc = self.caches[layer - 1].data_accessor
         return b"".join(
-            _read(acc, RangeFromComputeView(seg.tid, off, size))
+            _read(
+                acc,
+                _cache_range((seg.tid, off, size), self.plan.parent[layer][seg.node]),
+            )
             for _k, off, size in seg.parents
         )
 
@@ -837,7 +881,10 @@ class _RankRun:
         rng = RangeFromComputeView(key[0], off, size)
         self._inflight(1)
         try:
-            data = _read(self.caches[self.last].data_accessor, rng)
+            data = _read(
+                self.caches[self.last].data_accessor,
+                _cache_range((key[0], off, size), node),
+            )
             _write(self.dst.data_accessor, rng, data)
         except BaseException as exc:
             self._inflight(-1)
@@ -867,6 +914,17 @@ class _RankRun:
             self.t.node(layer, node).ack(key, piece)
             self.t.mark_touched((layer, node))
             self.t.bump()
+
+
+@dataclass(eq=True)
+class _CacheRange(RangeFromComputeView):
+    """Internal cache address; public byte-range fields remain unchanged."""
+
+    cache_node: int = 0
+
+
+def _cache_range(key, node: int) -> RangeFromComputeView:
+    return _CacheRange(key[0], key[1], key[2], node)
 
 
 def _crange(key) -> RangeFromComputeView:
