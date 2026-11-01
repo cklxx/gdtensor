@@ -63,6 +63,21 @@ DCP 的读盘发生在 load session 初始化。不能把每次 accessor callbac
 
 这些测试检出缓存 fill job 丢失 file_path 的缺陷。修复保留源文件路径及每个合法 range，逐 slot 读取，避免跨 slot 合并成非法文件范围。修复未新增公开 API。
 
+## CRC 验证与混合部署模拟
+
+CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片继续使用原有逐元素或逐字节断言，不额外加 CRC。原有 checkpoint CRC 验证保持不变。
+
+`support/crc.py` 提供 CRC-32 校验。测试必须在操作前保存基线，或从独立输出 oracle 生成基线；不能对同一输出计算两次 CRC 后比较。原有数值精度与逐字节断言继续执行。
+
+- `core/test_payload_crc.py` 检查标准向量、原样传输，以及翻转、截短、交换和追加损坏。失败路径不得打印 PASS。
+- `sim/test_dcp_codec.py` 检查非 arange BF16 常量和随机载荷的 codec/DCP 往返。
+- `torch/test_lawa_dtype.py` 在累加前记录噪声输入 CRC，累加后检查输入未变；BF16 输出与独立量化均值做 CRC 和精确对拍。允许误差的 F32 累加保留容差断言，不强制 CRC 相等。
+- `torch/test_lawa.py` 的非 arange bias 在加载后、累加前与独立输入做 CRC 对拍。
+
+`io/test_colocated_cluster_sim.py` 使用每节点独立缓存内存、有效位和 NIC，以及每 rank 独立计算内存。它检查每 rank 的 arange 分片与未写入保护字节。NIC 计数只记录跨节点传输，全覆盖场景要求网络为零。
+
+部分覆盖、单 DN 和两层场景的四项流量断言保留 `xfail(strict=True, raises=AssertionError)`。已知原因是远端 rank 代替 DN 填充，执行流量与规划统计不一致。此批提交增加模拟与正确性测试，不宣称修复填充归属，也不证明多物理机器部署。
+
 ## 本轮实际结果
 
 受测树：`42d03d8`（分支 `fix/cache-propagation-plan`，digest 干净归档树）。

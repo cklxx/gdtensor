@@ -15,6 +15,7 @@ import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
 from gdtensor_sim.coord import ProcessCoordinator
+from tests.support.crc import crc_of, verify_payload
 from tests.support.lawa import normalize_weights as _normalize_weights
 from tests.support.oracle import TorchAccessor
 from tests.support.storage import FileStorage
@@ -201,6 +202,7 @@ def _average_checkpoints(
                 _storage(root / f"input{index}", tensors, fmt, None, world),
             )
         )
+        _verify_loaded_bias(torch, current, tensors, rank)
         _accumulate(accumulator, current, index + 1, method)
         _progress(
             progress, rank, f"method={method} k={k} merged_checkpoint={index + 1}/{k}"
@@ -217,6 +219,17 @@ def _average_checkpoints(
     )
     _ok(gio.rank_load(rank, reloaded, _storage(output, base, fmt, None, world)))
     _verify_local_mean(torch, reloaded, values[:k], rank, progress, method, k)
+
+
+def _verify_loaded_bias(torch, view, tensors, rank):
+    indices = view.data_accessor.points["bias"]
+    want = tensors["bias"].reshape(-1)[indices].contiguous()
+    tensor = gdtensor.get_d_tensor(_ok(gdtensor.get_gd_tensor(view, "bias")))
+    actual = tensor.to_local().contiguous().reshape(-1)
+    raw = bytes(actual.view(torch.uint8).numpy())
+    expected = bytes(want.view(torch.uint8).numpy())
+    verify_payload(f"lawa_bias_rank{rank}", crc_of(expected), raw)
+    assert raw == expected
 
 
 def _divide(view, divisor):
@@ -267,6 +280,7 @@ def _average_weighted_checkpoints(
                 _storage(root / f"input{index}", tensors, fmt, None, world),
             )
         )
+        _verify_loaded_bias(torch, current, tensors, rank)
         cumulative += normalized[index]
         _weighted_accumulate(
             torch, accumulator, current, normalized[index], cumulative, method
