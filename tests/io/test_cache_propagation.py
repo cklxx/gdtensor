@@ -268,7 +268,9 @@ def _live_peak(cache: Probe) -> int:
 @pytest.mark.parametrize(
     "steps,width", [(1, 1), (2, 1), (4, 1), (2, 2), (4, 2), (8, 2)]
 )
-def test_resident_cache_bytes_never_exceed_stat(steps, width):
+def test_resident_cache_bytes_never_exceed_stat(steps, width, monkeypatch):
+    # A no-fill mutant must fail inside the test, before thread/harness limits.
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "2")
     size, world = 16, 2
     chain, _src, cache, dst = _one_layer(size, world, 2, (0,), steps, width)
     stat = gio.chain_stat_mem_overhead(chain)
