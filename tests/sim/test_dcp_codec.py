@@ -14,6 +14,8 @@ torch = pytest.importorskip("torch")
 
 from gdtensor_sim import dcp_backend as db
 
+from tests.support.crc import crc_of, verify_payload
+
 
 class _Meta:
     def __init__(self, shape, dtype, itemsize):
@@ -27,6 +29,7 @@ def test_bf16_slot_bytes_reconstruct_without_float32_widening():
     values = [1.0, 2.0, -3.0, 0.5, 100.0, -0.25]
     expected = torch.tensor(values, dtype=torch.bfloat16).reshape(shape)
     raw = bytes(expected.reshape(-1).view(torch.uint8).numpy())
+    want_crc = crc_of(raw)
     assert len(raw) == expected.numel() * 2
 
     out = db._torch_from_raw(raw, _Meta(shape, "BF16", 2))
@@ -35,7 +38,9 @@ def test_bf16_slot_bytes_reconstruct_without_float32_widening():
     assert out.shape == torch.Size(shape)
     assert torch.equal(out, expected)
     # The 2-byte pattern must survive byte-exact; no float32 round trip.
-    assert bytes(out.reshape(-1).view(torch.uint8).numpy()) == raw
+    actual = bytes(out.reshape(-1).view(torch.uint8).numpy())
+    verify_payload("bf16_literal_codec", want_crc, actual)
+    assert actual == raw
 
 
 def test_bf16_roundtrip_via_real_dcp_preserves_bytes():
@@ -46,15 +51,20 @@ def test_bf16_roundtrip_via_real_dcp_preserves_bytes():
     shape = (4, 2)
     expected = torch.randn(shape, dtype=torch.bfloat16)
     raw_before = bytes(expected.reshape(-1).view(torch.uint8).numpy())
+    want_crc = crc_of(raw_before)
 
     with tempfile.TemporaryDirectory() as root:
-        dcp_save({"x": expected.clone()}, checkpoint_id=root, no_dist=True)
+        with pytest.warns(UserWarning, match="intent is to save in a single process"):
+            dcp_save({"x": expected.clone()}, checkpoint_id=root, no_dist=True)
         out = {"x": torch.empty(shape, dtype=torch.bfloat16)}
-        dcp_load(out, checkpoint_id=root, no_dist=True)
+        with pytest.warns(UserWarning, match="intent is to load in a single process"):
+            dcp_load(out, checkpoint_id=root, no_dist=True)
 
     assert out["x"].dtype == torch.bfloat16
     assert torch.equal(out["x"], expected)
-    assert bytes(out["x"].reshape(-1).view(torch.uint8).numpy()) == raw_before
+    raw_after = bytes(out["x"].reshape(-1).view(torch.uint8).numpy())
+    assert raw_after == raw_before
+    verify_payload("bf16_randn_dcp_roundtrip", want_crc, raw_after)
 
 
 def test_empty_tensor_does_not_raise_on_view():

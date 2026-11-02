@@ -136,9 +136,9 @@ def compute_table(names, size=4, exclusive=False):
     return gb.DTensorTable(dts)
 
 
-def cache_view(names, accessor, size=4):
+def cache_view(names, accessor, size=4, steps=1):
     mesh = gb.StCacheOuterProductMesh(
-        gb.ArrangedMesh(gt.NumSteps(1)),
+        gb.ArrangedMesh(gt.NumSteps(steps)),
         gb.ArrangedMesh(gt.NumNodes(1)),
         gb.ArrangedMesh(gt.ConcurrencyWidth(1)),
     )

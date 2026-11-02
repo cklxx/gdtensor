@@ -57,11 +57,13 @@
 - DCP `get_file_offset`：per-dim chunk origin 已实现——`MetadataIndex.offset` + `ChunkStorageMetadata.sizes` 逐维 subtract 后按 chunk shape ravel，不再用 scalar flat diff 启发式。5 个公共 session 测试过：no_dist world3 middle pread、gloo 2-rank row Shard(0)、col Shard(1) packed 2D、world1 跨 2 chunks 返回 InvalidArgumentError（公开 `rank_load` 读全量字节正确）、col shard 第二行 sub-slot within chunk（local offset = row1*chunk_width = 2 elems）。跨 chunk 单 pos 返回 InvalidArgumentError 是明确能力边界，不扩 multi-segment API。
 - Mixed：按设计 line 386 "每段自己的源端 session"，删除 `_run_shared_source` 跨段共享，改为 `_run_one_concrete` per-chain session。2 个合法 test（A/B 各自独立 session、B 失败 A bytes 已投递）过。
 - cache observer：14 个独立观察 test 过，per-node slot reference counting，write retain 到同 node 所有 reader ACK 才 free。
+- 缓存读链（2026-10-29）：规划、统计、执行统一为节点级传播计划；修复两层扩散链路执行失败、流量口径、源端读放大、内存低估和缺席消费者挂起。验收：`tests/io/test_cache_propagation.py`。
+- 形式化（2026-10-29）：`formal/tla/CachePropagation.tla` 覆盖新节点级传播计划执行器。正例满足 8 个聚合不变量（字节预算、resident 精确、rank/parent 不提前释放、父子顺序、边合法、错误记录与准入阻断），5 个变异分别被指定不变量检出，peer_down 在 FairSpec 下给出活性反例。映射见 `formal/tla/MAPPING.md`。有界投影，不证明 Python。
 - leg-order feasibility：whole-leg barrier 与 C=1 容量在 temporal=2/world=1 下矛盾，已记录证据 `log/gate/leg-order-feasibility.txt`，推荐 slot 内顺序交错（Main 批准 delta）。
 
 ## 边界（不记 pass）
 
 - 真实多机（>1 node）未测；单机 gloo 2-rank + LAWA 2-32 进程历史覆盖。
 - DCP 跨 chunk 单 pos 不支持 single base offset（返回 InvalidArgumentError）；公开 `rank_load` 经 official reader 全量正确。
-- bounded C cache pipeline：当前 per-slot 交错实现中，node 级 slot state 由 pipeline owner 维护。
+- 缓存协调器默认在进程内（线程）；多进程需实现同一契约的协调器，未提供，也未做多机测试。见 `docs/decisions-2026-10-29.md`。
 

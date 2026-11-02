@@ -381,11 +381,34 @@ _DATA_TYPES = set(_EXTRA) | {
 
 
 def _cache_view(o):
-    from .dtensor import tensor_ids_of
+    from .dtensor import naive_of, tensor_ids_of
+    from .mesh import cache_concurrency_width, cache_node_set
 
     if tensor_ids_of(o.d_tensor_table) != list(o.tensor_ids):
         return _err(
             o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table"
+        )
+    # The plan executor (propagation._view_nodes / _view_width) needs one node
+    # set and one width per view; reject a mixed view before any plan builds.
+    sets = {
+        tuple(cache_node_set(naive_of(nd).mesh))
+        for nd in o.d_tensor_table.named_d_tensors
+    }
+    if len(sets) != 1:
+        return _err(
+            o,
+            "cache_node_set_consistent",
+            "all tensors of a cache view must cover one node set",
+        )
+    widths = {
+        cache_concurrency_width(naive_of(nd).mesh)
+        for nd in o.d_tensor_table.named_d_tensors
+    }
+    if len(widths) != 1:
+        return _err(
+            o,
+            "cache_width_consistent",
+            "all tensors of a cache view must share one width",
         )
     if o.data_accessor is None:
         return _err(o, "data_accessor_non_nil", "data_accessor is nil")
@@ -405,14 +428,20 @@ def _st_cache_mesh(o):
         return _err(
             o, "temporal_branch", "temporal must be ArrangedMesh or ReshapedMesh"
         )
-    if type(s) not in (LiteralMesh, ReshapedMesh):
-        return _err(o, "spatial_branch", "spatial must be LiteralMesh or ReshapedMesh")
+    if type(s) not in (ArrangedMesh, LiteralMesh, ReshapedMesh):
+        return _err(
+            o,
+            "spatial_branch",
+            "spatial must be ArrangedMesh, LiteralMesh or ReshapedMesh",
+        )
     if type(c) is not ArrangedMesh:
         return _err(o, "concurrency_arranged", "concurrency must be ArrangedMesh")
-    # Exactly one anchor branch; the other dimension reshape-wraps it.
+    # Exactly one anchor branch; the other dimension reshape-wraps it. Two
+    # flat branches (both ArrangedMesh) are legal: the executor reads node
+    # count from the spatial branch and step count from the temporal branch.
     tb, sb = _unwrap_cache(t), _unwrap_cache(s)
     anchored = (
-        (type(t) is ArrangedMesh and type(s) is LiteralMesh)
+        (type(t) is ArrangedMesh and type(s) in (ArrangedMesh, LiteralMesh))
         or (type(s) is ReshapedMesh and type(tb) is ArrangedMesh)
         or (type(t) is ReshapedMesh and type(sb) is LiteralMesh)
     )
@@ -491,6 +520,7 @@ _EXTRA["MixedDTensorsReadChain"] = _mixed_chain
 _EXTRA["DisjointTensorIdsAndReadChain"] = _disjoint_chain
 _DATA_TYPES.update(
     {
+        "CacheDTensorsView",
         "CacheMesh",
         "TemporalCacheMesh",
         "SpatioCacheMesh",

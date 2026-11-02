@@ -76,7 +76,9 @@ jobs:
   torch:
     name: Torch, types and LAWA (CPU)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The complete CPU rank suite exceeded the former 30-minute job budget.
+    # Preserve every test and the zero-skip gate; allow the slow runner to finish.
+    timeout-minutes: 60
     env:
       GDTENSOR_TORCH_TESTS: "1"
       GDTENSOR_LAWA_JOIN_SECONDS: "300"
