@@ -11,7 +11,7 @@ proof of the whole Python.
 
 Pinned runtime baseline:
 - `gdtensor/internal/api.py`
-  `sha256 416609763880c3e2415bf9b9bfb334233150d001000ae33e1222c88d23726cb4`.
+  `sha256 b1e1a919f6b4843c74609e3d5e243402208d2e57c269b1ef698bd63f36fede3a`.
 - `gdtensor/internal/propagation.py`
   `sha256 db555b6f0d4333c59ba00d0bcad82414ae380c88627c45c7fcec8d1d1f8ff8ad`.
 Current source hashes are recorded by `scripts/formal_gate.sh` in its
