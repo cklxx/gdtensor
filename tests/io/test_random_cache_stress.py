@@ -71,7 +71,7 @@ def _draw(seed: int) -> dict:
         steps=[int(rng.choice([1, 2, 3, 4, 8])) for _ in layers],
         width=[int(rng.integers(1, 4)) for _ in layers],
         sizes=sizes,
-        replicate=[bool(rng.random() < 0.3) for _ in sizes],
+        replicate=[rng.random() < 0.3 for _ in sizes],
         coordinator=str(rng.choice(["file", "thread"])),
         bandwidth=float(rng.choice([0.0, 0.0, 0.0, 16384.0])),
         repeat=int(rng.integers(1, 3)),

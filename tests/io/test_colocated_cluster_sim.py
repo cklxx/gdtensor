@@ -10,6 +10,7 @@ import faulthandler
 import multiprocessing as mp
 import threading
 import time
+from typing import cast
 
 import numpy as np
 import pytest
@@ -317,14 +318,15 @@ def _death_load(rank, buffers, lock, entered, release, ready, pipe):
     chain, cluster, caches, dst = _build([(0,)], size=8, world=2, k=1)
     caches[0].mem[(0, "w")] = tuple(np.frombuffer(b, np.uint8) for b in buffers)
     caches[0].lock = lock
-    read = chain.src.data_accessor.read_to_buffer
+    src = cast(gb.StorageDTensorsView, chain.src)
+    read = src.data_accessor.read_to_buffer
 
     def gated_read(rng, callback):
         entered.set()
         assert release.wait(15), "parent did not release source read"
         return read(rng, callback)
 
-    chain.src.data_accessor.read_to_buffer = gated_read
+    src.data_accessor.read_to_buffer = gated_read
     cluster.rank = rank
     ready.set()
     result = gio.chain_load(rank, chain)

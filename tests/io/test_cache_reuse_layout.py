@@ -156,7 +156,9 @@ class ReusedFiles(ga.DTensorDataAccessor):
             self.deleted.append((key, path))
 
     def assert_slow_bytes_live(self):
-        node, slow = self.block
+        block = self.block
+        assert block is not None, "blocked consumer never entered"
+        node, slow = block
         with self.lock:
             held = [k for k in self.slots if k[0] == node and k[2] == 0]
             assert held, "first segment disappeared while its consumer was blocked"
