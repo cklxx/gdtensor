@@ -105,12 +105,14 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 
 ## 本轮实际结果
 
-受测树：`42d03d8`（分支 `fix/cache-propagation-plan`，digest 干净归档树）。
+受测树：`cea07b4`（分支 `fix/cache-propagation-plan`，digest 干净归档树）。本段文档更新单独提交，不影响测试结果。
 
-- digest 全量 pytest：1488 passed、0 failed、0 skipped（含真实 2–32 rank torch/LAWA）。
+- digest 全量 pytest：1710 passed、0 failed、0 skipped（含真实 torch/LAWA）。
+- 随机缓存策略压测：5000 个 seed 全部通过（`io/test_random_cache_stress.py`，1103 秒）。
 - 格式、lint、字节编译通过；ty 与 Pyrefly 均为 0 诊断。
-- 独立变异检测：11 个核心变异全部检出（含新的字节预算准入与 owed ACK 释放变异）。
-- 独立形式化复验：Lean 5 个正向文件通过、6 个负向夹具被拒绝；TLA+ 30 个检查通过（CopyPlan 10、AtomicPublish 1、SlotLifecycle 11、CachePropagation 8）。
+- 独立变异检测：notorch 组 19/19、torch 组 1/1 全部检出。
+- 独立形式化复验：Lean 5 个正向文件通过，NegativeFixtures 按预期被拒绝；TLA+ 31 个检查通过，含新增 `cp_peer_down`。
+- 形式化工具：digest 直连 GitHub 取固定 jar 返回 403。改用已校验缓存的同一 jar（sha256 `011267fc…`）补跑。脚本仍校验固定哈希，不匹配即中止。
 
 证据在 digest `log/fix-df1/`（pytest、mutation、formal）。日志不作为发布包内容。
 
