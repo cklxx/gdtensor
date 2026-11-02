@@ -157,6 +157,44 @@ MUTATIONS = [
         "tests/io/test_colocated_cluster_sim.py::test_missing_local_filler_returns_error_without_remote_write",
         "notorch",
     ),
+    # Randomized co-located stress: each mutant breaks one oracle axis (fill
+    # owner, helper node, storage offset, generation refill, stat traffic).
+    # The detector is the first seed that exposes the mutant on digest.
+    (
+        "gdtensor/internal/propagation.py",
+        "eligible = [r for r in local if r in consumers]",
+        "eligible = list(consumers)",
+        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/propagation.py",
+        "helper = (local or plan.ranks)[0]",
+        "helper = plan.ranks[0]",
+        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/plan.py",
+        "RangeFromStorageView(path, cpo + int(l) * isz, int(b - a) * isz)",
+        "RangeFromStorageView(path, cpo + int(a) * isz, int(b - a) * isz)",
+        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "if any(s.key in self.slots or s.key in self.completed for s in segs):",
+        "if any(s.key in self.slots for s in segs):",
+        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[76]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/propagation.py",
+        "        _drain_traffic(rank // plan.k, pieces, inbound, outbound)\n",
+        "        pass\n",
+        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "notorch",
+    ),
 ]
 
 
@@ -168,6 +206,9 @@ def _run(snapshot, detector, log):
     env = dict(
         os.environ, PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"
     )
+    # Detector ids name default stress seeds; a caller seed range must not hide them.
+    env.pop("GDTENSOR_STRESS_BASE", None)
+    env.pop("GDTENSOR_STRESS_SEEDS", None)
     with log.open("wb") as output:
         process = subprocess.Popen(
             [sys.executable, "-m", "pytest", "-xq", "-p", "no:cacheprovider", detector],

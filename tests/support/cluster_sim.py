@@ -105,6 +105,8 @@ class NodeCache(ga.DTensorDataAccessor):
         self.lock = threading.Lock()
         self.wrong_node = 0
         self.writes = []
+        self.fills = []  # (actor node, target node, tid, offset, size)
+        self.reads = []  # (actor rank, target node)
 
     def _buf(self, node: int, tid: str):
         key = (node, tid)
@@ -132,6 +134,7 @@ class NodeCache(ga.DTensorDataAccessor):
         self.cluster.transfer(actor, target, size)
         with self.lock:
             self.writes.append((actor, target, off, size))
+            self.fills.append((actor, target, tid, off, size))
             data, valid = self._buf(target, tid)
             data[off : off + size] = tmp
             valid[off : off + size] = True
@@ -148,6 +151,7 @@ class NodeCache(ga.DTensorDataAccessor):
             data, valid = self._buf(target, tid)
             missing = not valid[off : off + size].all()
             self.wrong_node += int(missing)
+            self.reads.append((self.cluster.rank, target))
             view = data[off : off + size].copy()
         if missing:
             return gb.Err(

@@ -80,6 +80,19 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 
 服务 rank 在自己分片完成后继续填充服务段。完成段按 generation 留痕，避免段释放后被晚到 helper 重填。缺席本地 filler 有界报错，不退回远端填充。新增小预算、串行、缺席 filler、非法 DN 拒绝与多进程共享内存测试。内存/NIC 模拟不证明多物理机器部署。
 
+`io/test_random_cache_stress.py` 按 seed 随机生成合法部署和缓存策略。随机轴包括：每节点 rank 数、节点数、一层或两层缓存、各层 DN 节点集合、steps、并发宽度、张量数与大小、分片或复制、file 或 thread 协调器、线程启动顺序与延迟、NIC 带宽、重复加载次数。payload 为随机字节，存储为单个拼接文件。独立 oracle 不调用规划器，按以下各项检查：
+
+- 每 rank 输出逐字节相等，CRC 一致，保护字节不变；
+- 缓存读取命中目标节点；末层 drain 读取的节点等于 oracle 推导的服务节点；
+- 缓存写入的执行节点等于 DN 节点；
+- 每个被需求的缓存字节在每代只填充一次；
+- 存储只由第一层 DN 节点读取，每字节每代一次；
+- 统计入站、出站流量等于模拟 NIC 字节加存储读取字节。
+
+每代开始前清空缓存字节和全部计数器，每代单独检查，因此跨代 2+0 的填充分布会失败。
+
+默认 128 个 seed。`GDTENSOR_STRESS_SEEDS` 设置 seed 数，`GDTENSOR_STRESS_BASE` 设置起始 seed。五个变异接入 `mutation_check.py`，分别破坏填充节点、helper 节点、存储偏移、代际重填和统计流量。
+
 ## 本轮实际结果
 
 受测树：`42d03d8`（分支 `fix/cache-propagation-plan`，digest 干净归档树）。
