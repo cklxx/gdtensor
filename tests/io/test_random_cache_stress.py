@@ -13,6 +13,8 @@ of every cache node. It does not call the gdtensor planner. The test checks:
 * every cache read finds valid bytes on the addressed node;
 * every cache write is a local fill: filler node equals the DN node;
 * every drain reads the serve node the oracle derives for the rank;
+* every rank drains exactly its wanted bytes from the last cache layer, so
+  each output byte passed through the cache;
 * every demanded cache byte is filled once per generation, no more, no less;
 * storage bytes are read once per first-layer node, by a rank on that node;
 * the stat inbound and outbound traffic equal the simulated NIC bytes.
@@ -22,8 +24,11 @@ on its own, so a 2+0 fill split across generations fails.
 
 GDTENSOR_STRESS_SEEDS sets the seed count; GDTENSOR_STRESS_BASE sets the
 first seed. A failure message prints the seed and the drawn case.
+GDTENSOR_STRESS_REPORT names a file; each passed generation appends one JSON
+line with the observed values next to the oracle values.
 """
 
+import json
 import os
 import threading
 import time
@@ -363,8 +368,11 @@ def _check_outputs(case, built) -> None:
 
 def _check_cache_fills(case, built, demand) -> None:
     serve = built["targets"][-1]
-    drains = [(r, t) for r, t in built["caches"][-1].reads if t != serve(r)]
+    drains = [(r, t) for r, t, _s in built["caches"][-1].reads if t != serve(r)]
     assert not drains, ("drain off serve node", drains[:4], case)
+    got = _drain_bytes(built)
+    want = [_bytes(_rank_mask(case, built, r)) for r in range(built["world"])]
+    assert got == want, ("drain bytes", got, want, case)
     for layer, cache in enumerate(built["caches"]):
         assert cache.wrong_node == 0, (layer, case)
         remote = [f for f in cache.fills if f[0] != f[1]]
@@ -402,6 +410,45 @@ def _check_traffic(case, built) -> None:
     assert stat_in == observed_in, (stat_in, observed_in, case)
 
 
+def _bytes(masks: dict) -> int:
+    return int(sum(mask.sum() for mask in masks.values()))
+
+
+def _drain_bytes(built) -> list:
+    out = [0] * built["world"]
+    for rank, _target, size in built["caches"][-1].reads:
+        out[rank] += size
+    return out
+
+
+def _report(case, built, demand, gen) -> None:
+    """Append one evidence line: observed values next to oracle values."""
+    path = os.environ.get("GDTENSOR_STRESS_REPORT")
+    if not path:
+        return
+    caches, cluster = built["caches"], built["cluster"]
+    rx, tx = cluster.nic_bytes()
+    row = dict(
+        seed=case["seed"],
+        gen=gen,
+        ranks=built["world"],
+        layers=len(case["layers"]),
+        coordinator=case["coordinator"],
+        fill_bytes=[sum(f[4] for f in c.fills) for c in caches],
+        oracle_fill_bytes=[sum(map(_bytes, d.values())) for d in demand],
+        drain_bytes=sum(_drain_bytes(built)),
+        output_bytes=sum(
+            _bytes(_rank_mask(case, built, r)) for r in range(built["world"])
+        ),
+        storage_bytes=sum(r[3] for r in built["src"].reads),
+        oracle_storage_bytes=sum(map(_bytes, demand[0].values())),
+        stat_out=list(gio.chain_stat_outbound_traffic(built["chain"])),
+        nic_out=tx,
+    )
+    with open(path, "a") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
 def _reset_generation(built) -> None:
     """Clear outputs, cache bytes and counters, so each generation must refill."""
     for tensors in built["dst"].buffers.values():
@@ -428,13 +475,14 @@ def test_random_cache_strategy_is_correct(seed, tmp_path, monkeypatch):
     built = _build(case)
     assert type(built["chain"].check_constraints()) is gb.Ok, case
     demand = _demand(case, built)
-    for _ in range(case["repeat"]):
+    for gen in range(case["repeat"]):
         _reset_generation(built)
         _run(case, built)
         _check_outputs(case, built)
         _check_cache_fills(case, built, demand)
         _check_storage(case, built, demand)
         _check_traffic(case, built)
+        _report(case, built, demand, gen)
 
 
 def test_draw_covers_every_strategy_axis():

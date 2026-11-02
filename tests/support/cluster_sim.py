@@ -106,7 +106,7 @@ class NodeCache(ga.DTensorDataAccessor):
         self.wrong_node = 0
         self.writes = []
         self.fills = []  # (actor node, target node, tid, offset, size)
-        self.reads = []  # (actor rank, target node)
+        self.reads = []  # (actor rank, target node, size)
 
     def _buf(self, node: int, tid: str):
         key = (node, tid)
@@ -151,7 +151,7 @@ class NodeCache(ga.DTensorDataAccessor):
             data, valid = self._buf(target, tid)
             missing = not valid[off : off + size].all()
             self.wrong_node += int(missing)
-            self.reads.append((self.cluster.rank, target))
+            self.reads.append((self.cluster.rank, target, size))
             view = data[off : off + size].copy()
         if missing:
             return gb.Err(
