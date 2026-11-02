@@ -485,6 +485,87 @@ def test_random_cache_strategy_is_correct(seed, tmp_path, monkeypatch):
         _report(case, built, demand, gen)
 
 
+@pytest.fixture(
+    params=[
+        pytest.param(("file", [[0, 2]]), id="file-one-layer"),
+        pytest.param(("thread", [[0, 2]]), id="thread-one-layer"),
+        pytest.param(("file", [[0], [0, 2]]), id="file-two-layers"),
+        pytest.param(("thread", [[0], [0, 2]]), id="thread-two-layers"),
+    ]
+)
+def changed_payload_generation(request, tmp_path, monkeypatch):
+    coordinator, layers = request.param
+    case = dict(
+        seed=0,
+        k=2,
+        nodes=3,
+        layers=layers,
+        steps=[3] * len(layers),
+        width=[2] * len(layers),
+        sizes=[17, 9],
+        replicate=[False, True],
+        coordinator=coordinator,
+        bandwidth=0.0,
+        repeat=2,
+    )
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "10")
+    monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", coordinator)
+    built = _build(case)
+    assert type(built["chain"].check_constraints()) is gb.Ok, case
+    demand = _demand(case, built)
+    _reset_generation(built)
+    _run(case, built)
+    _check_outputs(case, built)
+    _check_cache_fills(case, built, demand)
+    _check_storage(case, built, demand)
+    _check_traffic(case, built)
+
+    # Change every byte in storage and in the separate oracle, on the same chain.
+    old_data = built["data"]
+    built["src"].payload ^= np.uint8(0xFF)
+    built["data"] = {tid: value ^ np.uint8(0xFF) for tid, value in old_data.items()}
+    _reset_generation(built)
+    return case, built, demand, old_data
+
+
+def test_second_generation_reads_changed_payload(changed_payload_generation):
+    case, built, demand, _old_data = changed_payload_generation
+    _run(case, built)
+    _check_outputs(case, built)
+    _check_cache_fills(case, built, demand)
+    _check_storage(case, built, demand)
+    _check_traffic(case, built)
+
+
+def test_second_generation_rejects_stale_last_layer(
+    changed_payload_generation, monkeypatch
+):
+    case, built, demand, old_data = changed_payload_generation
+    cache = built["caches"][-1]
+    write = cache.write_from_buffer
+
+    def stale_write(global_range, write_from_buffer):
+        result = write(global_range, write_from_buffer)
+        if type(result) is not gb.Ok:
+            return result
+        _actor, target = cache._ends(global_range)
+        tid = global_range.global_tensor_id
+        off, size = global_range.global_tensor_offset, global_range.size
+        with cache.lock:
+            data, _valid = cache._buf(target, tid)
+            data[off : off + size] = old_data[tid][off : off + size]
+        return result
+
+    monkeypatch.setattr(cache, "write_from_buffer", stale_write)
+    _run(case, built)
+    _check_cache_fills(case, built, demand)
+    _check_storage(case, built, demand)
+    _check_traffic(case, built)
+    with pytest.raises(AssertionError):
+        _check_outputs(case, built)
+
+
 def test_draw_covers_every_strategy_axis():
     cases = [_draw(s) for s in range(SEED_BASE, SEED_BASE + SEEDS)]
     assert {len(c["layers"]) for c in cases} == {1, 2}

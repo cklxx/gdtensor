@@ -93,6 +93,16 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 
 默认 128 个 seed。`GDTENSOR_STRESS_SEEDS` 设置 seed 数，`GDTENSOR_STRESS_BASE` 设置起始 seed。五个变异接入 `mutation_check.py`，分别破坏填充节点、helper 节点、存储偏移、代际重填和统计流量。
 
+## 进程退出与重启
+
+文件协调器为每次缓存加载持有一个生命周期文件锁。进程退出时内核释放锁；其他调用检测到未完成调用的锁已释放后，返回 `cache_peer_down`。健康的慢 IO 没有租约到期时间。
+
+失败状态保留在同一 chain 的协调状态文件中。同目录重试明确报错，不自动复用可能不完整的缓存。所有旧调用停止后，使用新 `GDTENSOR_CACHE_DIR` 重新加载；同进程切换目录也会创建新协调表。不要在旧调用运行时删除或替换锁文件。
+
+状态协议升级为 v3。旧协议或损坏状态返回 `cache_state`；升级时全部参与进程必须使用同一版本和新协调目录，不支持混合版本运行。跨主机还要求共享文件系统提供可靠的跨客户端 `flock` 和原子替换。主机断联、文件系统阻塞及活进程永久阻塞不在本次进程退出检测的保证范围内。
+
+`io/test_colocated_cluster_sim.py` 检查源读取中途杀进程、健康慢读取、同目录失败和新目录恢复。`io/test_cache_owner_lifecycle.py` 检查 fork 后锁隔离、状态提交失败和同进程切换目录。`io/test_random_cache_stress.py` 增加第二代更换源数据与末层旧数据负对照；`io/test_cache_reuse_layout.py` 检查两层缓存实际删除和复用文件、慢消费者、二维 F32 非均匀列分片。后两项分别覆盖 file/thread 协调器，不等同于跨机器验证。
+
 ## 本轮实际结果
 
 受测树：`42d03d8`（分支 `fix/cache-propagation-plan`，digest 干净归档树）。

@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "416609763880c3e2415bf9b9bfb334233150d001000ae33e1222c88d23726cb4"
+FROZEN_API_SHA256 = "b1e1a919f6b4843c74609e3d5e243402208d2e57c269b1ef698bd63f36fede3a"
 
 
 def _production_manifest(root=ROOT):
@@ -193,6 +193,20 @@ MUTATIONS = [
         "        _drain_traffic(rank // plan.k, pieces, inbound, outbound)\n",
         "        pass\n",
         "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        'if not slot["owed"]:',
+        "if True:",
+        "tests/io/test_cache_reuse_layout.py::test_two_layer_physical_reuse_waits_for_slow_consumer",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "rng = RangeFromComputeView(key[0], off, size)",
+        "rng = RangeFromComputeView(key[0], off // 4, size)",
+        "tests/io/test_cache_reuse_layout.py::test_two_layer_f32_uneven_column_shards",
         "notorch",
     ),
 ]

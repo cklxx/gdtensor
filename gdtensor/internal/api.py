@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 import ctypes
 import hashlib
@@ -33,6 +34,23 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 
 _LOG = logging.getLogger(__name__)
+_PROCESS_FILES: weakref.WeakSet = weakref.WeakSet()
+_PROCESS_FILES_LOCK = threading.Lock()
+
+
+def _open_process_file(path, mode):
+    with _PROCESS_FILES_LOCK:
+        file = open(path, mode)
+        _PROCESS_FILES.add(file)
+        return file
+
+
+def _new_owner(directory):
+    with _PROCESS_FILES_LOCK:
+        fd, path = tempfile.mkstemp(prefix="gdtensor-run-", dir=directory)
+        owner = os.fdopen(fd, "a+b")
+        _PROCESS_FILES.add(owner)
+        return owner, path
 
 
 def _read(src_acc, src) -> bytes:
@@ -275,6 +293,18 @@ class _SlotTable:
         """No-op: this table shares one in-memory state, so there is no
         snapshot merge to protect."""
 
+    def participate(self, rank: int):
+        return nullcontext()
+
+    def check_alive(self) -> None:
+        """Thread callers cannot outlive a killed process."""
+
+    def activity(self, owner, delta: int) -> None:
+        self.inflight += delta
+
+    def finish(self, owner) -> None:
+        """No process registration in the thread coordinator."""
+
 
 # ---------------------------------------------------------------- process-safe table
 #
@@ -287,7 +317,7 @@ class _SlotTable:
 
 _COORD_ENV = "GDTENSOR_CACHE_COORDINATOR"
 _COORD_DIR_ENV = "GDTENSOR_CACHE_DIR"
-_MAGIC = "gdtensor-coord-v2"
+_MAGIC = "gdtensor-coord-v3"
 
 
 def _DBG(*parts) -> None:
@@ -338,6 +368,7 @@ class _FileCond:
         return action == "ready"
 
     def _wait_ready(self, predicate, deadline) -> str:
+        self.t.check_alive()
         if predicate():
             return "ready"
         if deadline is not None and time.monotonic() >= deadline:
@@ -355,10 +386,10 @@ class _FileCond:
 class _FileSlotTable:
     """Process-safe coordinator for one concrete chain (content fingerprint).
 
-    The state is {magic, version, inflight, nodes: {(layer, node): _NodeState}}.
-    Every mutation runs under a process RLock and an exclusive flock on the
-    state file, then bumps the version and writes the file atomically
-    (temp file + os.replace). Waits poll the file version.
+    State records node residency, active owners, in-flight IO and terminal error.
+    Mutations hold a thread RLock and a file flock, then atomically replace state.
+    Per-call flocks remain held outside these short transactions. An abandoned
+    owner fails this chain; restarting safely requires a new coordinator directory.
     """
 
     _POLL = 0.005
@@ -373,9 +404,10 @@ class _FileSlotTable:
             f"gdtensor-coord-{key}",
         )
         self._path = base + ".state"
-        self._fd = open(base + ".lock", "a+b")
+        self._pid = os.getpid()
+        self._fd = _open_process_file(base + ".lock", "a+b")
         self._thread_lock = threading.RLock()
-        self._held = False
+        self._held: int | None = None
         self._dirty = False
         self.version = 0
         self.inflight = 0
@@ -400,27 +432,105 @@ class _FileSlotTable:
         avoiding a stale snapshot from rolling back a peer's update."""
         self._touched.add(key)
 
+    @contextmanager
+    def participate(self, rank: int):
+        assert fcntl is not None
+        self._check_process()
+        # Kernel-held locks have no expiry: slow living callers remain valid.
+        owner, path = _new_owner(os.path.dirname(self._path))
+        try:
+            fcntl.flock(owner, fcntl.LOCK_EX)
+            token = os.path.basename(path)
+            self._register(token, rank)
+            yield token
+        finally:
+            self._close_owner(owner, path)
+
+    def _close_owner(self, owner, path):
+        owner.close()
+        if self._pid == os.getpid():
+            os.unlink(path)
+
+    def _register(self, path, rank):
+        with self.cond:
+            self.check_alive()
+            self.runs[path] = {"rank": rank, "inflight": 0}
+            self.bump()
+
+    def activity(self, owner, delta: int) -> None:
+        self.runs[owner]["inflight"] += delta
+        self.inflight += delta
+
+    def finish(self, owner) -> None:
+        # An interrupted commit leaves its owner registered, even after exit.
+        if self.runs[owner]["inflight"] == 0:
+            self.runs.pop(owner)
+
+    def check_alive(self) -> None:
+        if self.error is not None:
+            raise check_failed(*self.error)
+        dead = next(
+            (run["rank"] for path, run in self.runs.items() if self._unlocked(path)),
+            None,
+        )
+        if dead is not None:
+            self.error = (
+                "cache_peer_down",
+                f"rank {dead} exited during cache IO; use a new coordinator directory",
+            )
+            self.bump()
+            raise check_failed(*self.error)
+
+    def _unlocked(self, path) -> bool:
+        assert fcntl is not None
+        try:
+            owner = _open_process_file(
+                os.path.join(os.path.dirname(self._path), path), "r+b"
+            )
+        except FileNotFoundError:
+            return True
+        try:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            owner.close()
+
     def _enter(self) -> None:
         _DBG("t_enter", threading.current_thread().name, "held", self._held)
+        self._check_process()
+        self._check_reentrant()
         self._thread_lock.acquire()
         try:
             fcntl.flock(self._fd, fcntl.LOCK_EX)  # type: ignore[possibly-missing-attribute]
             self._refresh()
-            self._check_reentrant()
-            self._held = True
+            self._held = threading.get_ident()
             self._dirty = False
         except BaseException:
             self._unlock()
             raise
 
+    def _check_process(self) -> None:
+        if self._pid != os.getpid():
+            raise check_failed(
+                "cache_fork", "forked during cache IO; start a new chain_load"
+            )
+
     def _check_reentrant(self) -> None:
-        if self._held:
+        if self._held == threading.get_ident():
             raise RuntimeError("_FileSlotTable.cond is not reentrant")
 
     def _unlock(self) -> None:
-        self._thread_lock.release()
+        assert fcntl is not None
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            self._thread_lock.release()
 
     def _exit(self) -> None:
+        if self._held != threading.get_ident() or self._pid != os.getpid():
+            return
         _DBG(
             "t_exit",
             threading.current_thread().name,
@@ -429,32 +539,40 @@ class _FileSlotTable:
             "d",
             self._dirty,
         )
-        if self._dirty:
-            self.version += 1
-            latest = self._read_state()
-            latest["nodes"].update({k: self.nodes[k] for k in self._touched})
-            latest["version"] = self.version
-            latest["inflight"] = self.inflight
-            self._write_state(latest)
-        self._held = False
-        fcntl.flock(self._fd, fcntl.LOCK_UN)  # type: ignore[possibly-missing-attribute]
-        self._thread_lock.release()
+        try:
+            self._commit()
+        finally:
+            self._drop()
+
+    def _commit(self) -> None:
+        if not self._dirty:
+            return
+        self.version += 1
+        latest = self._read_state()
+        latest["nodes"].update({k: self.nodes[k] for k in self._touched})
+        latest.update(
+            version=self.version,
+            inflight=self.inflight,
+            runs=self.runs,
+            error=self.error,
+        )
+        self._write_state(latest)
 
     def _drop(self) -> None:
         _DBG("t_drop", threading.current_thread().name)
-        self._held = False
-        fcntl.flock(self._fd, fcntl.LOCK_UN)  # type: ignore[possibly-missing-attribute]
-        self._thread_lock.release()
+        self._held = None
+        self._unlock()
 
     def _reacquire(self) -> None:
         _DBG("t_reacq", threading.current_thread().name)
+        self._check_process()
         self._thread_lock.acquire()
         try:
             fcntl.flock(self._fd, fcntl.LOCK_EX)  # type: ignore[possibly-missing-attribute]
             self._refresh()
-            self._held = True
+            self._held = threading.get_ident()
         except BaseException:
-            self._thread_lock.release()
+            self._unlock()
             raise
 
     def _refresh(self) -> None:
@@ -462,20 +580,30 @@ class _FileSlotTable:
         self.nodes = state["nodes"]
         self.version = state["version"]
         self.inflight = state["inflight"]
+        self.runs = state["runs"]
+        self.error = state["error"]
         self._touched = set()
 
     def _read_state(self) -> dict:
         try:
             state = self._read_raw()
-        except (FileNotFoundError, EOFError, pickle.UnpicklingError, ValueError):
-            state = None
-        if not state or state.get("magic") != _MAGIC:
+        except FileNotFoundError:
             return {
                 "magic": _MAGIC,
                 "version": 0,
                 "inflight": 0,
                 "nodes": self._initial_nodes(),
+                "runs": {},
+                "error": None,
             }
+        except (EOFError, pickle.UnpicklingError, ValueError) as exc:
+            raise check_failed(
+                "cache_state", "invalid coordinator state; use a new directory"
+            ) from exc
+        if not isinstance(state, dict) or state.get("magic") != _MAGIC:
+            raise check_failed(
+                "cache_state", "incompatible coordinator state; use a new directory"
+            )
         return state
 
     def _read_raw(self) -> dict:
@@ -519,6 +647,25 @@ _view_slots: dict = {}
 _table_lock = threading.RLock()
 
 
+def _after_fork() -> None:
+    global _table_lock
+    # Close, never unlock: fork shares the parent's open-file descriptions.
+    for file in list(_PROCESS_FILES):
+        file.close()
+    _PROCESS_FILES.clear()
+    _table_lock = threading.RLock()
+    _view_slots.clear()
+    _PROCESS_FILES_LOCK.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_PROCESS_FILES_LOCK.acquire,
+        after_in_parent=_PROCESS_FILES_LOCK.release,
+        after_in_child=_after_fork,
+    )
+
+
 def _chain_fingerprint(chain) -> str:
     """Content hash of a concrete chain: identical chains in different
     processes share one coordinator file. Views (which hold accessors) are
@@ -531,11 +678,12 @@ def _chain_fingerprint(chain) -> str:
     return hashlib.sha256(pickle.dumps(payload, protocol=5)).hexdigest()[:20]
 
 
-def _drop_table(key) -> None:
-    # Pop under the lock, drop the table outside it: dropping the table can
-    # run another view finalizer that takes the same lock.
+def _drop_table(key, expected) -> None:
+    # A finalizer for an older table must not remove its replacement.
     with _table_lock:
-        table = _view_slots.pop(key, None)
+        table = _view_slots.get(key)
+        if table is expected():
+            _view_slots.pop(key, None)
     del table
 
 
@@ -543,15 +691,17 @@ def _slots(chain):
     from .propagation import build_chain_plan, cache_layers
 
     key = _chain_fingerprint(chain)
+    directory = os.path.realpath(os.environ.get(_COORD_DIR_ENV, tempfile.gettempdir()))
+    cache_key = (os.getpid(), os.environ.get(_COORD_ENV, "file"), directory, key)
     with _table_lock:
-        table = _view_slots.get(key)
+        table = _view_slots.get(cache_key)
     if table is not None:
         return table
     table = _coordinator_factory()(build_chain_plan(chain), key)
     with _table_lock:
-        table = _view_slots.setdefault(key, table)
+        table = _view_slots.setdefault(cache_key, table)
     for view in cache_layers(chain):
-        weakref.finalize(view, _drop_table, key)
+        weakref.finalize(view, _drop_table, cache_key, weakref.ref(table))
     return table
 
 
@@ -584,13 +734,19 @@ class _RankRun:
         self.wait = _wait_seconds()
 
     def run(self) -> None:
+        with self.t.participate(self.rank) as self.owner:
+            self._run()
+
+    def _run(self) -> None:
         with self.t.cond:
+            self.t.check_alive()
             self.gens = {ln: self.t.node(*ln).join(self.rank) for ln in self.gens}
             [self.t.mark_touched(ln) for ln in self.gens]
             self.t.bump()
         try:
             self._wait_cohort()
             self._loop(list(self.plan.drains[self.rank]))
+            self._version_checked()
         finally:
             self._leave()
 
@@ -663,6 +819,7 @@ class _RankRun:
     def _leave(self) -> None:
         with self.t.cond:
             _ = [self._dec(ln) for ln in self.gens]
+            self.t.finish(self.owner)
             self.t.bump()
 
     def _dec(self, ln) -> None:
@@ -706,6 +863,7 @@ class _RankRun:
 
     def _version_checked(self) -> int:
         with self.t.cond:
+            self.t.check_alive()
             _ = [self.t.node(*ln).check(gen) for ln, gen in self.gens.items()]
             return self.t.version
 
@@ -851,7 +1009,7 @@ class _RankRun:
         with self.t.cond:
             self.t.node(layer, node).slots[seg.key]["filled"] = True
             self.t.node(layer, node).completed.add(seg.key)
-            self.t.inflight -= 1
+            self.t.activity(self.owner, -1)
             self.t.mark_touched((layer, node))
             self.t.bump()
         if layer > 0:
@@ -898,7 +1056,7 @@ class _RankRun:
         work as progress and do not time out. The delta is persisted so a peer
         in another process observes it."""
         with self.t.cond:
-            self.t.inflight += delta
+            self.t.activity(self.owner, delta)
             self.t.bump()
 
     def _fail(self, layer: int, node: int, exc: BaseException, key) -> None:
