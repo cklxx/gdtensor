@@ -17,15 +17,16 @@
 #       TLA2TOOLS_JAR="$(scripts/get_tla_tools.sh)" bash formal/tla/run_tlc.sh
 #
 # Pin provenance: official tlaplus/tlaplus GitHub release v1.8.0 asset
-#   tla2tools.jar: asset 692577622, created 2026-10-30T15:45:52Z.
-# The upstream v1.8.0 asset changed in place. This SHA matches the
-# official GitHub release asset digest, verified on 2026-11-01.
+#   tla2tools.jar: asset 702470423, created 2026-11-02T16:51:09Z.
+# The upstream v1.8.0 asset changed in place twice. The current SHA matches the
+# official GitHub release asset digest, verified on 2026-11-03: the previous
+# asset (692577622, sha 011267fca25d...) now returns 404.
 # Re-pin only after verifying the official asset and its digest.
 set -euo pipefail
 
 TLA2TOOLS_VERSION="v1.8.0"
-TLA2TOOLS_URL="https://api.github.com/repos/tlaplus/tlaplus/releases/assets/692577622"
-TLA2TOOLS_SHA256="011267fca25d0752cf18894dd585cd28b96960c112ea8a20b823ea770e7e10cd"
+TLA2TOOLS_URL="https://api.github.com/repos/tlaplus/tlaplus/releases/assets/702470423"
+TLA2TOOLS_SHA256="c57d4d7bbee3ed2c89c32cb9c60cac728f751e80e2570bc4b7368ae39291fc21"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
