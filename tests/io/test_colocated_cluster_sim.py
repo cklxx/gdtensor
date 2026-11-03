@@ -6,8 +6,8 @@ hits the node the plan says, (3) the stat traffic functions equal the bytes
 the simulated NICs move, and (4) a slow NIC does not stall the executor.
 """
 
-import faulthandler
 import multiprocessing as mp
+import os
 import threading
 import time
 from typing import cast
@@ -304,14 +304,11 @@ def test_one_process_per_rank_uses_local_dn_and_shared_cache():
     )
 
 
-def _death_worker(rank, buffers, lock, entered, release, ready, pipe, trace):
-    with open(trace, "w") as output:
-        faulthandler.dump_traceback_later(3, file=output)
-        try:
-            _death_load(rank, buffers, lock, entered, release, ready, pipe)
-        finally:
-            faulthandler.cancel_dump_traceback_later()
-            pipe.close()
+def _death_worker(rank, buffers, lock, entered, release, ready, pipe):
+    try:
+        _death_load(rank, buffers, lock, entered, release, ready, pipe)
+    finally:
+        pipe.close()
 
 
 def _death_load(rank, buffers, lock, entered, release, ready, pipe):
@@ -347,7 +344,7 @@ def _death_load(rank, buffers, lock, entered, release, ready, pipe):
     )
 
 
-def _death_pair(ctx, tmp_path):
+def _death_pair(ctx):
     buffers = (ctx.RawArray("B", 8), ctx.RawArray("B", 8))
     lock, entered, release = ctx.RLock(), ctx.Event(), ctx.Event()
     workers, receivers, senders, ready = [], [], [], []
@@ -355,9 +352,7 @@ def _death_pair(ctx, tmp_path):
         recv, send = ctx.Pipe(duplex=False)
         event = ctx.Event()
         args = (rank, buffers, lock, entered, release, event, send)
-        worker = ctx.Process(
-            target=_death_worker, args=(*args, str(tmp_path / f"rank-{rank}.trace"))
-        )
+        worker = ctx.Process(target=_death_worker, args=args)
         workers.append(worker)
         receivers.append(recv)
         senders.append(send)
@@ -365,41 +360,43 @@ def _death_pair(ctx, tmp_path):
     return workers, receivers, senders, ready, entered, release, (buffers, lock)
 
 
-def _confirm_survivor_waiting(worker, trace):
-    # Inspect the public faulthandler dump, without patching coordinator internals.
-    for _ in range(60):
-        assert worker.is_alive(), "survivor exited before fault injection"
-        text = trace.read_text() if trace.exists() else ""
-        if "in _wait_inflight" in text:
-            return
-        time.sleep(0.1)
-    raise AssertionError("survivor never entered the in-flight wait")
+def _confirm_survivor_waiting(worker, receiver, grace=1.0):
+    # The survivor reached chain_load but has produced no result, so it is
+    # blocked on the in-flight fill. A periodic faulthandler dump is not usable
+    # here: repeated dumps from the watchdog thread kill the spawned child
+    # (exitcode -SIGSEGV) on some runs.
+    end = time.monotonic() + grace
+    while time.monotonic() < end:
+        assert worker.is_alive(), (
+            f"survivor exited before fault injection, exitcode={worker.exitcode}"
+        )
+        assert not receiver.poll(0), "survivor finished before fault injection"
+        time.sleep(0.05)
 
 
-def _death_observe(workers, receivers, tmp_path, deadline):
+def _death_observe(workers, receivers, deadline):
     rows = []
     for rank, worker in enumerate(workers):
         worker.join(max(0, deadline - time.monotonic()))
         result = receivers[rank].recv() if receivers[rank].poll(0) else None
-        trace = tmp_path / f"rank-{rank}.trace"
         rows.append(
             dict(
                 rank=rank,
                 alive=worker.is_alive(),
                 exitcode=worker.exitcode,
                 result=result,
-                trace=trace.read_text()[-6000:] if trace.exists() else "",
             )
         )
     return rows
 
 
-def _death_round(tmp_path, kill, restart=False):
+def _death_round(tmp_path, kill, restart=False, wait="6"):
+    # The wait budget must outlive the blocked-survivor probe: a short budget
+    # would let the survivor return before the host confirms it is blocked.
+    os.environ["GDTENSOR_CACHE_WAIT_SECONDS"] = wait
     ctx = mp.get_context("spawn")
     # Keep parent references until spawn has unpickled every semaphore and buffer.
-    workers, receivers, senders, ready, entered, release, _shared = _death_pair(
-        ctx, tmp_path
-    )
+    workers, receivers, senders, ready, entered, release, _shared = _death_pair(ctx)
     if restart:
         release.set()
     try:
@@ -409,7 +406,7 @@ def _death_round(tmp_path, kill, restart=False):
         workers[1].start()
         assert ready[1].wait(10), "survivor never reached chain_load"
         if not restart:
-            _confirm_survivor_waiting(workers[1], tmp_path / "rank-1.trace")
+            _confirm_survivor_waiting(workers[1], receivers[1])
         deadline = time.monotonic() + 4
         if kill:
             workers[0].kill()
@@ -417,7 +414,7 @@ def _death_round(tmp_path, kill, restart=False):
             assert workers[0].exitcode == -9, workers[0].exitcode
         else:
             release.set()
-        return _death_observe(workers, receivers, tmp_path, deadline)
+        return _death_observe(workers, receivers, deadline)
     finally:
         for worker in workers:
             _finish_process(worker)
@@ -428,7 +425,6 @@ def _death_round(tmp_path, kill, restart=False):
 @pytest.mark.parametrize("kill", [False, True], ids=["release", "kill-filler"])
 def test_filler_process_exit_is_bounded(tmp_path, monkeypatch, kill):
     monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "file")
-    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "0.2")
     rows = _death_round(tmp_path, kill)
     survivor = rows[1]
     assert not survivor["alive"], ("survivor did not exit within 4s", rows)
@@ -448,14 +444,13 @@ def test_filler_process_exit_is_bounded(tmp_path, monkeypatch, kill):
 )
 def test_restart_after_filler_death_is_bounded(tmp_path, monkeypatch, reuse_state):
     monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "file")
-    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "0.2")
     _death_round(tmp_path, kill=True)
     # Both old processes are reaped before any change of coordinator directory.
     if not reuse_state:
         tmp_path = tmp_path / "fresh"
         tmp_path.mkdir()
         monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
-    rows = _death_round(tmp_path, kill=False, restart=True)
+    rows = _death_round(tmp_path, kill=False, restart=True, wait="0.2")
     assert not any(row["alive"] for row in rows), ("restart reused stuck state", rows)
     assert all(row["exitcode"] == 0 and row["result"] is not None for row in rows), rows
     assert all(not row["result"]["ok"] or row["result"]["correct"] for row in rows), (

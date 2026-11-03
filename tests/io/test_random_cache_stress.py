@@ -105,7 +105,7 @@ def _draw_common(seed: int) -> dict:
         steps=[int(rng.choice([4, 8])) for _ in layers],
         width=[int(rng.choice([1, 2, 3])) for _ in layers],
         sizes=sizes,
-        replicate=[bool(rng.random() < 0.2) for _ in sizes],
+        replicate=[rng.random() < 0.2 for _ in sizes],
         coordinator=str(rng.choice(["file", "file", "file", "thread"])),
         bandwidth=float(rng.choice([0.0, 0.0, 0.0, 65536.0])),
         repeat=2,
