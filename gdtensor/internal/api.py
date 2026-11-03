@@ -729,6 +729,8 @@ class _RankRun:
         self.caches, self.storage, self.dst = caches, storage, dst
         self.last = len(caches) - 1
         closure = execution_closure(self.plan, rank)
+        self.closure = closure
+        self._absent: set = set()
         self.services = list(self.plan.services.get(rank, ()))
         self.gens = dict.fromkeys(sorted({(lay, n) for lay, n, _k in closure}), 0)
         self.wait = _wait_seconds()
@@ -749,6 +751,52 @@ class _RankRun:
             self._version_checked()
         finally:
             self._leave()
+
+    def _adopt(self, layer: int, node: int, key) -> bool:
+        """Adopt a segment the cache view already reports as present.
+
+        Adoption asks the view for metadata only, so a cold cache costs one
+        look-up and a warm cache skips the storage read.
+        """
+        if (layer, node, key) in self._absent:
+            return False
+        if self._adopted(layer, node, key):
+            return True
+        seg = self.plan.segments[layer][node][key]
+        acc = self.caches[layer].data_accessor
+        if not acc.has_bytes(_cache_range(seg.key, node)):
+            self._absent.add((layer, node, key))
+            return False
+        return self._mark_adopted(layer, node, seg)
+
+    def _adopted(self, layer: int, node: int, key) -> bool:
+        with self.t.cond:
+            return self._slot_filled(layer, node, key)
+
+    def _slot_filled(self, layer: int, node: int, key) -> bool:
+        state = self.t.node(layer, node)
+        if key in state.completed:
+            return True
+        slot = state.slots.get(key)
+        return bool(slot["filled"]) if slot is not None else False
+
+    def _mark_adopted(self, layer: int, node: int, seg) -> bool:
+        with self.t.cond:
+            return self._seal_node(layer, node, seg)
+
+    def _seal_node(self, layer: int, node: int, seg) -> bool:
+        state = self.t.node(layer, node)
+        if seg.key in state.completed:
+            return True
+        if seg.key in state.slots:
+            return bool(state.slots[seg.key]["filled"])
+        if not state.reserve([seg]):
+            return False
+        state.slots[seg.key]["filled"] = True
+        state.completed.add(seg.key)
+        self.t.mark_touched((layer, node))
+        self.t.bump()
+        return True
 
     def _wait_cohort(self) -> None:
         """Wait for missing consumers of a node whose budget cannot hold the
@@ -837,7 +885,11 @@ class _RankRun:
 
     def _step(self, pending: list) -> bool:
         """Drain every filled piece; else fill one segment. True on progress."""
-        done = [p for p in pending if self._filled(self.last, p[0], p[1])]
+        done = [
+            p
+            for p in pending
+            if self._adopt(self.last, p[0], p[1]) or self._filled(self.last, p[0], p[1])
+        ]
         for piece in done:
             self._drain(piece)
             pending.remove(piece)
@@ -938,6 +990,8 @@ class _RankRun:
             return False
         if not self._room(layer, node, seg):
             return False
+        if self._adopt(layer, node, key):
+            return False
         if layer > 0 and not self._parents_ready(layer, node, seg):
             return False
         if not self._reserve(layer, node, [seg]):
@@ -978,6 +1032,8 @@ class _RankRun:
         pnode = self.plan.parent[layer][node]
         psegs = self.plan.segments[layer - 1][pnode]
         keys = sorted({pkey for pkey, _o, _n in seg.parents})
+        for k in keys:
+            self._adopt(layer - 1, pnode, k)
         if all(self._filled(layer - 1, pnode, k) for k in keys):
             return True
         missing = [psegs[k] for k in keys if not self._resident(layer - 1, pnode, k)]

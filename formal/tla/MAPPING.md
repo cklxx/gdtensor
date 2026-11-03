@@ -11,9 +11,9 @@ proof of the whole Python.
 
 Pinned runtime baseline:
 - `gdtensor/internal/api.py`
-  `sha256 b1e1a919f6b4843c74609e3d5e243402208d2e57c269b1ef698bd63f36fede3a`.
+  `sha256 a97ba05b92dd8122dbc9a50b85fed6076a93ccad18848b9dd6ed01a07f66532f`.
 - `gdtensor/internal/propagation.py`
-  `sha256 db555b6f0d4333c59ba00d0bcad82414ae380c88627c45c7fcec8d1d1f8ff8ad`.
+  `sha256 a97ba05b92dd8122dbc9a50b85fed6076a93ccad18848b9dd6ed01a07f66532f`.
 Current source hashes are recorded by `scripts/formal_gate.sh` in its
 generated manifest.
 
@@ -135,6 +135,7 @@ counterpart.
 |------------------------------------------------------|---------------------|
 | `_NodeState.admit` byte-budget check                 | `Admit(n)`          |
 | fill job completes (`slots[k]["filled"]=True`)       | `Fill(n,TRUE)`      |
+| `_adopt` reads bytes the cache view holds            | `Fill(n,TRUE)`      |
 | `_SlotTable._ack` rank piece                         | `RankAck(n)`        |
 | segment released after owed set empties              | `ReleaseTerminal(n)`|
 | child ack of a parent edge                           | `AckEdge(n)`        |

@@ -163,6 +163,17 @@ class NodeCache(ga.DTensorDataAccessor):
         self.cluster.transfer(target, actor, size)
         return read_to_buffer(view.ctypes.data, size)
 
+    def has_bytes(self, global_range) -> bool:
+        actor, target = self._ends(global_range)
+        tid, off, size = (
+            global_range.global_tensor_id,
+            _offset(global_range),
+            global_range.size,
+        )
+        with self.lock:
+            _data, valid = self._buf(target, tid)
+            return bool(valid[off : off + size].all())
+
 
 class StorageMem(ga.DTensorDataAccessor):
     """Remote storage: every read lands on the calling rank's node."""
