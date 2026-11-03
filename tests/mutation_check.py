@@ -185,7 +185,7 @@ MUTATIONS = [
         "gdtensor/internal/api.py",
         "if any(s.key in self.slots or s.key in self.completed for s in segs):",
         "if any(s.key in self.slots for s in segs):",
-        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[76]",
+        "tests/io/test_random_cache_stress.py",
         "notorch",
     ),
     (

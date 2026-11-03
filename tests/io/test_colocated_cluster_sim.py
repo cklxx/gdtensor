@@ -10,7 +10,7 @@ import multiprocessing as mp
 import os
 import threading
 import time
-from typing import cast
+from typing import NamedTuple, cast
 
 import numpy as np
 import pytest
@@ -374,19 +374,19 @@ def _confirm_survivor_waiting(worker, receiver, grace=1.0):
         time.sleep(0.05)
 
 
-def _death_observe(workers, receivers, deadline):
+class _DeathRow(NamedTuple):
+    rank: int
+    alive: bool
+    exitcode: int | None
+    result: dict | None
+
+
+def _death_observe(workers, receivers, deadline) -> list[_DeathRow]:
     rows = []
     for rank, worker in enumerate(workers):
         worker.join(max(0, deadline - time.monotonic()))
         result = receivers[rank].recv() if receivers[rank].poll(0) else None
-        rows.append(
-            dict(
-                rank=rank,
-                alive=worker.is_alive(),
-                exitcode=worker.exitcode,
-                result=result,
-            )
-        )
+        rows.append(_DeathRow(rank, worker.is_alive(), worker.exitcode, result))
     return rows
 
 
@@ -427,14 +427,14 @@ def test_filler_process_exit_is_bounded(tmp_path, monkeypatch, kill):
     monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "file")
     rows = _death_round(tmp_path, kill)
     survivor = rows[1]
-    assert not survivor["alive"], ("survivor did not exit within 4s", rows)
-    assert survivor["exitcode"] == 0 and survivor["result"] is not None, rows
+    assert not survivor.alive, ("survivor did not exit within 4s", rows)
+    assert survivor.exitcode == 0 and survivor.result is not None, rows
     if kill:
-        assert not survivor["result"]["ok"], rows
-        assert survivor["result"]["check_name"] == "cache_peer_down", rows
+        assert not survivor.result["ok"], rows
+        assert survivor.result["check_name"] == "cache_peer_down", rows
     else:
-        assert all(not row["alive"] and row["exitcode"] == 0 for row in rows), rows
-        assert all(row["result"]["ok"] and row["result"]["correct"] for row in rows), (
+        assert all(not row.alive and row.exitcode == 0 for row in rows), rows
+        assert all(row.result is not None and row.result["correct"] for row in rows), (
             rows
         )
 
@@ -451,16 +451,11 @@ def test_restart_after_filler_death_is_bounded(tmp_path, monkeypatch, reuse_stat
         tmp_path.mkdir()
         monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
     rows = _death_round(tmp_path, kill=False, restart=True, wait="0.2")
-    assert not any(row["alive"] for row in rows), ("restart reused stuck state", rows)
-    assert all(row["exitcode"] == 0 and row["result"] is not None for row in rows), rows
-    assert all(not row["result"]["ok"] or row["result"]["correct"] for row in rows), (
-        rows
-    )
+    assert not any(row.alive for row in rows), ("restart reused stuck state", rows)
+    assert all(row.exitcode == 0 and row.result is not None for row in rows), rows
+    succ = [row.result for row in rows if row.result is not None]
+    assert all(not item["ok"] or item["correct"] for item in succ), rows
     if not reuse_state:
-        assert all(row["result"]["ok"] and row["result"]["correct"] for row in rows), (
-            rows
-        )
+        assert all(item["ok"] and item["correct"] for item in succ), rows
     else:
-        assert all(row["result"]["check_name"] == "cache_peer_down" for row in rows), (
-            rows
-        )
+        assert all(item["check_name"] == "cache_peer_down" for item in succ), rows
