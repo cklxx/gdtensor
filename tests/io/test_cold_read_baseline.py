@@ -58,7 +58,7 @@ def _draw(seed: int) -> dict:
         nodes=nodes,
         k=k,
         sizes=sizes,
-        replicate=[bool(rng.random() < 0.2) for _ in sizes],
+        replicate=[rng.random() < 0.2 for _ in sizes],
         rounds=int(rng.integers(2, 5)),
     )
 
