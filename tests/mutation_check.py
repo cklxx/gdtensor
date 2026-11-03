@@ -216,6 +216,12 @@ def _limit_output():
     resource.setrlimit(resource.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024))
 
 
+def _budget():
+    """Per-detector wall-clock limit. The stress file is the slowest detector,
+    so leave head-room over its plain run time; a hang still trips this."""
+    return int(os.environ.get("GDTENSOR_MUTATION_TIMEOUT", "120"))
+
+
 def _run(snapshot, detector, log):
     env = dict(
         os.environ, PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"
@@ -234,7 +240,7 @@ def _run(snapshot, detector, log):
             preexec_fn=_limit_output,
         )
         try:
-            return process.wait(timeout=60)
+            return process.wait(timeout=_budget())
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
