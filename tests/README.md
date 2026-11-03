@@ -93,6 +93,8 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 
 默认 128 个 seed。`GDTENSOR_STRESS_SEEDS` 设置 seed 数，`GDTENSOR_STRESS_BASE` 设置起始 seed。五个变异接入 `mutation_check.py`，分别破坏填充节点、helper 节点、存储偏移、代际重填和统计流量。
 
+常见形态采样 `_draw_common` 覆盖均匀采样到不了的规模：2 或 4 个节点、每节点 4 或 8 个 rank（world 最多 32）、张量 256–1024 B、steps 4 或 8、并发达 3、两层缓存、file 协调器为主。它用的检查与均匀采样完全相同。默认 8 个 seed（`GDTENSOR_STRESS_COMMON_SEEDS`），单个 seed 约 5 秒，所以默认不放大批量。实测 64 个 seed 全部通过，用时 312 秒；64 个里 32 个同时命中"两层 + DN 节点少于总节点"。
+
 ## 进程退出与重启
 
 文件协调器为每次缓存加载持有一个生命周期文件锁。进程退出时内核释放锁；其他调用检测到未完成调用的锁已释放后，返回 `cache_peer_down`。健康的慢 IO 没有租约到期时间。

@@ -22,6 +22,11 @@ of every cache node. It does not call the gdtensor planner. The test checks:
 Each generation starts from empty cache bytes and zero counters and is checked
 on its own, so a 2+0 fill split across generations fails.
 
+A second sampler keeps the common shape of a real hybrid deployment: 2 or 4
+nodes, 4 or 8 ranks per node, 2 or 4 KiB-class tensors, 4 or 8 steps, one or
+two layers, file coordinator. It guards the sizes the uniform sampler never
+reaches. GDTENSOR_STRESS_COMMON_SEEDS sets its seed count (default 8).
+
 GDTENSOR_STRESS_SEEDS sets the seed count; GDTENSOR_STRESS_BASE sets the
 first seed. A failure message prints the seed and the drawn case.
 GDTENSOR_STRESS_REPORT names a file; each passed generation appends one JSON
@@ -45,6 +50,7 @@ from tests.support.crc import crc_of
 
 SEEDS = int(os.environ.get("GDTENSOR_STRESS_SEEDS", "128"))
 SEED_BASE = int(os.environ.get("GDTENSOR_STRESS_BASE", "0"))
+COMMON_SEEDS = int(os.environ.get("GDTENSOR_STRESS_COMMON_SEEDS", "8"))
 GUARD = 0xA5
 
 
@@ -75,6 +81,34 @@ def _draw(seed: int) -> dict:
         coordinator=str(rng.choice(["file", "thread"])),
         bandwidth=float(rng.choice([0.0, 0.0, 0.0, 16384.0])),
         repeat=int(rng.integers(1, 3)),
+    )
+
+
+def _draw_common(seed: int) -> dict:
+    """Draw a common deployment shape, above the uniform sampler's ceiling.
+
+    Ranks and DNs share a node, so k stays above one. Tensors reach 256 to
+    1024 bytes and steps reach 8, so one cache layer costs real bytes and
+    the segment count passes the 32-byte, 8-step limit of `_draw`.
+    """
+    rng = np.random.default_rng(seed + 100_000)
+    nodes = int(rng.choice([2, 4]))
+    big = _subset(rng, range(nodes))
+    layers = [big] if rng.random() < 0.15 else [_subset(rng, big), big]
+    count = int(rng.integers(2, 5))
+    sizes = [int(rng.choice([256, 512, 1024])) for _ in range(count)]
+    return dict(
+        seed=seed,
+        k=int(rng.choice([4, 8])),
+        nodes=nodes,
+        layers=layers,
+        steps=[int(rng.choice([4, 8])) for _ in layers],
+        width=[int(rng.choice([1, 2, 3])) for _ in layers],
+        sizes=sizes,
+        replicate=[bool(rng.random() < 0.2) for _ in sizes],
+        coordinator=str(rng.choice(["file", "file", "file", "thread"])),
+        bandwidth=float(rng.choice([0.0, 0.0, 0.0, 65536.0])),
+        repeat=2,
     )
 
 
@@ -468,7 +502,15 @@ def _reset_generation(built) -> None:
 
 @pytest.mark.parametrize("seed", range(SEED_BASE, SEED_BASE + SEEDS))
 def test_random_cache_strategy_is_correct(seed, tmp_path, monkeypatch):
-    case = _draw(seed)
+    _verify_case(_draw(seed), tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("seed", range(COMMON_SEEDS))
+def test_common_shape_stays_correct(seed, tmp_path, monkeypatch):
+    _verify_case(_draw_common(seed), tmp_path, monkeypatch)
+
+
+def _verify_case(case, tmp_path, monkeypatch):
     monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
     monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "10")
     monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", case["coordinator"])
