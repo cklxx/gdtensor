@@ -23,9 +23,21 @@ class DTensorDataAccessor(_abc.ABC, _Generic[_RangeT]):
         """Whether every byte of the range is present, without reading it.
 
         Caches that track validity answer from metadata; the default answer
-        is no, so reuse stays off for accessors that cannot speak.
+        is no, so reuse stays off for accessors that cannot speak. Cache ranges
+        carry an internal source_identity. An implementation that returns True
+        must bind both published bytes and queries to that identity. Unknown
+        identities do not permit reuse across calls. Reading published bytes
+        must reject detected corruption before invoking the consumer callback.
         """
         return False
+
+    def cache_identity(self) -> object | None:
+        """Stable source identity for cache reuse, or None if unavailable.
+
+        File backends use resolved paths and file metadata. This is not a
+        caller-supplied version number. A changed identity selects new bytes.
+        """
+        return None
 
     @_abc.abstractmethod
     def write_from_buffer(

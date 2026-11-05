@@ -687,19 +687,25 @@ def _drop_table(key, expected) -> None:
     del table
 
 
-def _slots(chain):
+def _slots(chain, source_identity=None):
     from .propagation import build_chain_plan, cache_layers
 
+    identity = (
+        source_identity
+        if source_identity is not None
+        else chain.src.data_accessor.cache_identity()
+    )
     key = _chain_fingerprint(chain)
+    if identity is not None:
+        key = hashlib.sha256(pickle.dumps((key, identity), protocol=5)).hexdigest()[:20]
     directory = os.path.realpath(os.environ.get(_COORD_DIR_ENV, tempfile.gettempdir()))
     cache_key = (os.getpid(), os.environ.get(_COORD_ENV, "file"), directory, key)
     with _table_lock:
         table = _view_slots.get(cache_key)
-    if table is not None:
-        return table
-    table = _coordinator_factory()(build_chain_plan(chain), key)
-    with _table_lock:
-        table = _view_slots.setdefault(cache_key, table)
+        if table is not None:
+            return table
+        table = _coordinator_factory()(build_chain_plan(chain), key)
+        _view_slots[cache_key] = table
     for view in cache_layers(chain):
         weakref.finalize(view, _drop_table, cache_key, weakref.ref(table))
     return table
@@ -727,6 +733,7 @@ class _RankRun:
 
         self.t, self.plan, self.rank = table, table.plan, rank
         self.caches, self.storage, self.dst = caches, storage, dst
+        self.source_identity = storage.data_accessor.cache_identity()
         self.last = len(caches) - 1
         closure = execution_closure(self.plan, rank)
         self.closure = closure
@@ -749,8 +756,15 @@ class _RankRun:
             self._wait_cohort()
             self._loop(list(self.plan.drains[self.rank]))
             self._version_checked()
+            self._check_source()
         finally:
             self._leave()
+
+    def _check_source(self):
+        if self.source_identity != self.storage.data_accessor.cache_identity():
+            raise check_failed(
+                "cache_source_changed", "source file changed during load"
+            )
 
     def _adopt(self, layer: int, node: int, key) -> bool:
         """Adopt a segment the cache view already reports as present.
@@ -762,12 +776,21 @@ class _RankRun:
             return False
         if self._adopted(layer, node, key):
             return True
+        if self.source_identity is None:
+            return False
         seg = self.plan.segments[layer][node][key]
         acc = self.caches[layer].data_accessor
-        if not acc.has_bytes(_cache_range(seg.key, node)):
+        if self.source_identity != self.storage.data_accessor.cache_identity():
+            raise check_failed(
+                "cache_source_changed", "source file changed during load"
+            )
+        if not acc.has_bytes(self._range(seg.key, node)):
             self._absent.add((layer, node, key))
             return False
         return self._mark_adopted(layer, node, seg)
+
+    def _range(self, key, node):
+        return _CacheRange(key[0], key[1], key[2], node, self.source_identity)
 
     def _adopted(self, layer: int, node: int, key) -> bool:
         with self.t.cond:
@@ -1057,7 +1080,7 @@ class _RankRun:
         self._inflight(1)
         try:
             data = self._source_bytes(layer, seg)
-            _write(self.caches[layer].data_accessor, _cache_range(seg.key, node), data)
+            _write(self.caches[layer].data_accessor, self._range(seg.key, node), data)
         except BaseException as exc:
             self._inflight(-1)
             self._fail(layer, node, exc, seg.key)
@@ -1085,7 +1108,7 @@ class _RankRun:
         return b"".join(
             _read(
                 acc,
-                _cache_range((seg.tid, off, size), self.plan.parent[layer][seg.node]),
+                self._range((seg.tid, off, size), self.plan.parent[layer][seg.node]),
             )
             for _k, off, size in seg.parents
         )
@@ -1097,7 +1120,7 @@ class _RankRun:
         try:
             data = _read(
                 self.caches[self.last].data_accessor,
-                _cache_range((key[0], off, size), node),
+                self._range((key[0], off, size), node),
             )
             _write(self.dst.data_accessor, rng, data)
         except BaseException as exc:
@@ -1135,6 +1158,7 @@ class _CacheRange(RangeFromComputeView):
     """Internal cache address; public byte-range fields remain unchanged."""
 
     cache_node: int = 0
+    source_identity: Any = None
 
 
 def _cache_range(key, node: int) -> RangeFromComputeView:
@@ -1148,7 +1172,8 @@ def _crange(key) -> RangeFromComputeView:
 def _run_cached(rank: int, chain, storage_session_view) -> None:
     from .propagation import cache_layers
 
-    table = _slots(chain)
+    identity = storage_session_view.data_accessor.cache_identity()
+    table = _slots(chain, identity)
     if rank not in table.plan.ranks:
         raise invalid("rank", f"rank {rank} not in read-chain ranks {table.plan.ranks}")
     _RankRun(table, rank, cache_layers(chain), storage_session_view, chain.dst).run()
@@ -1172,10 +1197,16 @@ def _run_one_concrete(rank: int, chain) -> None:
     assert session is not None
     try:
         view = _session_view(storage, session)
+        identity_of = getattr(view.data_accessor, "cache_identity", lambda: None)
+        identity = identity_of()
         if plan is not None:
             _copy(plan, view, chain.dst)
         else:
             _run_cached(rank, chain, view)
+        if identity != identity_of():
+            raise check_failed(
+                "cache_source_changed", "source file changed during load"
+            )
     except BaseException:
         _cleanup(session, "finish")
         raise

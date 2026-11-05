@@ -14,6 +14,10 @@ load into a compute view, then save from it (design 9).
 
 from __future__ import annotations
 
+import os
+import pickle
+import threading
+import weakref
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -35,6 +39,7 @@ from .dtensor import (
     participants_of,
 )
 from .layout import (
+    PayloadIndex,
     PhysicalLayoutTable,
     TensorComponentPos,
     build_payload_index,
@@ -58,18 +63,63 @@ def is_storage(r) -> bool:
 # ------------------------------------------------------------------ helpers
 
 
+_INDEX_CACHE: Dict[int, tuple] = {}
+_INDEX_LOCK = threading.RLock()
+
+
+def payload_index_of(view) -> PayloadIndex:
+    """Reuse the index only while the complete table and layout are unchanged.
+
+    Public builders permit in-place changes. Object identity alone cannot
+    detect them. Serialize metadata, not payload, and build once under a lock.
+    """
+    key = id(view)
+    with _INDEX_LOCK:
+        signature = pickle.dumps(
+            (view.d_tensor_table, view.physical_layout), protocol=5
+        )
+        hit = _INDEX_CACHE.get(key)
+        if hit is not None and hit[0]() is view and hit[1] == signature:
+            return hit[2]
+        index = build_payload_index(view.d_tensor_table, view.physical_layout)
+        ref = weakref.ref(view, lambda _ref: _drop_payload_index(key, _ref))
+        _INDEX_CACHE[key] = (ref, signature, index)
+        return index
+
+
+def _drop_payload_index(key, reference):
+    with _INDEX_LOCK:
+        if _INDEX_CACHE.get(key, (None,))[0] is reference:
+            _INDEX_CACHE.pop(key, None)
+
+
+def _reset_index_lock():
+    global _INDEX_LOCK
+    _INDEX_LOCK = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_index_lock)
+
+
 class _Side:
     """Uniform 'who owns which elements, and how to address them' for one view."""
 
-    def __init__(self, view) -> None:
+    def __init__(self, view, index=None) -> None:
         self.view = view
         self.table: DTensorTable = view.d_tensor_table
         self.is_storage = type(view) is StorageDTensorsView
+        self._storage_by_tid = {}
         if self.is_storage:
-            self.index = build_payload_index(self.table, view.physical_layout)
+            self.index = index if index is not None else payload_index_of(view)
 
     def storage_pieces(self, tid: str) -> List[Tuple[np.ndarray, str, int, int]]:
         """Non-empty slots with a physical file: (intervals, path, cpo, itemsize)."""
+        if tid not in self._storage_by_tid:
+            self._storage_by_tid[tid] = self._collect_storage_pieces(tid)
+        return self._storage_by_tid[tid]
+
+    def _collect_storage_pieces(self, tid):
         hits = (
             self.index.slots.get(TensorComponentPos(tid, rank))
             for rank in participants_of(named_of(self.table, tid), "storage")
@@ -206,7 +256,8 @@ def d_tensors_view_rank_plan_save(
     storage_view: StorageDTensorsView,
 ) -> Result[CopyPlan]:
     _check_same_tensors(compute_view, storage_view)
-    c, s = _Side(compute_view), _Side(storage_view)
+    c = _Side(compute_view)
+    s = _Side(storage_view, payload_index_of(storage_view))
     plan: CopyPlan = []
     for tid in compute_view.tensor_ids:
         nd = named_of(c.table, tid)
@@ -227,7 +278,8 @@ def d_tensors_view_rank_plan_load(
     storage_view: StorageDTensorsView,
 ) -> Result[CopyPlan]:
     _check_same_tensors(compute_view, storage_view)
-    c, s = _Side(compute_view), _Side(storage_view)
+    c = _Side(compute_view)
+    s = _Side(storage_view, payload_index_of(storage_view))
     plan: CopyPlan = []
     for tid in compute_view.tensor_ids:
         plan.extend(_pair(c.dst_intervals(tid, rank), s.src_candidates(tid, rank)))
@@ -276,7 +328,7 @@ def _storage_side_within(view, plan: CopyPlan, which: str):
             by_raw.setdefault(r.file_path, []).append(
                 (r.contiguous_payload_offset, r.size)
             )
-    index = _Side(view).index
+    index = payload_index_of(view)
     by_f = {
         path: _check_bounds(
             pairs, index.files[path].payload_size, f"storage {path}", CHECK

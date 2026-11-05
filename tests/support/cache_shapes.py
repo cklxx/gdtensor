@@ -4,6 +4,8 @@ Storage payload, compute buffers, the three views and the independent
 demand oracle live here so more than one test module can build them.
 """
 
+import hashlib
+
 import numpy as np
 
 import gdtensor.access as ga
@@ -33,6 +35,10 @@ class FileStorage(ga.DTensorDataAccessor):
             self.spans.append((start, start + value.size, tid))
             start += value.size
         self.reads = []  # (actor node, tid, offset, size)
+
+    def cache_identity(self) -> object | None:
+        # Memory fixture identity changes with its payload, not with a test epoch.
+        return hashlib.sha256(self.payload.tobytes()).hexdigest()
 
     def _tensor_of(self, off: int, size: int):
         hits = [(lo, hi, tid) for lo, hi, tid in self.spans if lo <= off < hi]

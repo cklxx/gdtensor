@@ -29,11 +29,11 @@ bash scripts/formal_gate.sh
 |---|---|---|
 | 核心接口 | `gdtensor/access.py::DTensorDataAccessor` | 抽象 `read_to_buffer`、`write_from_buffer`；不绑定文件格式 |
 | safetensors | `gdtensor_sim/access.py::StorageDataAccessor` | callback 与 buffer 交互；`FileIO` 执行 `os.pread/os.pwrite`；session 校验文件和 slot 范围 |
-| PyTorch DCP | `gdtensor_sim/dcp_backend.py` | process 模式写真实 stage 文件；commit 调用 DCP save；load session 初始化时调用 DCP load 读盘，accessor 再选择加载结果中的范围 |
+| PyTorch DCP | `gdtensor_sim/dcp_backend.py` | process 模式写真实 stage 文件；commit 调用 DCP save；load session 延迟读取，仅实际源读取触发 DCP load |
 | 文件缓存测试 | `tests/support/cache_oracle.py::FileCache` | 每 slot 独立文件；flush/fsync、pread；记录 rank ACK，完成后删除 slot 文件 |
 | 计算端独立 oracle | `tests/support/oracle.py::ArrayFabric` | 稠密全局下标生成预期值，校验每 rank 局部数组；存储与缓存仍真实落盘 |
 
-DCP 的读盘发生在 load session 初始化。不能把每次 accessor callback 都描述为直接 pread。
+DCP 仅在源 accessor 首次读取时加载。每个 filler session 仍全量读取；缓存填充字节不等于 DCP 的全部底层 IO。
 
 ## 验收分层
 
@@ -103,7 +103,7 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 
 同形状对照用一层或两层缓存，各轮不清缓存。断言分两段：第 1 轮存储读取等于冷读字节；暖轮存储读取为 0，缓存读取大于 0，填充条数保持第 1 轮的水平。
 
-跨轮复用读取缓存视图的元数据，不改视图结构。`DTensorDataAccessor.has_bytes` 回答“这些字节在不在缓存里”，默认返回假，表示调用方不能表态时就不复用。执行器在 `_ensure` 与 `_parents_ready` 前调用 `_adopt`：命中就占槽、标已填充、记为完成，未命中就记入缺席集合，避免重复查询。采纳路径不读缓存字节，所以冷读路径字节数不变，`cache_oracle` 的槽位语义也不受影响。
+跨轮复用读取缓存 accessor 的有效范围和源身份。`has_bytes` 默认返回 False。文件后端自动使用完整路径和 stat；调用方不用传版本号。同名文件变更会失效。DCP 身份包含 `.metadata`。内部 range 传递 `source_identity`，后端必须按身份隔离字节；未知身份仅允许当轮复用。视图结构保持不变。
 
 实测：36 个用例全部通过（12 个冷读、24 个缓存对照，四个层组合各 12 个）。包括冷读与压测在内的 `tests/io` 两组共 181 个用例通过，用时 100 秒。
 
@@ -136,6 +136,26 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 - 形式化：Lean 5 个正向文件编译无空洞，NegativeFixtures 按预期拒绝；TLA+ 31 个检查通过。固定 jar 在 mac 侧下载并校验后传入 digest。
 
 证据在 digest `log/fix-df1/`（pytest、mutation、formal）。日志不作为发布包内容。
+
+## 固定黄金测试
+
+在 digest 的仓库根目录执行，不传测试开关。
+
+```bash
+PYTHONPATH=. uv run --locked --extra torch-cpu python log/golden_chain.py
+```
+
+入口固定 100 个逻辑节点，每节点 1 rank。文件是 32 张量、1.6 GB 的 F16 safetensors。计算视图使用 `Shard(0)`。每次执行全部 0/1/2 层、随机两层、同预算策略选择及正负控制。独立 oracle 检查每个 rank 的精确字节、覆盖、边界及非法写。
+
+源设备模型为 256 MiB/s、200 µs/op；缓存和 NIC 为 4096 MiB/s。缓存延迟为 50 µs/op。源和缓存都实际 pread/pwrite。未清 OS page cache；计时包含模型延迟、计划、session 和执行，不等于物理磁盘性能。
+
+账本分离 payload、header、缓存消费与物理 pread、TX/RX、队列和文件分配。校验整段的读放大会如实记录。每轮分别输出增量与累计。计划与 session 秒数按 rank 合计，有重叠，不能加成墙钟。
+
+热点定义为节点需求字节超过层均值的两倍。随机层只随机节点集合；parent 仍本机优先、其余轮转。同预算候选固定为三组随机 60/85 节点和连续 60/85 节点。评分先比较 L0 峰值，再比较跨节点 parent 边。不承诺全局最优或时延更优。
+
+执行器准入峰值按节点检查 budget。持久文件有效字节单独记录。前者不包含 callback 暂存与 RSS；后者跨轮保留，可以大于 active budget。
+
+双机入口 `log/p2p_verify.py` 固定执行 digest/v100 的 0/1/2 层、8 MiB 往返及损坏拒绝。0 层本机直读；1 层通过 SSH 读写 v100；2 层执行本机 cache→v100 cache→rank。它使用一个逻辑 rank 和本机协调器。测试清理远端 helper 和专用数据目录。SSH 仅作为受控测试后端，不提供生产 peer 发现或跨机协调。
 
 ## 证明边界
 

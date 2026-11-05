@@ -46,12 +46,20 @@ class Nic:
         self.rx = 0
         self.bandwidth = bandwidth  # bytes/s; 0 = no delay
         self.link = threading.Lock()
+        self.receive_link = threading.Lock()
+        self.queue_seconds = 0.0
 
     def wire(self, nbytes: int) -> None:
         if not self.bandwidth:
             return
         with self.link:
             time.sleep(nbytes / self.bandwidth)
+
+
+def _wire_endpoints(sender, receiver, nbytes):
+    rates = [b for b in (sender.bandwidth, receiver.bandwidth) if b > 0]
+    if rates:
+        time.sleep(nbytes / min(rates))
 
 
 class Cluster:
@@ -78,10 +86,15 @@ class Cluster:
     def transfer(self, src: int, dst: int, nbytes: int) -> None:
         if src == dst:
             return
-        self.nics[src].wire(nbytes)
+        sender, receiver = self.nics[src], self.nics[dst]
+        start = time.monotonic()
+        with sender.link, receiver.receive_link:
+            queued = time.monotonic() - start
+            _wire_endpoints(sender, receiver, nbytes)
         with self.lock:
-            self.nics[src].tx += nbytes
-            self.nics[dst].rx += nbytes
+            sender.queue_seconds += queued
+            sender.tx += nbytes
+            receiver.rx += nbytes
 
     def nic_bytes(self) -> tuple[list[int], list[int]]:
         nodes = sorted(self.nics)
@@ -102,6 +115,7 @@ class NodeCache(ga.DTensorDataAccessor):
         self.sizes = sizes
         self.target_of_rank = target_of_rank
         self.mem: dict = {}  # (node, tid) -> (bytes, valid mask)
+        self.identities: dict = {}
         self.lock = threading.Lock()
         self.wrong_node = 0
         self.writes = []
@@ -114,6 +128,12 @@ class NodeCache(ga.DTensorDataAccessor):
             size = self.sizes[tid]
             self.mem[key] = (np.zeros(size, np.uint8), np.zeros(size, bool))
         return self.mem[key]
+
+    def _bind_source(self, node, tid, rng):
+        identity = getattr(rng, "source_identity", None)
+        if self.identities.get((node, tid)) != identity:
+            self.mem.pop((node, tid), None)
+        self.identities[node, tid] = identity
 
     def _ends(self, rng):
         actor = self.cluster.node_of_rank(self.cluster.rank)
@@ -135,6 +155,7 @@ class NodeCache(ga.DTensorDataAccessor):
         with self.lock:
             self.writes.append((actor, target, off, size))
             self.fills.append((actor, target, tid, off, size))
+            self._bind_source(target, tid, global_range)
             data, valid = self._buf(target, tid)
             data[off : off + size] = tmp
             valid[off : off + size] = True
@@ -170,6 +191,10 @@ class NodeCache(ga.DTensorDataAccessor):
             _offset(global_range),
             global_range.size,
         )
+        if self.identities.get((target, tid)) != getattr(
+            global_range, "source_identity", None
+        ):
+            return False
         with self.lock:
             _data, valid = self._buf(target, tid)
             return bool(valid[off : off + size].all())

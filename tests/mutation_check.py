@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "a97ba05b92dd8122dbc9a50b85fed6076a93ccad18848b9dd6ed01a07f66532f"
+FROZEN_API_SHA256 = "638a8af9a32a24d314dca4b1d485356fea403a27e0410dd3212e39ead704bf4a"
 
 
 def _production_manifest(root=ROOT):
@@ -207,6 +207,41 @@ MUTATIONS = [
         "rng = RangeFromComputeView(key[0], off, size)",
         "rng = RangeFromComputeView(key[0], off // 4, size)",
         "tests/io/test_cache_reuse_layout.py::test_two_layer_f32_uneven_column_shards",
+        "notorch",
+    ),
+    (
+        "gdtensor_sim/file_cache.py",
+        "if len(raw) != size or hashlib.sha256(raw).digest() != digest:",
+        "if len(raw) != size:",
+        "tests/io/test_file_cache_correctness.py::test_corrupt_cache_fails_before_delivery[checksum]",
+        "notorch",
+    ),
+    (
+        "gdtensor_sim/file_cache.py",
+        'raise OSError("cache short write made no progress")',
+        "return",
+        "tests/io/test_file_cache_correctness.py::test_zero_short_write_never_publishes",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "if identity != identity_of():",
+        "if False:",
+        "tests/io/test_file_cache_correctness.py::test_source_change_during_load_returns_error[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/plan.py",
+        "hit[1] == signature",
+        "True",
+        "tests/io/test_file_cache_correctness.py::test_public_plan_refreshes_inplace_layout",
+        "notorch",
+    ),
+    (
+        "gdtensor_sim/file_cache.py",
+        "namespace = hashlib.sha256(repr(identity).encode()).hexdigest()[:20]",
+        'namespace = "all-sources"',
+        "tests/io/test_file_cache_correctness.py::test_source_file_identity_prevents_stale_hit[same_path]",
         "notorch",
     ),
 ]

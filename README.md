@@ -1,6 +1,6 @@
-# gdtensor
+# grouped dtensor
 
-通用分布式张量的 view、布局和 IO 核心。仓库：[cklxx/gdtensor](https://github.com/cklxx/gdtensor)。唯一设计依据是 [DTensorsView-design.md](docs/DTensorsView-design.md)。实现与测试的对应关系见 [SPEC_TRACEABILITY.md](SPEC_TRACEABILITY.md)。
+分组分布式张量（grouped dtensor）的 view、布局和 IO 核心。Python 包名与 import 路径仍为 `gdtensor`，本文档其余 `gdtensor` 字样均为实际包名、模块路径或命令，不随展示名变化。仓库：[cklxx/gdtensor](https://github.com/cklxx/gdtensor)。唯一设计依据是 [DTensorsView-design.md](docs/DTensorsView-design.md)。实现与测试的对应关系见 [SPEC_TRACEABILITY.md](SPEC_TRACEABILITY.md)。
 
 | namespace | 导出范围 |
 |---|---|

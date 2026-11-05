@@ -11,9 +11,9 @@ proof of the whole Python.
 
 Pinned runtime baseline:
 - `gdtensor/internal/api.py`
-  `sha256 a97ba05b92dd8122dbc9a50b85fed6076a93ccad18848b9dd6ed01a07f66532f`.
+  `sha256 638a8af9a32a24d314dca4b1d485356fea403a27e0410dd3212e39ead704bf4a`.
 - `gdtensor/internal/propagation.py`
-  `sha256 a97ba05b92dd8122dbc9a50b85fed6076a93ccad18848b9dd6ed01a07f66532f`.
+  `sha256 db555b6f0d4333c59ba00d0bcad82414ae380c88627c45c7fcec8d1d1f8ff8ad`.
 Current source hashes are recorded by `scripts/formal_gate.sh` in its
 generated manifest.
 
@@ -112,7 +112,7 @@ segment and both read the layer-0 segment.
 
 | plan / executor concept                  | model element                     |
 |------------------------------------------|-----------------------------------|
-| `ChainPlan.nodes` / segments per node    | `Nodes`, one segment per node     |
+| `ChainPlan.layer_nodes` / segments per node | `Nodes`, one segment per node     |
 | segment byte size                        | `SegSize[n]`                      |
 | `ChainPlan.budget` byte bound            | `Budget[n]`                       |
 | parent edges (`Segment.parents`)         | `Edges[n]` (constant `A`)         |
@@ -135,12 +135,26 @@ counterpart.
 |------------------------------------------------------|---------------------|
 | `_NodeState.admit` byte-budget check                 | `Admit(n)`          |
 | fill job completes (`slots[k]["filled"]=True`)       | `Fill(n,TRUE)`      |
-| `_adopt` reads bytes the cache view holds            | `Fill(n,TRUE)`      |
-| `_SlotTable._ack` rank piece                         | `RankAck(n)`        |
+| `_adopt` accepts source-bound validity metadata      | `Fill(n,TRUE)`      |
+| `_RankRun._ack` rank piece                           | `RankAck(n)`        |
 | segment released after owed set empties              | `ReleaseTerminal(n)`|
 | child ack of a parent edge                           | `AckEdge(n)`        |
 | parent released after every child acked              | `ReleaseParent`     |
-| `_fail_node` generation error                        | `Fill(n,FALSE)`     |
+| `_RankRun._fail` generation error                    | `Fill(n,FALSE)`     |
+
+## File-identity and integrity scope
+
+The finite models do not represent pathname/stat changes, checksum algorithms,
+short writes, or physical storage. These are enforced by accessor code and
+negative tests. `cache_identity` is backend-derived; callers supply no version.
+Cache ranges bind `source_identity`. Unknown source identity disables cross-call
+adoption. File mutation during load returns Err; destination rollback is not
+claimed. Metadata/stat identity detects ordinary changes, not adversarial
+metadata forgery. `DiskNodeCache` verifies SHA256 before consumer callbacks.
+The mutation suite removes these checks to prove the corresponding tests fail.
+
+Active slot admission is the modeled byte budget. Persistent valid file ranges
+and callback temporary buffers are distinct metrics and are not that budget.
 
 ## DN fill ownership
 
