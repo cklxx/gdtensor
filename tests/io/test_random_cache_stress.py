@@ -57,6 +57,7 @@ from tests.support.crc import crc_of
 SEEDS = int(os.environ.get("GDTENSOR_STRESS_SEEDS", "128"))
 SEED_BASE = int(os.environ.get("GDTENSOR_STRESS_BASE", "0"))
 COMMON_SEEDS = int(os.environ.get("GDTENSOR_STRESS_COMMON_SEEDS", "8"))
+FANOUT_SEEDS = int(os.environ.get("GDTENSOR_STRESS_FANOUT_SEEDS", "24"))
 
 
 # ---------------------------------------------------------------- draw
@@ -87,6 +88,43 @@ def _draw(seed: int) -> dict:
         bandwidth=float(rng.choice([0.0, 0.0, 0.0, 16384.0])),
         repeat=int(rng.integers(1, 3)),
     )
+
+
+def _draw_fanout(seed: int) -> dict:
+    """Two-layer fan-out shape: every rank node is a layer-1 cache.
+
+    Layer 1 covers every node, so each rank drains its own node (no remote
+    drain). Layer 0 is a strict random subset, so more layer-1 nodes than
+    layer-0 parents exist; at least one parent must serve several children
+    ("one fans out to ten"). One rank per node keeps each node its own
+    filler. The fan-out assignment itself is checked from observed reads,
+    not from the planner.
+    """
+    rng = np.random.default_rng(seed + 200_000)
+    nodes = int(rng.choice([2, 3, 4]))
+    count = int(rng.integers(1, nodes))  # strict subset: 1 .. nodes-1
+    big = _subset_size(rng, range(nodes), count)
+    sizes = [
+        int(rng.choice([64, 128, 256, 512])) for _ in range(int(rng.integers(2, 5)))
+    ]
+    return dict(
+        seed=seed,
+        k=1,
+        nodes=nodes,
+        layers=[big, list(range(nodes))],
+        steps=[int(rng.choice([1, 2, 4])), int(rng.choice([1, 2, 4]))],
+        width=[int(rng.choice([1, 2, 3])) for _ in range(2)],
+        sizes=sizes,
+        replicate=[False] * len(sizes),
+        coordinator=str(rng.choice(["file", "thread"])),
+        bandwidth=0.0,
+        repeat=2,
+    )
+
+
+def _subset_size(rng, items, count: int) -> list:
+    items = list(items)
+    return sorted(int(x) for x in rng.choice(items, size=count, replace=False))
 
 
 def _draw_common(seed: int) -> dict:
@@ -198,6 +236,65 @@ def _check_storage(case, built, demand) -> None:
     _check_once(counts, demand[0], ("storage", case))
 
 
+def _check_fanout(case, built, demand) -> None:
+    """Independent fan-out oracle for the every-node-L1 / subset-L0 shape.
+
+    Derived from observed transfers, not from the planner:
+    * layer-1 drain nodes: every rank drains its own colocated node only;
+    * each layer-1 node takes every demanded byte from exactly one L0 node;
+    * every L0 node serves at least one child, and at least one serves many;
+    * every child's parent is an L0 node (cross-layer hops only).
+    """
+    l0, l1 = case["layers"]
+    assert l1 == list(range(case["nodes"])) and len(l0) < len(l1)
+    assert case["k"] == 1
+    # Layer-0 read records are (reader_rank, target_L0_node, size). One rank
+    # per node makes the reader the layer-1 child node; derive its parent from
+    # observed L0 reads, never from the planner.
+    parent_of_l1: dict[int, int] = {}
+    for reader, target, _size in built["caches"][0].reads:
+        assert target in l0, ("L1 read from a non-L0 node", target, case)
+        prev = parent_of_l1.setdefault(reader, target)
+        assert prev == target, (
+            "L1 node used multiple parents",
+            reader,
+            prev,
+            target,
+            case,
+        )
+    assert set(parent_of_l1) == set(l1), (
+        "not every node read from L0",
+        parent_of_l1,
+        case,
+    )
+    children: dict[int, set] = {}
+    for child, parent in parent_of_l1.items():
+        children.setdefault(parent, set()).add(child)
+    assert set(children) == set(l0), ("idle L0 node", children, l0, case)
+    assert max(len(v) for v in children.values()) >= 2, (
+        "no fan-out parent",
+        children,
+        case,
+    )
+    # Every demanded L1 byte is filled once on the local L1 child node.
+    l1_fills = built["caches"][1].fills
+    assert not [f for f in l1_fills if f[0] != f[1]], ("remote L1 fill", case)
+    counts = _counts(
+        [(t, tid, off, size) for _a, t, tid, off, size in l1_fills],
+        l1,
+        built["sizes"],
+    )
+    _check_once(counts, demand[1], ("fanout-l1", case))
+    # Drains are local: the serving node of each rank is its own node.
+    serve = built["targets"][-1]
+    for rank in range(built["world"]):
+        assert serve(rank) == rank // case["k"], (
+            "remote drain in full-L1 shape",
+            rank,
+            case,
+        )
+
+
 def _check_traffic(case, built) -> None:
     cluster = built["cluster"]
     rx, tx = cluster.nic_bytes()
@@ -269,6 +366,24 @@ def test_random_cache_strategy_is_correct(seed, tmp_path, monkeypatch):
 @pytest.mark.parametrize("seed", range(COMMON_SEEDS))
 def test_common_shape_stays_correct(seed, tmp_path, monkeypatch):
     _verify_case(_draw_common(seed), tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("seed", range(FANOUT_SEEDS))
+def test_every_node_cache_fanout_is_correct(seed, tmp_path, monkeypatch):
+    case = _draw_fanout(seed)
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "10")
+    monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", case["coordinator"])
+    built = _build(case)
+    assert type(built["chain"].check_constraints()) is gb.Ok, case
+    demand = _demand(case, built)
+    for gen in range(case["repeat"]):
+        _reset_generation(built)
+        _run(case, built)
+        _check_outputs(case, built)
+        _check_cache_fills(case, built, demand)
+        _check_storage(case, built, demand)
+        _check_fanout(case, built, demand)
 
 
 def _verify_case(case, tmp_path, monkeypatch):
