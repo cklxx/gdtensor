@@ -7,7 +7,10 @@ the simulated NICs move, and (4) a slow NIC does not stall the executor.
 """
 
 import multiprocessing as mp
+import os
 import threading
+import time
+from typing import NamedTuple, cast
 
 import numpy as np
 import pytest
@@ -261,9 +264,15 @@ def _shared_cache_worker(rank, buffers, lock, queue):
 
 
 def _finish_process(process):
+    if process.pid is None:
+        return
     if process.is_alive():
         process.terminate()
     process.join(5)
+    if process.is_alive():
+        process.kill()
+        process.join(5)
+    assert not process.is_alive(), f"worker {process.pid} survived cleanup"
 
 
 def test_one_process_per_rank_uses_local_dn_and_shared_cache():
@@ -293,3 +302,160 @@ def test_one_process_per_rank_uses_local_dn_and_shared_cache():
     assert all(
         actor == target == 0 for item in results for actor, target, _o, _s in item[4]
     )
+
+
+def _death_worker(rank, buffers, lock, entered, release, ready, pipe):
+    try:
+        _death_load(rank, buffers, lock, entered, release, ready, pipe)
+    finally:
+        pipe.close()
+
+
+def _death_load(rank, buffers, lock, entered, release, ready, pipe):
+    chain, cluster, caches, dst = _build([(0,)], size=8, world=2, k=1)
+    caches[0].mem[(0, "w")] = tuple(np.frombuffer(b, np.uint8) for b in buffers)
+    caches[0].lock = lock
+    src = cast(gb.StorageDTensorsView, chain.src)
+    read = src.data_accessor.read_to_buffer
+
+    def gated_read(rng, callback):
+        entered.set()
+        assert release.wait(15), "parent did not release source read"
+        return read(rng, callback)
+
+    src.data_accessor.read_to_buffer = gated_read
+    cluster.rank = rank
+    ready.set()
+    result = gio.chain_load(rank, chain)
+    want = np.full(8, 0xA5, np.uint8)
+    want[rank * 4 : (rank + 1) * 4] = np.arange(8, dtype=np.uint8)[
+        rank * 4 : (rank + 1) * 4
+    ]
+    pipe.send(
+        dict(
+            rank=rank,
+            ok=type(result) is gb.Ok,
+            correct=np.array_equal(dst.buffers[rank], want),
+            error=repr(result.value) if type(result) is gb.Err else None,
+            check_name=getattr(result.value, "check_name", None)
+            if type(result) is gb.Err
+            else None,
+        )
+    )
+
+
+def _death_pair(ctx):
+    buffers = (ctx.RawArray("B", 8), ctx.RawArray("B", 8))
+    lock, entered, release = ctx.RLock(), ctx.Event(), ctx.Event()
+    workers, receivers, senders, ready = [], [], [], []
+    for rank in range(2):
+        recv, send = ctx.Pipe(duplex=False)
+        event = ctx.Event()
+        args = (rank, buffers, lock, entered, release, event, send)
+        worker = ctx.Process(target=_death_worker, args=args)
+        workers.append(worker)
+        receivers.append(recv)
+        senders.append(send)
+        ready.append(event)
+    return workers, receivers, senders, ready, entered, release, (buffers, lock)
+
+
+def _confirm_survivor_waiting(worker, receiver, grace=1.0):
+    # The survivor reached chain_load but has produced no result, so it is
+    # blocked on the in-flight fill. A periodic faulthandler dump is not usable
+    # here: repeated dumps from the watchdog thread kill the spawned child
+    # (exitcode -SIGSEGV) on some runs.
+    end = time.monotonic() + grace
+    while time.monotonic() < end:
+        assert worker.is_alive(), (
+            f"survivor exited before fault injection, exitcode={worker.exitcode}"
+        )
+        assert not receiver.poll(0), "survivor finished before fault injection"
+        time.sleep(0.05)
+
+
+class _DeathRow(NamedTuple):
+    rank: int
+    alive: bool
+    exitcode: int | None
+    result: dict | None
+
+
+def _death_observe(workers, receivers, deadline) -> list[_DeathRow]:
+    rows = []
+    for rank, worker in enumerate(workers):
+        worker.join(max(0, deadline - time.monotonic()))
+        result = receivers[rank].recv() if receivers[rank].poll(0) else None
+        rows.append(_DeathRow(rank, worker.is_alive(), worker.exitcode, result))
+    return rows
+
+
+def _death_round(tmp_path, kill, restart=False, wait="6"):
+    # The wait budget must outlive the blocked-survivor probe: a short budget
+    # would let the survivor return before the host confirms it is blocked.
+    os.environ["GDTENSOR_CACHE_WAIT_SECONDS"] = wait
+    ctx = mp.get_context("spawn")
+    # Keep parent references until spawn has unpickled every semaphore and buffer.
+    workers, receivers, senders, ready, entered, release, _shared = _death_pair(ctx)
+    if restart:
+        release.set()
+    try:
+        workers[0].start()
+        stage = ready[0] if restart else entered
+        assert stage.wait(10), "filler never reached the required stage"
+        workers[1].start()
+        assert ready[1].wait(10), "survivor never reached chain_load"
+        if not restart:
+            _confirm_survivor_waiting(workers[1], receivers[1])
+        deadline = time.monotonic() + 4
+        if kill:
+            workers[0].kill()
+            workers[0].join(5)
+            assert workers[0].exitcode == -9, workers[0].exitcode
+        else:
+            release.set()
+        return _death_observe(workers, receivers, deadline)
+    finally:
+        for worker in workers:
+            _finish_process(worker)
+        for pipe in receivers + senders:
+            pipe.close()
+
+
+@pytest.mark.parametrize("kill", [False, True], ids=["release", "kill-filler"])
+def test_filler_process_exit_is_bounded(tmp_path, monkeypatch, kill):
+    monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "file")
+    rows = _death_round(tmp_path, kill)
+    survivor = rows[1]
+    assert not survivor.alive, ("survivor did not exit within 4s", rows)
+    assert survivor.exitcode == 0 and survivor.result is not None, rows
+    if kill:
+        assert not survivor.result["ok"], rows
+        assert survivor.result["check_name"] == "cache_peer_down", rows
+    else:
+        assert all(not row.alive and row.exitcode == 0 for row in rows), rows
+        assert all(row.result is not None and row.result["correct"] for row in rows), (
+            rows
+        )
+
+
+@pytest.mark.parametrize(
+    "reuse_state", [True, False], ids=["same-directory", "fresh-directory"]
+)
+def test_restart_after_filler_death_is_bounded(tmp_path, monkeypatch, reuse_state):
+    monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "file")
+    _death_round(tmp_path, kill=True)
+    # Both old processes are reaped before any change of coordinator directory.
+    if not reuse_state:
+        tmp_path = tmp_path / "fresh"
+        tmp_path.mkdir()
+        monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    rows = _death_round(tmp_path, kill=False, restart=True, wait="0.2")
+    assert not any(row.alive for row in rows), ("restart reused stuck state", rows)
+    assert all(row.exitcode == 0 and row.result is not None for row in rows), rows
+    succ = [row.result for row in rows if row.result is not None]
+    assert all(not item["ok"] or item["correct"] for item in succ), rows
+    if not reuse_state:
+        assert all(item["ok"] and item["correct"] for item in succ), rows
+    else:
+        assert all(item["check_name"] == "cache_peer_down" for item in succ), rows

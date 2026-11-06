@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "416609763880c3e2415bf9b9bfb334233150d001000ae33e1222c88d23726cb4"
+FROZEN_API_SHA256 = "6089f97551ecfc51fcc9a0a0741fd1f8c1f6aa4d5d9e5d441816bb5e97741d03"
 
 
 def _production_manifest(root=ROOT):
@@ -157,6 +157,93 @@ MUTATIONS = [
         "tests/io/test_colocated_cluster_sim.py::test_missing_local_filler_returns_error_without_remote_write",
         "notorch",
     ),
+    # Randomized co-located stress: each mutant breaks one oracle axis (fill
+    # owner, helper node, storage offset, generation refill, stat traffic).
+    # The detector is the first seed that exposes the mutant on digest.
+    (
+        "gdtensor/internal/propagation.py",
+        "eligible = [r for r in local if r in consumers]",
+        "eligible = list(consumers)",
+        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/propagation.py",
+        "helper = (local or plan.ranks)[0]",
+        "helper = plan.ranks[0]",
+        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/plan.py",
+        "RangeFromStorageView(path, cpo + int(l) * isz, int(b - a) * isz)",
+        "RangeFromStorageView(path, cpo + int(a) * isz, int(b - a) * isz)",
+        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "if any(s.key in self.slots or s.key in self.completed for s in segs):",
+        "if any(s.key in self.slots for s in segs):",
+        "tests/io/test_random_cache_stress.py",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/propagation.py",
+        "        _drain_traffic(rank // plan.k, pieces, inbound, outbound)\n",
+        "        pass\n",
+        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        'if not slot["owed"]:',
+        "if True:",
+        "tests/io/test_cache_reuse_layout.py::test_two_layer_physical_reuse_waits_for_slow_consumer",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "rng = RangeFromComputeView(key[0], off, size)",
+        "rng = RangeFromComputeView(key[0], off // 4, size)",
+        "tests/io/test_cache_reuse_layout.py::test_two_layer_f32_uneven_column_shards",
+        "notorch",
+    ),
+    (
+        "gdtensor_sim/file_cache.py",
+        "if len(raw) != size or hashlib.sha256(raw).digest() != digest:",
+        "if len(raw) != size:",
+        "tests/io/test_file_cache_correctness.py::test_corrupt_cache_fails_before_delivery[checksum]",
+        "notorch",
+    ),
+    (
+        "gdtensor_sim/file_cache.py",
+        'raise OSError("cache short write made no progress")',
+        "return",
+        "tests/io/test_file_cache_correctness.py::test_zero_short_write_never_publishes",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "if identity != identity_of():",
+        "if False:",
+        "tests/io/test_file_cache_correctness.py::test_source_change_during_load_returns_error[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/plan.py",
+        "hit[1] == signature",
+        "True",
+        "tests/io/test_file_cache_correctness.py::test_public_plan_refreshes_inplace_layout",
+        "notorch",
+    ),
+    (
+        "gdtensor_sim/file_cache.py",
+        "namespace = hashlib.sha256(repr(identity).encode()).hexdigest()[:20]",
+        'namespace = "all-sources"',
+        "tests/io/test_file_cache_correctness.py::test_source_file_identity_prevents_stale_hit[same_path]",
+        "notorch",
+    ),
 ]
 
 
@@ -164,10 +251,19 @@ def _limit_output():
     resource.setrlimit(resource.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024))
 
 
+def _budget():
+    """Per-detector wall-clock limit. The stress file is the slowest detector,
+    so leave head-room over its plain run time; a hang still trips this."""
+    return int(os.environ.get("GDTENSOR_MUTATION_TIMEOUT", "120"))
+
+
 def _run(snapshot, detector, log):
     env = dict(
         os.environ, PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"
     )
+    # Detector ids name default stress seeds; a caller seed range must not hide them.
+    env.pop("GDTENSOR_STRESS_BASE", None)
+    env.pop("GDTENSOR_STRESS_SEEDS", None)
     with log.open("wb") as output:
         process = subprocess.Popen(
             [sys.executable, "-m", "pytest", "-xq", "-p", "no:cacheprovider", detector],
@@ -179,7 +275,7 @@ def _run(snapshot, detector, log):
             preexec_fn=_limit_output,
         )
         try:
-            return process.wait(timeout=60)
+            return process.wait(timeout=_budget())
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()

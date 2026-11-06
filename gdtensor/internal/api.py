@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 import ctypes
 import hashlib
@@ -33,6 +34,23 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 
 _LOG = logging.getLogger(__name__)
+_PROCESS_FILES: weakref.WeakSet = weakref.WeakSet()
+_PROCESS_FILES_LOCK = threading.Lock()
+
+
+def _open_process_file(path, mode):
+    with _PROCESS_FILES_LOCK:
+        file = open(path, mode)
+        _PROCESS_FILES.add(file)
+        return file
+
+
+def _new_owner(directory):
+    with _PROCESS_FILES_LOCK:
+        fd, path = tempfile.mkstemp(prefix="gdtensor-run-", dir=directory)
+        owner = os.fdopen(fd, "a+b")
+        _PROCESS_FILES.add(owner)
+        return owner, path
 
 
 def _read(src_acc, src) -> bytes:
@@ -229,13 +247,15 @@ class _NodeState:
             self.slots[s.key]["owed"] = s.owed()
         return True
 
-    def ack(self, key, piece) -> None:
+    def ack(self, key, piece) -> bool:
         slot = self.slots.get(key)
         if slot is None:
             raise check_failed("cache_ack", f"segment {key} released before {piece}")
         slot["owed"].discard(piece)
         if not slot["owed"]:
             self.release(key)
+            return True
+        return False
 
     def fail(self, exc: BaseException, key) -> None:
         if key is not None:
@@ -252,6 +272,11 @@ class _NodeState:
 class _SlotTable:
     """In-process coordinator for one concrete chain: one lock, one version."""
 
+    # One process's threads share this table; the file table sets this False so
+    # every state change is persisted. Threads can skip a notify when a change
+    # makes no waiter predicate true (see bump's whitelist in the call sites).
+    in_memory = True
+
     def __init__(self, plan, key: str | None = None) -> None:
         self.plan = plan
         self.key = key
@@ -267,6 +292,10 @@ class _SlotTable:
     def node(self, layer: int, node: int) -> _NodeState:
         return self.nodes[(layer, node)]
 
+    @property
+    def _in_mem(self) -> bool:
+        return getattr(self, "in_memory", False)
+
     def bump(self) -> None:
         self.version += 1
         self.cond.notify_all()
@@ -274,6 +303,18 @@ class _SlotTable:
     def mark_touched(self, key) -> None:
         """No-op: this table shares one in-memory state, so there is no
         snapshot merge to protect."""
+
+    def participate(self, rank: int):
+        return nullcontext()
+
+    def check_alive(self) -> None:
+        """Thread callers cannot outlive a killed process."""
+
+    def activity(self, owner, delta: int) -> None:
+        self.inflight += delta
+
+    def finish(self, owner) -> None:
+        """No process registration in the thread coordinator."""
 
 
 # ---------------------------------------------------------------- process-safe table
@@ -287,7 +328,7 @@ class _SlotTable:
 
 _COORD_ENV = "GDTENSOR_CACHE_COORDINATOR"
 _COORD_DIR_ENV = "GDTENSOR_CACHE_DIR"
-_MAGIC = "gdtensor-coord-v2"
+_MAGIC = "gdtensor-coord-v3"
 
 
 def _DBG(*parts) -> None:
@@ -338,6 +379,7 @@ class _FileCond:
         return action == "ready"
 
     def _wait_ready(self, predicate, deadline) -> str:
+        self.t.check_alive()
         if predicate():
             return "ready"
         if deadline is not None and time.monotonic() >= deadline:
@@ -355,10 +397,10 @@ class _FileCond:
 class _FileSlotTable:
     """Process-safe coordinator for one concrete chain (content fingerprint).
 
-    The state is {magic, version, inflight, nodes: {(layer, node): _NodeState}}.
-    Every mutation runs under a process RLock and an exclusive flock on the
-    state file, then bumps the version and writes the file atomically
-    (temp file + os.replace). Waits poll the file version.
+    State records node residency, active owners, in-flight IO and terminal error.
+    Mutations hold a thread RLock and a file flock, then atomically replace state.
+    Per-call flocks remain held outside these short transactions. An abandoned
+    owner fails this chain; restarting safely requires a new coordinator directory.
     """
 
     _POLL = 0.005
@@ -373,9 +415,10 @@ class _FileSlotTable:
             f"gdtensor-coord-{key}",
         )
         self._path = base + ".state"
-        self._fd = open(base + ".lock", "a+b")
+        self._pid = os.getpid()
+        self._fd = _open_process_file(base + ".lock", "a+b")
         self._thread_lock = threading.RLock()
-        self._held = False
+        self._held: int | None = None
         self._dirty = False
         self.version = 0
         self.inflight = 0
@@ -384,6 +427,13 @@ class _FileSlotTable:
         self.cond = _FileCond(self)
         self._reacquire()
         self._drop()  # load the initial state, then release both locks
+
+    # File state is persisted on bump, so no notify may be skipped.
+    in_memory = False
+
+    @property
+    def _in_mem(self) -> bool:
+        return getattr(self, "in_memory", False)
 
     def node(self, layer: int, node: int) -> _NodeState:
         return self.nodes[(layer, node)]
@@ -400,27 +450,105 @@ class _FileSlotTable:
         avoiding a stale snapshot from rolling back a peer's update."""
         self._touched.add(key)
 
+    @contextmanager
+    def participate(self, rank: int):
+        assert fcntl is not None
+        self._check_process()
+        # Kernel-held locks have no expiry: slow living callers remain valid.
+        owner, path = _new_owner(os.path.dirname(self._path))
+        try:
+            fcntl.flock(owner, fcntl.LOCK_EX)
+            token = os.path.basename(path)
+            self._register(token, rank)
+            yield token
+        finally:
+            self._close_owner(owner, path)
+
+    def _close_owner(self, owner, path):
+        owner.close()
+        if self._pid == os.getpid():
+            os.unlink(path)
+
+    def _register(self, path, rank):
+        with self.cond:
+            self.check_alive()
+            self.runs[path] = {"rank": rank, "inflight": 0}
+            self.bump()
+
+    def activity(self, owner, delta: int) -> None:
+        self.runs[owner]["inflight"] += delta
+        self.inflight += delta
+
+    def finish(self, owner) -> None:
+        # An interrupted commit leaves its owner registered, even after exit.
+        if self.runs[owner]["inflight"] == 0:
+            self.runs.pop(owner)
+
+    def check_alive(self) -> None:
+        if self.error is not None:
+            raise check_failed(*self.error)
+        dead = next(
+            (run["rank"] for path, run in self.runs.items() if self._unlocked(path)),
+            None,
+        )
+        if dead is not None:
+            self.error = (
+                "cache_peer_down",
+                f"rank {dead} exited during cache IO; use a new coordinator directory",
+            )
+            self.bump()
+            raise check_failed(*self.error)
+
+    def _unlocked(self, path) -> bool:
+        assert fcntl is not None
+        try:
+            owner = _open_process_file(
+                os.path.join(os.path.dirname(self._path), path), "r+b"
+            )
+        except FileNotFoundError:
+            return True
+        try:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            owner.close()
+
     def _enter(self) -> None:
         _DBG("t_enter", threading.current_thread().name, "held", self._held)
+        self._check_process()
+        self._check_reentrant()
         self._thread_lock.acquire()
         try:
             fcntl.flock(self._fd, fcntl.LOCK_EX)  # type: ignore[possibly-missing-attribute]
             self._refresh()
-            self._check_reentrant()
-            self._held = True
+            self._held = threading.get_ident()
             self._dirty = False
         except BaseException:
             self._unlock()
             raise
 
+    def _check_process(self) -> None:
+        if self._pid != os.getpid():
+            raise check_failed(
+                "cache_fork", "forked during cache IO; start a new chain_load"
+            )
+
     def _check_reentrant(self) -> None:
-        if self._held:
+        if self._held == threading.get_ident():
             raise RuntimeError("_FileSlotTable.cond is not reentrant")
 
     def _unlock(self) -> None:
-        self._thread_lock.release()
+        assert fcntl is not None
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            self._thread_lock.release()
 
     def _exit(self) -> None:
+        if self._held != threading.get_ident() or self._pid != os.getpid():
+            return
         _DBG(
             "t_exit",
             threading.current_thread().name,
@@ -429,32 +557,40 @@ class _FileSlotTable:
             "d",
             self._dirty,
         )
-        if self._dirty:
-            self.version += 1
-            latest = self._read_state()
-            latest["nodes"].update({k: self.nodes[k] for k in self._touched})
-            latest["version"] = self.version
-            latest["inflight"] = self.inflight
-            self._write_state(latest)
-        self._held = False
-        fcntl.flock(self._fd, fcntl.LOCK_UN)  # type: ignore[possibly-missing-attribute]
-        self._thread_lock.release()
+        try:
+            self._commit()
+        finally:
+            self._drop()
+
+    def _commit(self) -> None:
+        if not self._dirty:
+            return
+        self.version += 1
+        latest = self._read_state()
+        latest["nodes"].update({k: self.nodes[k] for k in self._touched})
+        latest.update(
+            version=self.version,
+            inflight=self.inflight,
+            runs=self.runs,
+            error=self.error,
+        )
+        self._write_state(latest)
 
     def _drop(self) -> None:
         _DBG("t_drop", threading.current_thread().name)
-        self._held = False
-        fcntl.flock(self._fd, fcntl.LOCK_UN)  # type: ignore[possibly-missing-attribute]
-        self._thread_lock.release()
+        self._held = None
+        self._unlock()
 
     def _reacquire(self) -> None:
         _DBG("t_reacq", threading.current_thread().name)
+        self._check_process()
         self._thread_lock.acquire()
         try:
             fcntl.flock(self._fd, fcntl.LOCK_EX)  # type: ignore[possibly-missing-attribute]
             self._refresh()
-            self._held = True
+            self._held = threading.get_ident()
         except BaseException:
-            self._thread_lock.release()
+            self._unlock()
             raise
 
     def _refresh(self) -> None:
@@ -462,20 +598,30 @@ class _FileSlotTable:
         self.nodes = state["nodes"]
         self.version = state["version"]
         self.inflight = state["inflight"]
+        self.runs = state["runs"]
+        self.error = state["error"]
         self._touched = set()
 
     def _read_state(self) -> dict:
         try:
             state = self._read_raw()
-        except (FileNotFoundError, EOFError, pickle.UnpicklingError, ValueError):
-            state = None
-        if not state or state.get("magic") != _MAGIC:
+        except FileNotFoundError:
             return {
                 "magic": _MAGIC,
                 "version": 0,
                 "inflight": 0,
                 "nodes": self._initial_nodes(),
+                "runs": {},
+                "error": None,
             }
+        except (EOFError, pickle.UnpicklingError, ValueError) as exc:
+            raise check_failed(
+                "cache_state", "invalid coordinator state; use a new directory"
+            ) from exc
+        if not isinstance(state, dict) or state.get("magic") != _MAGIC:
+            raise check_failed(
+                "cache_state", "incompatible coordinator state; use a new directory"
+            )
         return state
 
     def _read_raw(self) -> dict:
@@ -519,6 +665,25 @@ _view_slots: dict = {}
 _table_lock = threading.RLock()
 
 
+def _after_fork() -> None:
+    global _table_lock
+    # Close, never unlock: fork shares the parent's open-file descriptions.
+    for file in list(_PROCESS_FILES):
+        file.close()
+    _PROCESS_FILES.clear()
+    _table_lock = threading.RLock()
+    _view_slots.clear()
+    _PROCESS_FILES_LOCK.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_PROCESS_FILES_LOCK.acquire,
+        after_in_parent=_PROCESS_FILES_LOCK.release,
+        after_in_child=_after_fork,
+    )
+
+
 def _chain_fingerprint(chain) -> str:
     """Content hash of a concrete chain: identical chains in different
     processes share one coordinator file. Views (which hold accessors) are
@@ -531,27 +696,36 @@ def _chain_fingerprint(chain) -> str:
     return hashlib.sha256(pickle.dumps(payload, protocol=5)).hexdigest()[:20]
 
 
-def _drop_table(key) -> None:
-    # Pop under the lock, drop the table outside it: dropping the table can
-    # run another view finalizer that takes the same lock.
+def _drop_table(key, expected) -> None:
+    # A finalizer for an older table must not remove its replacement.
     with _table_lock:
-        table = _view_slots.pop(key, None)
+        table = _view_slots.get(key)
+        if table is expected():
+            _view_slots.pop(key, None)
     del table
 
 
-def _slots(chain):
+def _slots(chain, source_identity=None):
     from .propagation import build_chain_plan, cache_layers
 
+    identity = (
+        source_identity
+        if source_identity is not None
+        else chain.src.data_accessor.cache_identity()
+    )
     key = _chain_fingerprint(chain)
+    if identity is not None:
+        key = hashlib.sha256(pickle.dumps((key, identity), protocol=5)).hexdigest()[:20]
+    directory = os.path.realpath(os.environ.get(_COORD_DIR_ENV, tempfile.gettempdir()))
+    cache_key = (os.getpid(), os.environ.get(_COORD_ENV, "file"), directory, key)
     with _table_lock:
-        table = _view_slots.get(key)
-    if table is not None:
-        return table
-    table = _coordinator_factory()(build_chain_plan(chain), key)
-    with _table_lock:
-        table = _view_slots.setdefault(key, table)
+        table = _view_slots.get(cache_key)
+        if table is not None:
+            return table
+        table = _coordinator_factory()(build_chain_plan(chain), key)
+        _view_slots[cache_key] = table
     for view in cache_layers(chain):
-        weakref.finalize(view, _drop_table, key)
+        weakref.finalize(view, _drop_table, cache_key, weakref.ref(table))
     return table
 
 
@@ -577,22 +751,191 @@ class _RankRun:
 
         self.t, self.plan, self.rank = table, table.plan, rank
         self.caches, self.storage, self.dst = caches, storage, dst
+        self.source_identity = storage.data_accessor.cache_identity()
         self.last = len(caches) - 1
         closure = execution_closure(self.plan, rank)
+        self.closure = closure
+        self._absent: set = set()
         self.services = list(self.plan.services.get(rank, ()))
         self.gens = dict.fromkeys(sorted({(lay, n) for lay, n, _k in closure}), 0)
         self.wait = _wait_seconds()
 
     def run(self) -> None:
+        with self.t.participate(self.rank) as self.owner:
+            self._run()
+
+    def _run(self) -> None:
         with self.t.cond:
+            self.t.check_alive()
             self.gens = {ln: self.t.node(*ln).join(self.rank) for ln in self.gens}
             [self.t.mark_touched(ln) for ln in self.gens]
             self.t.bump()
         try:
             self._wait_cohort()
             self._loop(list(self.plan.drains[self.rank]))
+            self._version_checked()
+            self._check_source()
         finally:
             self._leave()
+
+    def _check_source(self):
+        if self.source_identity != self.storage.data_accessor.cache_identity():
+            raise check_failed(
+                "cache_source_changed", "source file changed during load"
+            )
+
+    def _adopt(self, layer: int, node: int, key) -> bool:
+        """Adopt a segment the cache view already reports as present.
+
+        Adoption asks the view for metadata only, so a cold cache costs one
+        look-up and a warm cache skips the storage read.
+        """
+        if (layer, node, key) in self._absent:
+            return False
+        if self._adopted(layer, node, key):
+            return True
+        if self.source_identity is None:
+            return False
+        seg = self.plan.segments[layer][node][key]
+        acc = self.caches[layer].data_accessor
+        if self.source_identity != self.storage.data_accessor.cache_identity():
+            raise check_failed(
+                "cache_source_changed", "source file changed during load"
+            )
+        if not acc.has_bytes(self._range(seg.key, node)):
+            self._absent.add((layer, node, key))
+            return False
+        return self._mark_adopted(layer, node, seg)
+
+    def _range(self, key, node):
+        return _CacheRange(key[0], key[1], key[2], node, self.source_identity)
+
+    def _adopted(self, layer: int, node: int, key) -> bool:
+        with self.t.cond:
+            return self._slot_filled(layer, node, key)
+
+    def _slot_filled(self, layer: int, node: int, key) -> bool:
+        state = self.t.node(layer, node)
+        if key in state.completed:
+            return True
+        slot = state.slots.get(key)
+        return bool(slot["filled"]) if slot is not None else False
+
+    def _mark_adopted(self, layer: int, node: int, seg) -> bool:
+        with self.t.cond:
+            return self._seal_node(layer, node, seg)
+
+    def _seal_node(self, layer: int, node: int, seg) -> bool:
+        state = self.t.node(layer, node)
+        if seg.key in state.completed:
+            return True
+        if seg.key in state.slots:
+            return bool(state.slots[seg.key]["filled"])
+        if not state.reserve([seg]):
+            return False
+        state.slots[seg.key]["filled"] = True
+        state.completed.add(seg.key)
+        self.t.mark_touched((layer, node))
+        self.t.bump()
+        return True
+
+    def _classify_drains(self, pending) -> list:
+        """Return the drainable pieces of pending, in pending order.
+
+        One lock pass finds pieces already filled; cache probes run outside
+        the lock; one more lock pass seals any probed hits. This replaces a
+        per-piece lock probe for every pending piece of the rank.
+        """
+        with self.t.cond:
+            ready, probe_keys = self._drain_scan(pending)
+        segs = self._probe_drain_bytes(probe_keys)
+        if not segs:
+            return [piece for piece in pending if piece in ready]
+        with self.t.cond:
+            sealed = self._seal_drains(segs)
+        return [
+            piece
+            for piece in pending
+            if piece in ready or (piece[0], piece[1]) in sealed
+        ]
+
+    def _drain_scan(self, pending):
+        """Split pending into filled pieces and (node, key) probe candidates.
+
+        The caller holds the table lock. Each (node, key) is probed at most
+        once per scan, and keys already known absent are not probed again.
+        """
+        ready = {
+            piece
+            for piece in pending
+            if self._slot_filled(self.last, piece[0], piece[1])
+        }
+        seen = set()
+        probe_keys = []
+        for piece in pending:
+            self._collect_probe(piece, ready, seen, probe_keys)
+        return ready, probe_keys
+
+    def _collect_probe(self, piece, ready, seen, probe_keys) -> None:
+        node_key = (piece[0], piece[1])
+        if piece in ready or node_key in seen:
+            return
+        seen.add(node_key)
+        if (self.last, piece[0], piece[1]) not in self._absent:
+            probe_keys.append(node_key)
+
+    def _probe_drain_bytes(self, keys) -> list:
+        """Probe the last cache layer for (node, key) pairs, lock-free."""
+        if self.source_identity is None:
+            return []
+        acc = self.caches[self.last].data_accessor
+        segs = []
+        for node, key in keys:
+            self._probe_one(node, key, acc, segs)
+        return segs
+
+    def _probe_one(self, node, key, acc, segs) -> None:
+        seg = self.plan.segments[self.last][node][key]
+        if self.source_identity != self.storage.data_accessor.cache_identity():
+            raise check_failed(
+                "cache_source_changed", "source file changed during load"
+            )
+        if not acc.has_bytes(self._range(seg.key, node)):
+            self._absent.add((self.last, node, key))
+            return
+        segs.append(seg)
+
+    def _seal_drains(self, segs) -> set:
+        """Seal probed segments; the caller holds the table lock.
+
+        Re-checks each segment under the lock, because another rank may have
+        reserved it between the probe and this pass. Returns the (node, key)
+        pairs that are now drainable; bumps once if anything changed.
+        """
+        sealed = set()
+        changed = []
+        for seg in segs:
+            self._seal_one(seg, sealed, changed)
+        for node in dict.fromkeys(changed):
+            self.t.mark_touched((self.last, node))
+        if changed:
+            # A sealed segment makes drain predicates true: always bump.
+            self.t.bump()
+        return sealed
+
+    def _seal_one(self, seg, sealed, changed) -> None:
+        state = self.t.node(self.last, seg.node)
+        slot = state.slots.get(seg.key)
+        filled = seg.key in state.completed or bool(slot and slot["filled"])
+        if filled:
+            sealed.add((seg.node, seg.key))
+            return
+        if slot is not None or not state.reserve([seg]):
+            return
+        state.slots[seg.key]["filled"] = True
+        state.completed.add(seg.key)
+        sealed.add((seg.node, seg.key))
+        changed.append(seg.node)
 
     def _wait_cohort(self) -> None:
         """Wait for missing consumers of a node whose budget cannot hold the
@@ -663,7 +1006,9 @@ class _RankRun:
     def _leave(self) -> None:
         with self.t.cond:
             _ = [self._dec(ln) for ln in self.gens]
-            self.t.bump()
+            self.t.finish(self.owner)
+            # Leaving changes no waiter predicate for threads (join bumps).
+            self.t.bump() if not self.t._in_mem else None
 
     def _dec(self, ln) -> None:
         self.t.node(*ln).active -= 1
@@ -680,7 +1025,7 @@ class _RankRun:
 
     def _step(self, pending: list) -> bool:
         """Drain every filled piece; else fill one segment. True on progress."""
-        done = [p for p in pending if self._filled(self.last, p[0], p[1])]
+        done = self._classify_drains(pending)
         for piece in done:
             self._drain(piece)
             pending.remove(piece)
@@ -706,6 +1051,7 @@ class _RankRun:
 
     def _version_checked(self) -> int:
         with self.t.cond:
+            self.t.check_alive()
             _ = [self.t.node(*ln).check(gen) for ln, gen in self.gens.items()]
             return self.t.version
 
@@ -780,6 +1126,8 @@ class _RankRun:
             return False
         if not self._room(layer, node, seg):
             return False
+        if self._adopt(layer, node, key):
+            return False
         if layer > 0 and not self._parents_ready(layer, node, seg):
             return False
         if not self._reserve(layer, node, [seg]):
@@ -807,7 +1155,9 @@ class _RankRun:
             state.check(self.gens[(layer, node)])
             ok = state.reserve(segs)
             self.t.mark_touched((layer, node))
-            self.t.bump() if ok else None
+            # A reserve makes no waiter predicate true for threads; the
+            # fill completion that follows it bumps.
+            self.t.bump() if ok and not self.t._in_mem else None
         return ok
 
     def _parents_ready(self, layer: int, node: int, seg) -> bool:
@@ -820,6 +1170,8 @@ class _RankRun:
         pnode = self.plan.parent[layer][node]
         psegs = self.plan.segments[layer - 1][pnode]
         keys = sorted({pkey for pkey, _o, _n in seg.parents})
+        for k in keys:
+            self._adopt(layer - 1, pnode, k)
         if all(self._filled(layer - 1, pnode, k) for k in keys):
             return True
         missing = [psegs[k] for k in keys if not self._resident(layer - 1, pnode, k)]
@@ -843,25 +1195,29 @@ class _RankRun:
         self._inflight(1)
         try:
             data = self._source_bytes(layer, seg)
-            _write(self.caches[layer].data_accessor, _cache_range(seg.key, node), data)
+            _write(self.caches[layer].data_accessor, self._range(seg.key, node), data)
         except BaseException as exc:
             self._inflight(-1)
             self._fail(layer, node, exc, seg.key)
             raise
         with self.t.cond:
-            self.t.node(layer, node).slots[seg.key]["filled"] = True
-            self.t.node(layer, node).completed.add(seg.key)
-            self.t.inflight -= 1
+            state = self.t.node(layer, node)
+            state.slots[seg.key]["filled"] = True
+            state.completed.add(seg.key)
+            self.t.activity(self.owner, -1)
             self.t.mark_touched((layer, node))
+            self._ack_parents_locked(layer, node, seg) if layer > 0 else None
+            # Fill completion makes fill/drain predicates true: always bump.
             self.t.bump()
-        if layer > 0:
-            self._ack_parents(layer, node, seg)
 
-    def _ack_parents(self, layer: int, node: int, seg) -> None:
+    def _ack_parents_locked(self, layer: int, node: int, seg) -> None:
+        """ACK this fill's parent pieces; the caller holds the table lock."""
         pnode = self.plan.parent[layer][node]
+        pstate = self.t.node(layer - 1, pnode)
         consumer = ("seg", layer, node, seg.key)
         for pkey, off, size in seg.parents:
-            self._ack(layer - 1, pnode, pkey, (consumer, off, size))
+            pstate.ack(pkey, (consumer, off, size))
+        self.t.mark_touched((layer - 1, pnode))
 
     def _source_bytes(self, layer: int, seg) -> bytes:
         if layer == 0:
@@ -871,7 +1227,7 @@ class _RankRun:
         return b"".join(
             _read(
                 acc,
-                _cache_range((seg.tid, off, size), self.plan.parent[layer][seg.node]),
+                self._range((seg.tid, off, size), self.plan.parent[layer][seg.node]),
             )
             for _k, off, size in seg.parents
         )
@@ -883,23 +1239,34 @@ class _RankRun:
         try:
             data = _read(
                 self.caches[self.last].data_accessor,
-                _cache_range((key[0], off, size), node),
+                self._range((key[0], off, size), node),
             )
             _write(self.dst.data_accessor, rng, data)
         except BaseException as exc:
             self._inflight(-1)
             self._fail(self.last, node, exc, None)
             raise
-        self._inflight(-1)
-        self._ack(self.last, node, key, (("rank", self.rank), off, size))
+        with self.t.cond:
+            self.t.activity(self.owner, -1)
+            released = self.t.node(self.last, node).ack(
+                key, (("rank", self.rank), off, size)
+            )
+            self.t.mark_touched((self.last, node))
+            # Bump only when a waiter predicate can change: a slot release,
+            # or the last in-flight unit finishing. Other ACKs change no
+            # predicate (waiters read version and inflight only).
+            gated = not self.t._in_mem or released or self.t.inflight == 0
+            self.t.bump() if gated else None
 
     def _inflight(self, delta: int) -> None:
         """Mark a fill or drain as in flight: waiting peers treat in-flight
         work as progress and do not time out. The delta is persisted so a peer
         in another process observes it."""
         with self.t.cond:
-            self.t.inflight += delta
-            self.t.bump()
+            self.t.activity(self.owner, delta)
+            # +1 makes no waiter predicate true; a -1 to zero is observed by
+            # the inflight poll, and error-path -1 is followed by _fail.
+            self.t.bump() if not self.t._in_mem else None
 
     def _fail(self, layer: int, node: int, exc: BaseException, key) -> None:
         """Record one node-wide error for this generation; every rank of the
@@ -909,18 +1276,13 @@ class _RankRun:
             self.t.mark_touched((layer, node))
             self.t.bump()
 
-    def _ack(self, layer: int, node: int, key, piece) -> None:
-        with self.t.cond:
-            self.t.node(layer, node).ack(key, piece)
-            self.t.mark_touched((layer, node))
-            self.t.bump()
-
 
 @dataclass(eq=True)
 class _CacheRange(RangeFromComputeView):
     """Internal cache address; public byte-range fields remain unchanged."""
 
     cache_node: int = 0
+    source_identity: Any = None
 
 
 def _cache_range(key, node: int) -> RangeFromComputeView:
@@ -934,7 +1296,8 @@ def _crange(key) -> RangeFromComputeView:
 def _run_cached(rank: int, chain, storage_session_view) -> None:
     from .propagation import cache_layers
 
-    table = _slots(chain)
+    identity = storage_session_view.data_accessor.cache_identity()
+    table = _slots(chain, identity)
     if rank not in table.plan.ranks:
         raise invalid("rank", f"rank {rank} not in read-chain ranks {table.plan.ranks}")
     _RankRun(table, rank, cache_layers(chain), storage_session_view, chain.dst).run()
@@ -958,10 +1321,16 @@ def _run_one_concrete(rank: int, chain) -> None:
     assert session is not None
     try:
         view = _session_view(storage, session)
+        identity_of = getattr(view.data_accessor, "cache_identity", lambda: None)
+        identity = identity_of()
         if plan is not None:
             _copy(plan, view, chain.dst)
         else:
             _run_cached(rank, chain, view)
+        if identity != identity_of():
+            raise check_failed(
+                "cache_source_changed", "source file changed during load"
+            )
     except BaseException:
         _cleanup(session, "finish")
         raise

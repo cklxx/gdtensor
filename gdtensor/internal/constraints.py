@@ -26,32 +26,46 @@ def _err(obj, constraint: str, msg: str):
     )
 
 
-def _recurse(value: Any):
+def _recurse(value: Any, seen: set):
     if value is None or isinstance(value, (int, float, str, bytes, bool)):
         return Ok(None)
     if isinstance(value, (list, tuple)):
-        return _recurse_values(value)
+        return _recurse_values(value, seen)
     if isinstance(value, dict):
-        return _recurse_values(value.values())
+        return _recurse_values(value.values(), seen)
     if isinstance(value, Box):
-        return _recurse(value.value)
+        return _recurse(value.value, seen)
     if dataclasses.is_dataclass(value) and type(value).__name__ in _DATA_TYPES:
-        return value.check_constraints()
+        return _check_dataclass(value, seen)
     return Ok(None)  # opaque payload (callable, accessor, torch tensor)
 
 
-def _recurse_values(values):
+def _recurse_values(values, seen):
     for value in values:
-        result = _recurse(value)
+        result = _recurse(value, seen)
         if type(result) is Err:
             return result
     return Ok(None)
 
 
-def check_constraints(obj: Any):
-    """Validate a data object and everything it contains. Returns Result[None]."""
+def _check_dataclass(obj: Any, seen: set):
+    """Validate one dataclass once per root traversal.
+
+    Layout entries deliberately share one immutable mesh-list object. Without
+    memoization the shared object is revalidated once per entry, which is
+    quadratic in tensors x ranks. The constraint read pass never mutates, so
+    a shared instance has the same answer at every visit.
+    """
+    oid = id(obj)
+    if oid in seen:
+        return Ok(None)
+    seen.add(oid)
+    # Honor an instance-level override (tests inject a failing check).
+    overridden = vars(obj).get("check_constraints")
+    if callable(overridden):
+        return overridden()
     for f in dataclasses.fields(obj):
-        r = _recurse(getattr(obj, f.name))
+        r = _recurse(getattr(obj, f.name), seen)
         if type(r) is Err:
             return r
     hook = _EXTRA.get(type(obj).__name__)
@@ -60,6 +74,11 @@ def check_constraints(obj: Any):
         if r is not None:
             return r
     return Ok(None)
+
+
+def check_constraints(obj: Any):
+    """Validate a data object and everything it contains. Returns Result[None]."""
+    return _check_dataclass(obj, set())
 
 
 # ------------------------------------------------------------------ extra checks (B.2.4)

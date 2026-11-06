@@ -275,7 +275,7 @@ def test_safetensors_direct_vs_cached_source_reads(tmp_path):
     assert cached_bytes < direct_bytes
 
 
-def test_dcp_session_open_full_reads_per_rank(tmp_path, monkeypatch):
+def test_dcp_only_filler_sessions_load_full_source(tmp_path, monkeypatch):
     st, layout, _path = _save_real(tmp_path, "distcp")
     sv, io = _load_view(tmp_path, st, layout, "distcp")
     dst_mem, cv = _compute_dst()
@@ -285,7 +285,7 @@ def test_dcp_session_open_full_reads_per_rank(tmp_path, monkeypatch):
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=K
     )
 
-    # Count real torch DCP loads: one per rank session open.
+    # Opening sessions does not load payload; only actual fillers load DCP.
     import gdtensor_sim.dcp_backend as dcp_backend
 
     calls = {"n": 0}
@@ -297,5 +297,5 @@ def test_dcp_session_open_full_reads_per_rank(tmp_path, monkeypatch):
 
     monkeypatch.setattr(dcp_backend, "_real_dcp_load", counting_load)
     _run_concurrent(chain, dst_mem, cache_mem)
-    assert calls["n"] == WORLD  # full load per rank, not deduped by the cache
+    assert calls["n"] == len(NODES)  # only filler sessions load the source
     _assert_delivery(dst_mem)
