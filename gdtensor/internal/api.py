@@ -247,13 +247,15 @@ class _NodeState:
             self.slots[s.key]["owed"] = s.owed()
         return True
 
-    def ack(self, key, piece) -> None:
+    def ack(self, key, piece) -> bool:
         slot = self.slots.get(key)
         if slot is None:
             raise check_failed("cache_ack", f"segment {key} released before {piece}")
         slot["owed"].discard(piece)
         if not slot["owed"]:
             self.release(key)
+            return True
+        return False
 
     def fail(self, exc: BaseException, key) -> None:
         if key is not None:
@@ -270,6 +272,11 @@ class _NodeState:
 class _SlotTable:
     """In-process coordinator for one concrete chain: one lock, one version."""
 
+    # One process's threads share this table; the file table sets this False so
+    # every state change is persisted. Threads can skip a notify when a change
+    # makes no waiter predicate true (see bump's whitelist in the call sites).
+    in_memory = True
+
     def __init__(self, plan, key: str | None = None) -> None:
         self.plan = plan
         self.key = key
@@ -284,6 +291,10 @@ class _SlotTable:
 
     def node(self, layer: int, node: int) -> _NodeState:
         return self.nodes[(layer, node)]
+
+    @property
+    def _in_mem(self) -> bool:
+        return getattr(self, "in_memory", False)
 
     def bump(self) -> None:
         self.version += 1
@@ -416,6 +427,13 @@ class _FileSlotTable:
         self.cond = _FileCond(self)
         self._reacquire()
         self._drop()  # load the initial state, then release both locks
+
+    # File state is persisted on bump, so no notify may be skipped.
+    in_memory = False
+
+    @property
+    def _in_mem(self) -> bool:
+        return getattr(self, "in_memory", False)
 
     def node(self, layer: int, node: int) -> _NodeState:
         return self.nodes[(layer, node)]
@@ -821,6 +839,104 @@ class _RankRun:
         self.t.bump()
         return True
 
+    def _classify_drains(self, pending) -> list:
+        """Return the drainable pieces of pending, in pending order.
+
+        One lock pass finds pieces already filled; cache probes run outside
+        the lock; one more lock pass seals any probed hits. This replaces a
+        per-piece lock probe for every pending piece of the rank.
+        """
+        with self.t.cond:
+            ready, probe_keys = self._drain_scan(pending)
+        segs = self._probe_drain_bytes(probe_keys)
+        if not segs:
+            return [piece for piece in pending if piece in ready]
+        with self.t.cond:
+            sealed = self._seal_drains(segs)
+        return [
+            piece
+            for piece in pending
+            if piece in ready or (piece[0], piece[1]) in sealed
+        ]
+
+    def _drain_scan(self, pending):
+        """Split pending into filled pieces and (node, key) probe candidates.
+
+        The caller holds the table lock. Each (node, key) is probed at most
+        once per scan, and keys already known absent are not probed again.
+        """
+        ready = {
+            piece
+            for piece in pending
+            if self._slot_filled(self.last, piece[0], piece[1])
+        }
+        seen = set()
+        probe_keys = []
+        for piece in pending:
+            self._collect_probe(piece, ready, seen, probe_keys)
+        return ready, probe_keys
+
+    def _collect_probe(self, piece, ready, seen, probe_keys) -> None:
+        node_key = (piece[0], piece[1])
+        if piece in ready or node_key in seen:
+            return
+        seen.add(node_key)
+        if (self.last, piece[0], piece[1]) not in self._absent:
+            probe_keys.append(node_key)
+
+    def _probe_drain_bytes(self, keys) -> list:
+        """Probe the last cache layer for (node, key) pairs, lock-free."""
+        if self.source_identity is None:
+            return []
+        acc = self.caches[self.last].data_accessor
+        segs = []
+        for node, key in keys:
+            self._probe_one(node, key, acc, segs)
+        return segs
+
+    def _probe_one(self, node, key, acc, segs) -> None:
+        seg = self.plan.segments[self.last][node][key]
+        if self.source_identity != self.storage.data_accessor.cache_identity():
+            raise check_failed(
+                "cache_source_changed", "source file changed during load"
+            )
+        if not acc.has_bytes(self._range(seg.key, node)):
+            self._absent.add((self.last, node, key))
+            return
+        segs.append(seg)
+
+    def _seal_drains(self, segs) -> set:
+        """Seal probed segments; the caller holds the table lock.
+
+        Re-checks each segment under the lock, because another rank may have
+        reserved it between the probe and this pass. Returns the (node, key)
+        pairs that are now drainable; bumps once if anything changed.
+        """
+        sealed = set()
+        changed = []
+        for seg in segs:
+            self._seal_one(seg, sealed, changed)
+        for node in dict.fromkeys(changed):
+            self.t.mark_touched((self.last, node))
+        if changed:
+            # A sealed segment makes drain predicates true: always bump.
+            self.t.bump()
+        return sealed
+
+    def _seal_one(self, seg, sealed, changed) -> None:
+        state = self.t.node(self.last, seg.node)
+        slot = state.slots.get(seg.key)
+        filled = seg.key in state.completed or bool(slot and slot["filled"])
+        if filled:
+            sealed.add((seg.node, seg.key))
+            return
+        if slot is not None or not state.reserve([seg]):
+            return
+        state.slots[seg.key]["filled"] = True
+        state.completed.add(seg.key)
+        sealed.add((seg.node, seg.key))
+        changed.append(seg.node)
+
     def _wait_cohort(self) -> None:
         """Wait for missing consumers of a node whose budget cannot hold the
         whole demand. After the wait limit this is a clear error, not a hang."""
@@ -891,7 +1007,8 @@ class _RankRun:
         with self.t.cond:
             _ = [self._dec(ln) for ln in self.gens]
             self.t.finish(self.owner)
-            self.t.bump()
+            # Leaving changes no waiter predicate for threads (join bumps).
+            self.t.bump() if not self.t._in_mem else None
 
     def _dec(self, ln) -> None:
         self.t.node(*ln).active -= 1
@@ -908,11 +1025,7 @@ class _RankRun:
 
     def _step(self, pending: list) -> bool:
         """Drain every filled piece; else fill one segment. True on progress."""
-        done = [
-            p
-            for p in pending
-            if self._adopt(self.last, p[0], p[1]) or self._filled(self.last, p[0], p[1])
-        ]
+        done = self._classify_drains(pending)
         for piece in done:
             self._drain(piece)
             pending.remove(piece)
@@ -1042,7 +1155,9 @@ class _RankRun:
             state.check(self.gens[(layer, node)])
             ok = state.reserve(segs)
             self.t.mark_touched((layer, node))
-            self.t.bump() if ok else None
+            # A reserve makes no waiter predicate true for threads; the
+            # fill completion that follows it bumps.
+            self.t.bump() if ok and not self.t._in_mem else None
         return ok
 
     def _parents_ready(self, layer: int, node: int, seg) -> bool:
@@ -1086,19 +1201,23 @@ class _RankRun:
             self._fail(layer, node, exc, seg.key)
             raise
         with self.t.cond:
-            self.t.node(layer, node).slots[seg.key]["filled"] = True
-            self.t.node(layer, node).completed.add(seg.key)
+            state = self.t.node(layer, node)
+            state.slots[seg.key]["filled"] = True
+            state.completed.add(seg.key)
             self.t.activity(self.owner, -1)
             self.t.mark_touched((layer, node))
+            self._ack_parents_locked(layer, node, seg) if layer > 0 else None
+            # Fill completion makes fill/drain predicates true: always bump.
             self.t.bump()
-        if layer > 0:
-            self._ack_parents(layer, node, seg)
 
-    def _ack_parents(self, layer: int, node: int, seg) -> None:
+    def _ack_parents_locked(self, layer: int, node: int, seg) -> None:
+        """ACK this fill's parent pieces; the caller holds the table lock."""
         pnode = self.plan.parent[layer][node]
+        pstate = self.t.node(layer - 1, pnode)
         consumer = ("seg", layer, node, seg.key)
         for pkey, off, size in seg.parents:
-            self._ack(layer - 1, pnode, pkey, (consumer, off, size))
+            pstate.ack(pkey, (consumer, off, size))
+        self.t.mark_touched((layer - 1, pnode))
 
     def _source_bytes(self, layer: int, seg) -> bytes:
         if layer == 0:
@@ -1127,8 +1246,17 @@ class _RankRun:
             self._inflight(-1)
             self._fail(self.last, node, exc, None)
             raise
-        self._inflight(-1)
-        self._ack(self.last, node, key, (("rank", self.rank), off, size))
+        with self.t.cond:
+            self.t.activity(self.owner, -1)
+            released = self.t.node(self.last, node).ack(
+                key, (("rank", self.rank), off, size)
+            )
+            self.t.mark_touched((self.last, node))
+            # Bump only when a waiter predicate can change: a slot release,
+            # or the last in-flight unit finishing. Other ACKs change no
+            # predicate (waiters read version and inflight only).
+            gated = not self.t._in_mem or released or self.t.inflight == 0
+            self.t.bump() if gated else None
 
     def _inflight(self, delta: int) -> None:
         """Mark a fill or drain as in flight: waiting peers treat in-flight
@@ -1136,19 +1264,15 @@ class _RankRun:
         in another process observes it."""
         with self.t.cond:
             self.t.activity(self.owner, delta)
-            self.t.bump()
+            # +1 makes no waiter predicate true; a -1 to zero is observed by
+            # the inflight poll, and error-path -1 is followed by _fail.
+            self.t.bump() if not self.t._in_mem else None
 
     def _fail(self, layer: int, node: int, exc: BaseException, key) -> None:
         """Record one node-wide error for this generation; every rank of the
         generation that reads this node raises the same error object."""
         with self.t.cond:
             self.t.node(layer, node).fail(exc, key)
-            self.t.mark_touched((layer, node))
-            self.t.bump()
-
-    def _ack(self, layer: int, node: int, key, piece) -> None:
-        with self.t.cond:
-            self.t.node(layer, node).ack(key, piece)
             self.t.mark_touched((layer, node))
             self.t.bump()
 
