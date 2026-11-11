@@ -353,12 +353,19 @@ class _DcpAccessor(DTensorDataAccessor):
         index: PayloadIndex,
         stage: _Stage,
         full: Dict[str, object] | None = None,
+        load_full=None,
+        identity=None,
     ):
         self.mode = mode
+        self.load_full = load_full
+        self.identity = identity
         self.index = index
         self.stage = stage
         self.full: Dict[str, object] = full if full is not None else {}
         self._owned: Dict[TensorComponentPos, np.ndarray] = {}
+
+    def cache_identity(self) -> object | None:
+        return self.identity() if self.identity is not None else None
 
     def _owned_linear(self, pos: TensorComponentPos) -> np.ndarray:
         if pos not in self._owned:
@@ -371,9 +378,13 @@ class _DcpAccessor(DTensorDataAccessor):
         path = self.stage.path(slot.pos)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.stage.ensure_capacity(slot, path)
+        from .file_cache import pwrite_all
+
         fd = os.open(path, os.O_WRONLY)
-        os.pwrite(fd, data, rel)
-        os.close(fd)
+        try:
+            pwrite_all(fd, data, rel)
+        finally:
+            os.close(fd)
 
     @catch
     def write_from_buffer(self, global_range, write_from_buffer) -> None:
@@ -394,6 +405,8 @@ class _DcpAccessor(DTensorDataAccessor):
         from .access import call_buffer_callback
 
         slot, rel = _resolve_slot(self.index, global_range)
+        if not self.full and self.load_full is not None:
+            self.full = self.load_full()
         owned = self._owned_linear(slot.pos)
         n = global_range.size // slot.itemsize
         start = rel // slot.itemsize
@@ -520,13 +533,16 @@ class DcpLoadSession(StorageLoadSession):
             msg = "distcp checkpoint is incomplete: .metadata missing"
             raise io_error("open", msg, root)
         self.stage = _stage_for(root)
-        try:
-            self.full = _real_dcp_load(table, root)
-        except BaseException as exc:  # noqa: BLE001
-            raise io_error("read", f"real DCP load failed: {exc}", root) from None
+        self.full = None
         # Real raw byte offset of each tensor's payload inside the torch-written
         # ``.distcp`` archive, resolved by parsing the sub-archive zip structure.
-        self.offsets = _raw_payload_bases(root)
+        self._offsets = None
+
+    @property
+    def offsets(self):
+        if self._offsets is None:
+            self._offsets = _raw_payload_bases(self.root)
+        return self._offsets
 
     def _raise_missing_slot(self, pos):
         known_ids = {nd.global_tensor_id for nd in self.table.named_d_tensors}
@@ -539,11 +555,41 @@ class DcpLoadSession(StorageLoadSession):
         )
         raise invalid("file_offset", msg)
 
+    def cache_identity(self):
+        import pickle
+
+        from .access import _file_identity
+
+        with open(os.path.join(self.root, ".metadata"), "rb") as handle:
+            metadata = pickle.load(handle)
+        names = set(self.index.files)
+        names.update(sd.relative_path for sd in metadata.storage_data.values())
+        names.add(".metadata")
+        paths = [os.path.join(self.root, p) for p in names]
+        return tuple(_file_identity(p) for p in sorted(paths))
+
+    def _load_full(self):
+        if self.full is None:
+            self.full = self._load_checked()
+        return self.full
+
+    def _load_checked(self):
+        try:
+            return _real_dcp_load(self.table, self.root)
+        except BaseException as exc:
+            raise io_error("read", f"real DCP load failed: {exc}", self.root) from None
+
     @catch
     def init_data_accessor(self):
         if self.state != "open":
             raise invalid("session", f"init_data_accessor on {self.state} session")
-        return _DcpAccessor("load", self.index, self.stage, self.full)
+        return _DcpAccessor(
+            "load",
+            self.index,
+            self.stage,
+            load_full=self._load_full,
+            identity=self.cache_identity,
+        )
 
     @catch
     def get_file_offset(self, pos):

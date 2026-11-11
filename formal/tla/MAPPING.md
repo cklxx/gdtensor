@@ -1,118 +1,54 @@
-# Formal TLA+ models — mapping to `gdtensor/internal/`
+# Formal models — runtime mapping and scope
 
-This document is the field-by-field and transition-by-transition correspondence
-between the TLA+ models and the implementation, plus the explicit assumptions
-under which the models are claimed. Each model is a *bounded projection*, not a
-proof of the whole Python.
+Each model is a bounded projection, not a proof of the whole Python runtime.
+Only `CachePropagation.tla` has a current runtime mapping in this document.
+`SlotLifecycle.tla` and the Lean coverage predicate are legacy design models;
+their scope is stated explicitly below.
 
-- `SlotLifecycle.tla` covers the cohort/error lifecycle of one cache node.
-- `CachePropagation.tla` covers the node-level propagation plan: byte-budget
-  admission, parent/child order, and release after every owed ack.
+## Runtime source pins
 
-Pinned runtime baseline:
 - `gdtensor/internal/api.py`
-  `sha256 416609763880c3e2415bf9b9bfb334233150d001000ae33e1222c88d23726cb4`.
+  `sha256 5ef2460bbcda6731ecaa120a20ef4c75ef8240e1711360af03b8d7511e4f0b61`.
 - `gdtensor/internal/propagation.py`
   `sha256 db555b6f0d4333c59ba00d0bcad82414ae380c88627c45c7fcec8d1d1f8ff8ad`.
-Current source hashes are recorded by `scripts/formal_gate.sh` in its
-generated manifest.
 
-## Field map
+`scripts/formal_gate.sh` fails if either pin differs from the checked-out file.
+It also records both hashes in its generated manifest. A hash match verifies
+the documented baseline; it does not prove that the Python implements a model.
 
-| api.py (`_NodeState` / slot)            | model field                          |
-|-----------------------------------------|--------------------------------------|
-| `slots[key]`, key = `(tid,off,size)`    | `slots[n][k]` (k ∈ Keys)             |
-| `live`                                  | `live[n]`                            |
-| `cap`                                   | constant `Cap`                       |
-| `consumers`                             | constant `Consumers`                 |
-| `error` / `error_gen`                   | `nerr[n]` / `nerrgen[n]`             |
-| `gen`                                   | `gen[n]`                             |
-| `active`                                | `active[n]`                          |
-| `cohort_joined`                         | `joined[n]`                          |
-| slot `filled`                           | `slots[..].filled`                   |
-| slot `error` / `error_gen`              | `slots[..].err` / `errgen`           |
-| slot `required` (rank→intervals)        | `slots[..].required` (set of rec)    |
-| slot `cov` (rank→acked intervals)       | `slots[..].cov` (rank→set of iv)     |
-| (latch) recorded node failure            | `failed_gen[n]`                      |
+## Legacy bounded models
 
-## Transition map
+`SlotLifecycle.tla` checks an abstract capacity, cohort, node-error and ACK
+lifecycle. It does not map field-by-field to the current `_NodeState`. Current
+runtime tracks resident bytes, a completed set and exact outstanding `owed`
+pieces. It has no `_covers` predicate, per-slot `required`/`cov` maps, or the
+legacy `generation_start`, `begin_fill`, `finish_fill` and `ack_drain` methods.
+The model's positive invariants, negative mutants and bounded liveness results
+apply only to the abstract model.
 
-| api.py                                            | model step                       |
-|---------------------------------------------------|----------------------------------|
-| `generation_start` / `_cohort_join`               | `JoinCohort(n,r)`                |
-| `generation_end`                                   | `EndCohort(n)`                   |
-| `begin_fill` / `_begin_decision/_begin_existing`  | `BeginFill(n,k)`                 |
-| `finish_fill` / `_apply_finish`                   | `FinishFill(n,k,TRUE|FALSE)`      |
-| `set_expected`                                     | `SetExpected(n,k)`                |
-| `ack_drain` / `_covers`                           | `AckDrain(n,k,r,iv)`             |
+`formal/lean/Coverage.lean` proves properties of a legacy single-spanning
+interval predicate and ideal interval-union coverage. Current
+`_NodeState.ack` discards exact `(consumer, offset, size)` pieces from `owed`.
+The Lean predicate is not the current production ACK predicate.
 
-Faithful notes:
-- A failed slot stays in `slots` but `live` is decremented at failure time
-  (`_apply_finish`); the model counts a slot toward `live` unless it is a
-  filled-error slot (`CountsTowardLive`).
-- `ack_drain` is guarded to a filled-healthy slot: in-gen a failed slot raises at
-  `wait_filled`, and next-gen `begin_fill` replaces it before any drain, so the
-  `ack_drain` code path never runs against an error slot.
-- A cohort advances (gen+1, error cleared) only when `active=0` and every consumer
-  has joined; a late same-cohort rank still observes the existing node error.
-- `failed_gen` is a model latch, reset on cohort advance; it exists only to state
-  `FailureBroadcast`.
-
-## Safety invariants (normal cfgs must satisfy all)
-
-- `CapacityBound`      — `live[n] <= Cap`.
-- `NoEarlyRelease`      — a healthy slot is released only after every required
-                         (rank,interval) is acked.
-- `NodeIsolation`      — `live[n]` equals exactly n's live-counting slots; a node
-                         error is recorded on the node that failed.
-- `GenerationIsolation` — a node error belongs to exactly one generation; a newer
-                         cohort does not observe it.
-- `FailureBroadcast`    — a recorded node failure actually broadcasts node-wide.
-
-## Negative mutants (expected to be caught)
-
-| `MUTANT`      | models bug                                   | caught by            |
-|---------------|----------------------------------------------|----------------------|
-| `no_cap`      | begin_fill ignores the C bound               | `CapacityBound`      |
-| `early_release` | delete slot on first ack, not all required | `NoEarlyRelease`     |
-| `node_alias`  | a second node's fill bumps node 0's counter  | `NodeIsolation`      |
-| `stale_gen`   | gen advance forgets to clear the node error  | `GenerationIsolation`|
-| `no_broadcast`| failure only marks the slot, not the node    | `FailureBroadcast`    |
-
-## Bounded liveness (NOT claimed unconditionally)
-
-`LiveGoal == \A n,k : [](Occupied(n,k) => <>(slots[n][k].gone))` is a per-slot
-leads-to: once a slot is filled-healthy AND its expected set has been published
-(`required # {}`, mirroring `_drain_cell` calling `set_expected` before any
-read/ack), it must eventually be released. The old global `<>(live=0)` was
-vacuous at init and is removed.
-
-Checked only under `FairSpec`, which assumes: weak fairness on cohort join/end,
-on `BeginFill(n,0)`, on `SetExpected(n,k)`, on `FinishFill(n,k,TRUE)`, and on
-every `AckDrain(n,k,r,iv)` for `r in AckRanks`; fills succeed (`AllowFail=FALSE`).
-A config that omits a required rank from `AckRanks` (partial peer down) keeps
-the slot occupied forever and TLC **does** return a temporal counterexample
-(exit 13) — that boundary is reproduced, not papered over.
-
-Scope note: the model's `cov`/`required` abstracts `_covers` as a set of
-(rank,interval) pairs; it does NOT claim to model the real single-spanning
-interval condition of the production path. It checks the cell-contract shape
-(coverage set empties only when every expected pair is acked) under the bounded
-grid here, not a proof of the Python.
+These files remain checked as mathematical regression models. They are not
+source-level evidence for the current slot and ACK implementation. Current
+runtime behavior is covered by the Python contract, coordination, mutation and
+fault-injection tests listed in `tests/README.md`.
 
 ---
 
-# CachePropagation.tla — mapping to `propagation.py` + `api.py`
+# CachePropagation.tla — current runtime mapping
 
-The fixed instance is the two-layer fan-out fixed by this change: layer 0 is
-node 0 with one 8-byte segment; terminal nodes 1 and 2 each own one 4-byte
-segment and both read the layer-0 segment.
+The fixed instance is a two-layer fan-out: layer 0 is node 0 with one 8-byte
+segment; terminal nodes 1 and 2 each own one 4-byte segment and both read the
+layer-0 segment.
 
 ## Plan field map (`internal/propagation.py`)
 
 | plan / executor concept                  | model element                     |
 |------------------------------------------|-----------------------------------|
-| `ChainPlan.nodes` / segments per node    | `Nodes`, one segment per node     |
+| `ChainPlan.layer_nodes` / segments per node | `Nodes`, one segment per node  |
 | segment byte size                        | `SegSize[n]`                      |
 | `ChainPlan.budget` byte bound            | `Budget[n]`                       |
 | parent edges (`Segment.parents`)         | `Edges[n]` (constant `A`)         |
@@ -133,13 +69,33 @@ counterpart.
 
 | executor (`api.py`)                                  | model step          |
 |------------------------------------------------------|---------------------|
-| `_NodeState.admit` byte-budget check                 | `Admit(n)`          |
-| fill job completes (`slots[k]["filled"]=True`)       | `Fill(n,TRUE)`      |
-| `_SlotTable._ack` rank piece                         | `RankAck(n)`        |
-| segment released after owed set empties              | `ReleaseTerminal(n)`|
-| child ack of a parent edge                           | `AckEdge(n)`        |
-| parent released after every child acked              | `ReleaseParent`     |
-| `_fail_node` generation error                        | `Fill(n,FALSE)`     |
+| `_NodeState.admit` / `reserve` byte-budget admission | `Admit(n)`          |
+| `_RankRun._fill` marks a slot filled                 | `Fill(n,TRUE)`      |
+| `_adopt` / `_seal_one` accept valid presence         | `Fill(n,TRUE)`      |
+| `_RankRun._drain` / `_NodeState.ack` rank piece      | `RankAck(n)`        |
+| `_NodeState.ack` releases when `owed` is empty       | `ReleaseTerminal(n)`|
+| `_RankRun._ack_parent` child ACK of a parent piece   | `AckEdge(n)`        |
+| parent released after every child ACK                | `ReleaseParent`     |
+| `_RankRun._fail` / `_NodeState.fail` node error      | `Fill(n,FALSE)`     |
+
+The model's `owe` and `rem` sets are bounded projections of exact runtime ACK
+pieces. The model does not represent batched reads, presence probes, in-flight
+owner accounting, file locks or fingerprint sharing. Those paths require the
+runtime tests; the formal gate does not claim to verify them.
+
+## File-identity and integrity scope
+
+The finite models do not represent pathname/stat changes, checksum algorithms,
+short writes, or physical storage. These are enforced by accessor code and
+negative tests. `cache_identity` is backend-derived; callers supply no version.
+Cache ranges bind `source_identity`. Unknown source identity disables cross-call
+adoption. File mutation during load returns Err; destination rollback is not
+claimed. Metadata/stat identity detects ordinary changes, not adversarial
+metadata forgery. `DiskNodeCache` verifies SHA256 before consumer callbacks.
+The mutation suite removes these checks to prove the corresponding tests fail.
+
+Active slot admission is the modeled byte budget. Persistent valid file ranges
+and callback temporary buffers are distinct metrics and are not that budget.
 
 ## DN fill ownership
 
@@ -149,7 +105,7 @@ The helper remains in its execution closure until its service work completes.
 The runtime's completed set prevents released segments from being filled again
 within one generation. The public cache-subset constraint remains unchanged.
 
-`CachePropagation.tla` now records the rank that performs `Fill(n, rank, ok)`.
+`CachePropagation.tla` records the rank that performs `Fill(n, rank, ok)`.
 Its bounded instance has one rank per node, so `FillOnDN` requires `rank = n`.
 The `remote_fill` mutant relaxes that guard and must violate `FillOnDN`.
 This model verifies placement only for that bounded instance. Python service
@@ -193,8 +149,8 @@ not waited on forever.
 Scope: one fixed fan-out instance, one segment per node, one byte size per
 segment. Cross-process coordination is a real implementation
 (`_FileSlotTable`, selected by `GDTENSOR_CACHE_COORDINATOR`), but the model
-still projects it away: it checks the shared in-memory table contract shape,
-not file locking. The adversarial fixes sit at these layers:
+projects it away: it checks the shared in-memory table contract shape, not file
+locking. Related runtime constraints are:
 
 - Cell budget sums every tensor of a (step, slot) cell: `_budget` keys cells by
   `(s, c)` and sums segment bytes over all tensors, so `ByteBudget` compares
@@ -204,7 +160,7 @@ not file locking. The adversarial fixes sit at these layers:
 - In-flight fills count as progress: `_block` keeps waiting while `inflight > 0`
   even when the version is unchanged (a timeout detail, outside the model).
 - The plan cache holds weak references only: `_slots` registers
-  `weakref.finalize(view, _drop_table, key)` so a `ChainPlan` never pins a cache
+  `weakref.finalize(view, _drop_table, ...)` so a `ChainPlan` never pins a cache
   view (lifetime, outside the model).
 - `check_constraints` rejects mixed node sets and out-of-range ranks up front
   (`ConstraintViolationError` / `InvalidArgumentError`); `CacheDTensorsView` is

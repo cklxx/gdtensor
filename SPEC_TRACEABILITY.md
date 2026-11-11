@@ -65,5 +65,5 @@
 
 - 真实多机（>1 node）未测；单机 gloo 2-rank + LAWA 2-32 进程历史覆盖。
 - DCP 跨 chunk 单 pos 不支持 single base offset（返回 InvalidArgumentError）；公开 `rank_load` 经 official reader 全量正确。
-- 缓存协调器默认在进程内（线程）；多进程需实现同一契约的协调器，未提供，也未做多机测试。见 `docs/decisions-2026-10-29.md`。
+- 缓存协调器默认使用共享文件与 `flock`，另有 thread 模式；已有单机多进程测试，多机未测。进程退出检测使同一 chain 的旧协调状态永久报错，需停止旧调用后更换协调目录重试，不自动修复缓存。混合协议版本、网络分区、文件系统阻塞和活进程永久阻塞不在退出检测保证范围内。
 

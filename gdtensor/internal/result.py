@@ -109,6 +109,26 @@ class Fail(Exception):
         self.error = error
 
 
+def as_error(exc: BaseException):
+    """Convert an exception to the public Error returned by @catch."""
+    if isinstance(exc, Fail):
+        return exc.error
+    if isinstance(exc, OSError):
+        return GDTensorIOError(
+            file_path=getattr(exc, "filename", None),
+            operation="io",
+            msg=f"{type(exc).__name__}: {exc}",
+        )
+    if isinstance(exc, Exception):
+        return GDTensorIOError(
+            file_path=None,
+            operation="internal",
+            msg=f"{type(exc).__name__}: {exc}",
+        )
+    name = type(exc).__name__
+    return CheckFailedError(check_name=name, msg=str(exc) or name)
+
+
 # ------------------------------------------------------------------ raise helpers
 
 
@@ -161,24 +181,8 @@ def catch(fn: Callable[..., Any]) -> Callable[..., Any]:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             out = fn(*args, **kwargs)
-        except Fail as exc:
-            return Err(exc.error)
-        except OSError as exc:
-            return Err(
-                GDTensorIOError(
-                    file_path=getattr(exc, "filename", None),
-                    operation="io",
-                    msg=f"{type(exc).__name__}: {exc}",
-                )
-            )
         except Exception as exc:  # noqa: BLE001
-            return Err(
-                GDTensorIOError(
-                    file_path=None,
-                    operation="internal",
-                    msg=f"{type(exc).__name__}: {exc}",
-                )
-            )
+            return Err(as_error(exc))
         if type(out) in (Ok, Err):
             return out
         return Ok(out)

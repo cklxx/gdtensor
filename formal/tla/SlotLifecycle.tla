@@ -1,35 +1,20 @@
 ---- MODULE SlotLifecycle ----
 (* ===========================================================================
-   Model of the gdtensor cached-copy slot lifecycle in gdtensor/internal/api.py.
+   Legacy bounded model of a cache-slot lifecycle.
 
-   This model is a faithful, *deliberately small* projection of _NodeState,
-   _SlotTable and executeChain/_drain_cell/_recurse. It maps ONE implementation
-   field to ONE model field and ONE implementation transition to ONE model step.
-   It is NOT a proof that the Python is correct: it checks the named safety
-   invariants over the bounded interleavings enumerated here, and it is paired
-   with an independent public-API repro (not this model) for any bug found.
+   This model checks an abstract capacity, cohort, node-error and ACK contract.
+   It is not a field-level model of the current gdtensor/internal/api.py.
+   Current _NodeState tracks resident bytes, completed segments and exact
+   outstanding owed pieces; it has no _covers interval predicate or the legacy
+   generation_start, begin_fill, finish_fill and ack_drain methods.
 
-   Field map (api.py : SlotLifecycle):
-     _NodeState.slots[key]            slots[n][k]            key=(tid,off,size)
-     _NodeState.live                  live[n]                resident slot count
-     _NodeState.cap                   Cap                    concurrency width C
-     _NodeState.consumers              Consumers              ranks per node
-     _NodeState.error / error_gen     nerr[n] / nerrgen[n]   node-wide primary error
-     _NodeState.gen                   gen[n]                 cohort generation
-     _NodeState.active                active[n]              ranks inside cohort
-     _NodeState.cohort_joined         joined[n]              ranks joined this cohort
-     slot.filled                      slots[..].filled
-     slot.error / error_gen           slots[..].err / errgen
-     slot.required  rank->intervals   slots[..].required     set of (rank,iv)
-     slot.cov       rank->acked ivs   slots[..].cov          rank -> set of iv
+   The model retains its own fields and transitions:
+     slots, live, Cap, Consumers, nerr/nerrgen, gen, active, joined
+     JoinCohort, EndCohort, BeginFill, FinishFill, SetExpected, AckDrain
 
-   Transition map:
-     generation_start/_cohort_join    JoinCohort
-     generation_end                   EndCohort
-     begin_fill/_begin_*              BeginFill
-     finish_fill/_apply_finish        FinishFill(ok|fail)
-     set_expected/_set_expected_locked SetExpected
-     ack_drain/_covers                AckDrain
+   It is NOT a proof that the Python is correct. It checks the named safety
+   invariants over the bounded interleavings enumerated here. Runtime behavior
+   is covered by separate public-API and fault-injection tests.
 
    MUTANT selects a deliberately broken variant used ONLY by the negative
    self-test cfgs; normal cfgs use MUTANT="none". Each mutant must be caught by
@@ -86,7 +71,7 @@ NewSlot(n, k) ==
                 + IF MUTANT = "node_alias" /\ n2 = 0 /\ n # 0 THEN 1 ELSE 0]
   /\ UNCHANGED <<nerr, nerrgen, gen, active, joined, failed_gen>>
 
-(* ---- cohort join / end (generation_start/_cohort_join, generation_end) ---- *)
+(* ---- model-only cohort join / end ---------------------------------------- *)
 
 JoinCohort(n, r) ==
   (* at most `consumers` ranks inside the cohort (one in-flight chain_load per
@@ -159,7 +144,7 @@ FinishFill(n, k, ok) ==
         /\ failed_gen' = [failed_gen EXCEPT ![n] = gen[n]]
         /\ UNCHANGED <<gen, active, joined>>
 
-(* ---- set_expected / ack_drain ------------------------------------------- *)
+(* ---- model-only expected-set publication and ACK ------------------------- *)
 
 SetExpected(n, k) ==
   /\ ~slots[n][k].gone /\ slots[n][k].required = {}
@@ -167,13 +152,10 @@ SetExpected(n, k) ==
   /\ UNCHANGED <<live, nerr, nerrgen, gen, active, joined, failed_gen>>
 
 AckDrain(n, k, r, iv) ==
-  (* a drain ACK happens only after a successful read of VALID bytes: a failed
-     slot raises at wait_filled in-gen and is replaced by begin_fill next-gen,
-     so ack_drain never runs against an error slot. AckRanks is the set of
-     readers that can ever ack; omitting a required rank models a dead peer.
-     In _drain_cell, set_expected runs BEFORE any read/ack, so an ack against a
-     slot whose expected set was never published is impossible in the shared
-     path: require s.required # {} here. *)
+  (* A model ACK happens only for a filled, healthy slot whose expected set
+     was published. AckRanks is the set of readers that can ever ACK; omitting
+     a required rank models a dead peer. This is an abstract model contract,
+     not a description of the current runtime's exact owed-piece ACK path. *)
   /\ r \in AckRanks
   /\ LET s == slots[n][k] IN
      /\ ~s.gone /\ s.filled /\ s.err = "none" /\ s.required # {}
@@ -214,9 +196,8 @@ NoEarlyRelease ==
     s.gone /\ s.err = "none" =>
       \A rec \in s.required : rec.iv \in s.cov[rec.rank]
 
-(* A resident slot counts against C unless its fill failed: a failed slot lingers
-   in the dict (to be drained or replaced next generation) but live already
-   decremented at failure time (api.py _apply_finish). *)
+(* A resident model slot counts against C unless its fill failed: a failed slot
+   lingers in the model dictionary but live was decremented at failure time. *)
 CountsTowardLive(n, k) ==
   /\ ~slots[n][k].gone
   /\ ~(slots[n][k].filled /\ slots[n][k].err = "e")

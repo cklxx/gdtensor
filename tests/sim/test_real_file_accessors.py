@@ -120,6 +120,35 @@ def test_file_callback_error_does_not_write_payload(tmp_path):
     _ok(session.abort())
 
 
+def test_cache_identity_does_not_open_nonlocal_shards(tmp_path, monkeypatch):
+    from gdtensor_sim.access import StorageDataAccessor
+    from gdtensor_sim._layout import PayloadIndex
+    import gdtensor_sim.iobackend as iobackend
+
+    names = {"a.safetensors", "b.safetensors"}
+    for name in names:
+        (tmp_path / name).write_bytes(name.encode())
+    io = FileIO()
+    session = SimpleNamespace(
+        rank=0,
+        abspath=lambda path: str(tmp_path / path),
+        my_files=lambda: [],
+    )
+    accessor = StorageDataAccessor(
+        cast(PayloadIndex, SimpleNamespace(files=dict.fromkeys(names))),
+        io,
+        session=session,
+    )
+
+    def unexpected_open(path, mode):
+        raise AssertionError(f"identity opened nonlocal shard {path} with {mode}")
+
+    monkeypatch.setattr(iobackend, "_open_fd", unexpected_open)
+    identity = accessor.cache_identity()
+    assert identity is not None
+    assert len(identity) == len(names)
+
+
 def test_reopened_file_short_read_returns_error_without_callback(tmp_path):
     ct, st, layout, values, points, sv, _, path = _fixture(tmp_path, "safetensors")
     _ok(gio.rank_save(0, ArrayFabric(ct, points, values).view(0), sv))
