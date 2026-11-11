@@ -17,6 +17,74 @@
 
 IO 使用 session 的 `init_data_accessor()`。自定义 accessor 不需要内部 `index` 或 `bind`。buffer 回调支持分块，读写两侧可以使用不同的分块大小。LAWA 在 `torch.DTensor` 上计算，通过顶层桥函数取出和写回张量。
 
+## 文件系统 SDK 接入
+
+默认调用不变。省略 `io` 时，`make_storage_view` 仍创建本地 POSIX `FileIO`：
+
+```python
+storage_view = make_storage_view(tensor_ids, table, layout, root, coord=coord)
+```
+
+safetensors 可以通过 `SdkFileIO` 接入外部同步文件系统 SDK。外部创建 client，并将其传给现有 `io` 入口；`rank_load`、`rank_save` 和 `chain_load` 不需要修改：
+
+```python
+from gdtensor.io import chain_load, rank_load, rank_save
+from gdtensor_sim.formats import make_storage_view
+from gdtensor_sim.iobackend import SdkFileIO
+
+client = YourFileSystemClient(endpoint="...", credentials="...")
+storage_view = make_storage_view(
+    tensor_ids,
+    table,
+    layout,
+    "sdk://bucket/job-42/checkpoint",
+    io=SdkFileIO(client),
+    coord=coord,
+)
+
+rank_load(rank, compute_view, storage_view)
+rank_save(rank, compute_view, storage_view)
+chain_load(rank, read_chain)  # read_chain 的 source 使用上述 storage_view
+```
+
+client 采用 `gdtensor_sim.iobackend.FileSystemClient` 的结构化协议，不需要继承基类：
+
+| 方法 | 必须满足的语义 |
+|---|---|
+| `metadata(key) -> (size, version)` | `version` 是非空字符串，并唯一标识不可变内容版本。不能只按路径或 size 作为版本。 |
+| `read_range(key, offset, size, version) -> bytes` | 同步读取指定版本。短读会报错，不会进入 consumer callback。 |
+| `create_staging(key, size)` | 创建或调整 staging 文件。相同 size 的重复调用不得清零已有内容；多个 rank 可以调用同一 shard。 |
+| `write_range(key, offset, data) -> int \| None` | 同步写入。返回 `None` 表示全部写完；正整数表示实际写入数。`SdkFileIO` 会处理短写，零进展会报错。 |
+| `sync(key)` | 返回前保证此前的写入已完成，并可由后续 publish 发布。 |
+| `publish(temporary_key, final_key)` | 原子发布 staging 文件。 |
+| `discard(key)` | 删除未发布文件；文件不存在时成功返回。 |
+| `close_rank(rank, prefix=None)` | 释放该 rank 的句柄。没有 rank 句柄的 client 可以实现为空操作。 |
+
+`root` 是 client 的 key 前缀。GDTensor 将 layout 中的相对文件名拼接到此前缀。所有方法必须同步；同一 client 被多个 thread rank 并发调用时，client 必须保证自身线程安全。
+
+读取时，`SdkFileIO` 固定每个 rank/shard 的首次读取版本。后续 range read 显式携带该版本，`cache_identity()` 再检查当前版本，避免身份检查与实际读取指向不同内容。ETag 只有在 SDK 明确保证其为不可变内容版本时才能使用。
+
+写入沿用现有提交顺序：
+
+```text
+各 rank 写 staging
+→ sync 并原子发布全部 shard
+→ rank barrier
+→ 可选 HF index
+→ 最后发布 .gdtensor_committed
+```
+
+普通 abort 只删除 staging。commit 结果未知时保留现场。与现有 POSIX 实现一样，同一 root 的并发 save 不受支持；需要避免新旧 shard 混合时，使用新 root，不要原地覆盖已 committed checkpoint。
+
+边界：
+
+- 当前适配仅覆盖 safetensors。向 DCP view 传 `SdkFileIO` 会明确报错；DCP 仍使用原有 Torch 后端。
+- client 必须提供 range read/write。只支持整对象 PUT 的 SDK 需要先在外部实现完整 shard staging，不能把每个 CopyPlan range 当成独立对象上传。
+- 第一阶段 `DiskNodeCache` 仍写本地盘，不随 source SDK 迁移。
+- `gdtensor_sim` 是 simulation/test harness，不是 release core API。生产框架的 builder 应在 `begin_load/begin_save` 中注入同一 backend。
+
+完整可运行的内存 client 和读写示例见 `tests/sim/test_sdk_file_io.py`。
+
 ## 测试
 
 领域、层级、用例数量、验证方式和缺口见 [测试矩阵](tests/README.md)。测试按 `core`、`io`、`checkpoint`、`torch`、`sim`、`demo` 分目录，共享 fixture 放在 `tests/support`；测试文件互不导入。

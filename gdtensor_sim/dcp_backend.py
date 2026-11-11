@@ -558,7 +558,7 @@ class DcpLoadSession(StorageLoadSession):
     def cache_identity(self):
         import pickle
 
-        from .access import _file_identity
+        from .iobackend import _file_identity
 
         with open(os.path.join(self.root, ".metadata"), "rb") as handle:
             metadata = pickle.load(handle)
