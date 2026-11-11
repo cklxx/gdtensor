@@ -47,6 +47,17 @@ cd "$ROOT"
 test -f formal/lean/check.sh && test -f formal/tla/run_tlc.sh || {
   echo "[formal] FATAL: formal entrypoints missing under $ROOT" >&2; exit 1;
 }
+check_runtime_pin() {
+  local path="$1" hash
+  hash="$(shasum -a 256 "$path" | cut -d ' ' -f1)"
+  if ! grep -A1 -F -- "- \`$path\`" formal/tla/MAPPING.md \
+    | grep -Fq -- "\`sha256 $hash\`."; then
+    echo "[formal] FATAL: stale runtime pin for $path in formal/tla/MAPPING.md" >&2
+    exit 1
+  fi
+}
+check_runtime_pin gdtensor/internal/api.py
+check_runtime_pin gdtensor/internal/propagation.py
 # Live provenance manifest: committed HEAD + its tree vs staged model tree.
 mkdir -p log/fix-df1/formal
 {
@@ -54,6 +65,7 @@ mkdir -p log/fix-df1/formal
   echo "HEAD_TREE: $HEAD_TREE"
   echo "index-tree: $(git write-tree)"
   echo "worktree: $(git rev-parse --show-toplevel)"
+  shasum -a 256 gdtensor/internal/api.py gdtensor/internal/propagation.py
   find formal scripts -name '*.sh' -o -name '*.lean' -o -name '*.tla' -o -name '*.cfg' \
     | sort | xargs shasum -a 256
 } > log/fix-df1/formal/manifest.txt

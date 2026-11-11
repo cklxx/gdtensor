@@ -12,6 +12,10 @@ class Memory(ga.DTensorDataAccessor):
     def __init__(self, data, error=None, length=None):
         self.data = np.array(data, dtype=np.uint8)
         self.error, self.length = error, length
+        self.namespace = None
+
+    def cache_namespace(self):
+        return self.namespace
 
     def _call(self, rng, callback):
         if self.error is not None:

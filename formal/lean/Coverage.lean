@@ -1,7 +1,8 @@
 /-
-ACK interval coverage: ideal union vs the production single-spanning check.
+Legacy ACK interval coverage: ideal union vs a single-spanning check.
 
-Mirrors ``gdtensor/internal/api.py`` ``NodeState._covers`` (frozen source):
+``prodCovers`` mirrors this historical Python predicate, retained here only to
+document the model's origin:
 
     @staticmethod
     def _covers(ivs, required):
@@ -9,21 +10,25 @@ Mirrors ``gdtensor/internal/api.py`` ``NodeState._covers`` (frozen source):
         return all(any(x <= a and y >= b for x, y in merged)
                    for a, b in required)
 
-KEY FACT (must not be over-proved): ``merged`` is just the set of acked
-intervals recorded FOR ONE RANK; the check requires SOME SINGLE acked interval
-(x, y) to satisfy x <= a and y >= b for every required interval (a, b).
-There is NO union/merge of several acked intervals: acks [0,2) and [2,4) do
-NOT cover required [0,4) in production, because no single (x,y) spans it.
+Current ``gdtensor/internal/api.py`` has no ``_covers`` predicate. Current
+``_NodeState.ack`` removes exact ``(consumer, offset, size)`` pieces from an
+``owed`` set. This file is not a proof of the current ACK implementation.
+
+KEY FACT (must not be over-proved): ``merged`` is just the set of ACK intervals
+recorded FOR ONE RANK in the legacy predicate; the check requires SOME SINGLE
+ACK interval (x, y) to satisfy x <= a and y >= b for every required interval
+(a, b). There is NO union/merge of several ACK intervals: ACKs [0,2) and [2,4)
+do not cover required [0,4) in this predicate, because no single (x,y) spans it.
 
 This file proves:
   1. the IDEAL elementwise-union coverage definition, and its union lemma
      (element covered by the union of two ACK lists iff covered by one of them);
-  2. the production single-spanning predicate, and that single-spanning is a
+  2. the legacy single-spanning predicate, and that single-spanning is a
      SUFFICIENT condition for ideal coverage (every n in [a,b) lies inside the
-     spanning acked interval).
+     spanning ACK interval).
 
-The converse (ideal union coverage => production done) is FALSE and is carried
-as an intentionally-rejected fixture in NegativeFixtures.lean.
+The converse (ideal union coverage => legacy single-spanning) is FALSE and is
+carried as an intentionally-rejected fixture in NegativeFixtures.lean.
 No sorry/admit/axiom.
 -/
 import Init.Tactics
@@ -33,8 +38,8 @@ def anyInterval : List (Nat × Nat) → (Nat → Nat → Bool) → Bool
   | [], _ => false
   | (x, y) :: rest, p => p x y || anyInterval rest p
 
-/-- PRODUCTION predicate (NodeState._covers): every required interval must be
-    contained in SOME single acked interval. No union merge. -/
+/-- LEGACY predicate (historical ``prodCovers`` name retained): every required
+    interval must be contained in SOME single ACK interval. No union merge. -/
 def prodCovers (acks required : List (Nat × Nat)) : Bool :=
   match required with
   | [] => true
@@ -109,7 +114,7 @@ theorem idealCoverElem_monotone (acks : List (Nat × Nat)) (n : Nat)
 -- ideally covered.
 -- ---------------------------------------------------------------------------
 
-/-- Extraction from the production test: some acked interval (x,y) satisfies
+/-- Extraction from the legacy test: some acked interval (x,y) satisfies
     x <= a and y >= b. -/
 private theorem anyInterval_spanning_exists (acks : List (Nat × Nat)) (a b : Nat)
     (h : anyInterval acks (fun x y => x ≤ a && y ≥ b) = true) :
@@ -145,7 +150,7 @@ theorem prodSpanning_implies_ideal (acks : List (Nat × Nat)) (a b : Nat)
 -- ---------------------------------------------------------------------------
 -- Concrete checks on the audit fixture:
 --   acks = [(0,2),(2,4)] ideally cover [0,4) elementwise (0,1 in first;
---   2,3 in second), yet production prodCovers [(0,4)] is FALSE: no single
+--   2,3 in second), yet legacy prodCovers [(0,4)] is FALSE: no single
 --   acked interval spans [0,4).
 -- ---------------------------------------------------------------------------
 
@@ -158,7 +163,7 @@ example : prodCovers [(0, 2)] [(0, 2)] = true := by decide
 example : prodCovers [(0, 2), (2, 4)] [(0, 4)] = false := by decide
 
 /-- The sufficient condition in action: acked [0,4) spanning required [0,2)
-    makes production done AND ideally covers every element. -/
+    makes legacy done AND ideally covers every element. -/
 example : prodCovers [(0, 4)] [(0, 2)] = true := by decide
 
 /-- Union lemma on the fixture: union of [0,2) and [2,4) ideal-covers 1 and 2

@@ -17,11 +17,13 @@ Covered defects (all failed before the node-level propagation plan):
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import multiprocessing as mp
 import threading
 import time
 import weakref
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -450,11 +452,13 @@ def _one_layer_mt(
     return chain, src, cache_mem, dst
 
 
-def _mp_coord_worker(rank, cfg, q):
-    """One process per rank: the real deployment shape of the file coordinator."""
-    chain, _src, _cache_mem, _dst = _one_layer_mt(**cfg)
+def _mp_coord_worker(rank, cfg, q, shared):
+    """One process per rank with process-shared physical cache bytes."""
+    chain, _src, cache_mem, dst = _one_layer_mt(**cfg)
+    cache_mem.data = np.frombuffer(shared, dtype=np.uint8)
+    cast(Any, chain).cache.data_accessor.namespace = "cache-propagation-mp"
     r = gio.chain_load(rank, chain)
-    q.put((rank, type(r) is gb.Ok))
+    q.put((rank, type(r) is gb.Ok, dst.data.tobytes()))
 
 
 def test_one_process_per_rank_coordinates_via_shared_state(tmp_path, monkeypatch):
@@ -462,10 +466,11 @@ def test_one_process_per_rank_coordinates_via_shared_state(tmp_path, monkeypatch
     monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "3")
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
+    shared = ctx.RawArray(ctypes.c_uint8, 8)
     procs = [
         ctx.Process(
             target=_mp_coord_worker,
-            args=(r, dict(steps=2, width=1, placement="rep", world=2), q),
+            args=(r, dict(steps=2, width=1, placement="rep", world=2), q, shared),
         )
         for r in range(2)
     ]
@@ -474,7 +479,8 @@ def test_one_process_per_rank_coordinates_via_shared_state(tmp_path, monkeypatch
     out = [q.get(timeout=120) for _ in procs]
     for p in procs:
         p.join(30)
-    assert sorted(out) == [(0, True), (1, True)]
+    expected = bytes(range(8))
+    assert sorted(out) == [(0, True, expected), (1, True, expected)]
 
 
 def test_one_process_per_rank_multi_tensor_coordinates(tmp_path, monkeypatch):
@@ -482,6 +488,7 @@ def test_one_process_per_rank_multi_tensor_coordinates(tmp_path, monkeypatch):
     monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "3")
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
+    shared = ctx.RawArray(ctypes.c_uint8, 8)
     procs = [
         ctx.Process(
             target=_mp_coord_worker,
@@ -489,6 +496,7 @@ def test_one_process_per_rank_multi_tensor_coordinates(tmp_path, monkeypatch):
                 r,
                 dict(tids=("a", "b"), steps=1, width=1, placement="rep", world=2),
                 q,
+                shared,
             ),
         )
         for r in range(2)
@@ -498,7 +506,8 @@ def test_one_process_per_rank_multi_tensor_coordinates(tmp_path, monkeypatch):
     out = [q.get(timeout=120) for _ in procs]
     for p in procs:
         p.join(30)
-    assert sorted(out) == [(0, True), (1, True)]
+    expected = bytes(range(8))
+    assert sorted(out) == [(0, True, expected), (1, True, expected)]
 
 
 @pytest.mark.parametrize("steps,width", [(1, 1), (2, 1), (2, 2)])

@@ -52,6 +52,8 @@ GOT="$(git write-tree)"
 }
 # Each snapshot owns its environment. uv shares only its package cache.
 export UV_PROJECT_ENVIRONMENT="$DEST/.venv"
+export GDTENSOR_CACHE_DIR="$DEST/.cache-coordinator"
+mkdir -p "$GDTENSOR_CACHE_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 unset PYTHONPATH VIRTUAL_ENV
 export PYTHONPATH="."

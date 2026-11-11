@@ -103,9 +103,9 @@ class FileIO:
     def pwrite(self, rank: int, path: str, offset: int, data) -> None:
         fd = self.fds.get(rank, path, "w")
         view = memoryview(data)
-        done = 0
-        while done < len(view):
-            done += os.pwrite(fd, view[done:], offset + done)
+        from .file_cache import pwrite_all
+
+        pwrite_all(fd, view, offset)
         self.tracer.add(
             IoRecord(rank, "pwrite", path, offset, len(view), time.perf_counter())
         )

@@ -17,9 +17,13 @@ The two formats take different source paths:
 
 from __future__ import annotations
 
+import os
+import pickle
+import shutil
 import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import Callable
 
 import numpy as np
@@ -33,6 +37,7 @@ from gdtensor import Result
 from gdtensor_sim.formats import make_storage_view
 from gdtensor_sim.iobackend import FileIO
 from tests.support.cache_oracle import ResidentCache, storage_schema
+from tests.support.cluster_sim import Cluster, NodeCache
 
 SIZE = 16
 WORLD = 4
@@ -80,7 +85,7 @@ class ReplicateComputeMemory(ga.DTensorDataAccessor):
         raise AssertionError("compute dst must not be read during load")
 
 
-def _save_real(root, fmt: str):
+def _save_real(root, fmt: str, start: int = 0):
     """Write a real checkpoint with arange values. Return (table, layout, path)."""
     st, layout = storage_schema(["w"], SIZE)
     layout.container_format = fmt
@@ -102,7 +107,8 @@ def _save_real(root, fmt: str):
     points = {0: {"w": np.arange(SIZE)}}
     from tests.support.oracle import ArrayFabric
 
-    fabric = ArrayFabric(src_ct, points, {"w": np.arange(SIZE, dtype=np.uint8)})
+    values = np.arange(start, start + SIZE, dtype=np.uint8)
+    fabric = ArrayFabric(src_ct, points, {"w": values})
     assert type(gio.rank_save(0, fabric.view(0), sv)) is gb.Ok
     return st, layout, path
 
@@ -114,7 +120,7 @@ def _load_view(root, st, layout, fmt: str):
     return sv, io
 
 
-def _compute_dst():
+def _compute_dst(world: int = WORLD):
     ct = gb.DTensorTable(
         [
             gb.NamedDTensor(
@@ -122,19 +128,19 @@ def _compute_dst():
                 gb.NaiveDTensor(
                     gb.GlobalTensorMeta([SIZE], "U8", 1),
                     [gb.Replicate()],
-                    gb.ArrangedMesh(gt.WorldSize(WORLD)),
+                    gb.ArrangedMesh(gt.WorldSize(world)),
                 ),
             )
         ]
     )
-    mem = ReplicateComputeMemory(WORLD, SIZE)
+    mem = ReplicateComputeMemory(world, SIZE)
     return mem, gb.ComputeDTensorsView(["w"], ct, mem)
 
 
-def _cache_view(cache_mem, steps: int, width: int):
+def _cache_view(cache_mem, steps: int, width: int, nodes=NODES):
     mesh = gb.StCacheOuterProductMesh(
         temporal=gb.ArrangedMesh(gt.NumSteps(steps)),
-        spatial=gb.LiteralMesh(list(NODES), gt.NumNodes(len(NODES))),
+        spatial=gb.LiteralMesh(list(nodes), gt.NumNodes(len(nodes))),
         concurrency=gb.ArrangedMesh(gt.ConcurrencyWidth(width)),
     )
     dt = gb.NaiveDTensor(
@@ -146,10 +152,12 @@ def _cache_view(cache_mem, steps: int, width: int):
     return gb.CacheDTensorsView(["w"], table, cache_mem)
 
 
-def _run_concurrent(chain, dst_mem, cache_mem):
+def _run_concurrent(chain, dst_mem, cache_mem, cluster=None):
     def work(rank):
         dst_mem.current_rank = rank
-        if cache_mem is not None:
+        if cluster is not None:
+            cluster.rank = rank
+        if cache_mem is not None and hasattr(cache_mem, "current_rank"):
             cache_mem.current_rank = rank
         res = gio.chain_load(rank, chain)
         assert type(res) is gb.Ok, res
@@ -158,10 +166,11 @@ def _run_concurrent(chain, dst_mem, cache_mem):
         list(ex.map(work, range(WORLD)))
 
 
-def _assert_delivery(mem):
+def _assert_delivery(mem, start: int = 0):
+    expected = np.arange(start, start + SIZE, dtype=np.uint8)
     for rank in range(WORLD):
         np.testing.assert_array_equal(
-            mem.buffers[rank], np.arange(SIZE, dtype=np.uint8), err_msg=f"rank={rank}"
+            mem.buffers[rank], expected, err_msg=f"rank={rank}"
         )
 
 
@@ -275,7 +284,7 @@ def test_safetensors_direct_vs_cached_source_reads(tmp_path):
     assert cached_bytes < direct_bytes
 
 
-def test_dcp_session_open_full_reads_per_rank(tmp_path, monkeypatch):
+def test_dcp_only_filler_sessions_load_full_source(tmp_path, monkeypatch):
     st, layout, _path = _save_real(tmp_path, "distcp")
     sv, io = _load_view(tmp_path, st, layout, "distcp")
     dst_mem, cv = _compute_dst()
@@ -285,7 +294,7 @@ def test_dcp_session_open_full_reads_per_rank(tmp_path, monkeypatch):
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=K
     )
 
-    # Count real torch DCP loads: one per rank session open.
+    # Opening sessions does not load payload; only actual fillers load DCP.
     import gdtensor_sim.dcp_backend as dcp_backend
 
     calls = {"n": 0}
@@ -297,5 +306,84 @@ def test_dcp_session_open_full_reads_per_rank(tmp_path, monkeypatch):
 
     monkeypatch.setattr(dcp_backend, "_real_dcp_load", counting_load)
     _run_concurrent(chain, dst_mem, cache_mem)
-    assert calls["n"] == WORLD  # full load per rank, not deduped by the cache
+    assert calls["n"] == len(NODES)  # only filler sessions load the source
     _assert_delivery(dst_mem)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_safetensors_atomic_replacement_after_open_is_rejected(tmp_path, cached):
+    st, layout, path = _save_real(tmp_path, "safetensors")
+    other = tmp_path / "other"
+    _save_real(other, "safetensors", start=SIZE)
+    sv, _io = _load_view(tmp_path, st, layout, "safetensors")
+    original_begin = sv.begin_load
+    assert original_begin is not None
+
+    def replace_after_open(view, rank):
+        result = original_begin(view, rank)
+        if type(result) is gb.Ok:
+            os.replace(other / path, tmp_path / path)
+        return result
+
+    sv = replace(sv, begin_load=replace_after_open)
+    dst_mem, cv = _compute_dst(world=1)
+    cache_mem = ResidentCache([], 1)
+    if cached:
+        chain = gb.OneLayerCachedDTensorsReadChain(
+            src=sv,
+            cache=_cache_view(cache_mem, 1, 1, nodes=[0]),
+            dst=cv,
+            num_ranks_per_node=1,
+        )
+        result = gio.chain_load(0, chain)
+    else:
+        result = gio.chain_load(0, gb.DirectDTensorsReadChain(src=sv, dst=cv))
+    assert type(result) is gb.Err
+    assert not cache_mem.data
+    np.testing.assert_array_equal(dst_mem.buffers[0], np.zeros(SIZE, np.uint8))
+
+
+def test_dcp_metadata_only_payload_change_refreshes_cached_bytes(tmp_path, monkeypatch):
+    st, layout, _path = _save_real(tmp_path, "distcp")
+    original = tmp_path / "__0_0.distcp"
+    actual = tmp_path / "__1_0.distcp"
+    shutil.copyfile(original, actual)
+    with (tmp_path / ".metadata").open("rb") as handle:
+        metadata = pickle.load(handle)
+    for storage in metadata.storage_data.values():
+        storage.relative_path = actual.name
+    with (tmp_path / ".metadata").open("wb") as handle:
+        pickle.dump(metadata, handle)
+
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path / "coordination"))
+    monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "thread")
+    sv, _io = _load_view(tmp_path, st, layout, "distcp")
+    dst_mem, cv = _compute_dst()
+    cluster = Cluster(len(NODES), K)
+    cache_mem = NodeCache(cluster, {"w": SIZE}, lambda rank: rank // K)
+    chain = gb.OneLayerCachedDTensorsReadChain(
+        src=sv, cache=_cache_view(cache_mem, 1, 1), dst=cv, num_ranks_per_node=K
+    )
+
+    import gdtensor_sim.dcp_backend as dcp_backend
+
+    calls = {"n": 0}
+    original_load = dcp_backend._real_dcp_load
+
+    def counting_load(table, root):
+        calls["n"] += 1
+        return original_load(table, root)
+
+    monkeypatch.setattr(dcp_backend, "_real_dcp_load", counting_load)
+    _run_concurrent(chain, dst_mem, cache_mem, cluster)
+    assert calls["n"] == len(NODES)
+    _assert_delivery(dst_mem)
+
+    other = tmp_path / "other"
+    _save_real(other, "distcp", start=SIZE)
+    shutil.copyfile(other / original.name, actual)
+    for buf in dst_mem.buffers.values():
+        buf.fill(0)
+    _run_concurrent(chain, dst_mem, cache_mem, cluster)
+    assert calls["n"] == 2 * len(NODES)
+    _assert_delivery(dst_mem, start=SIZE)

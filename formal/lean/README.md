@@ -29,7 +29,7 @@ rejection is instead a syntax/unbound error.
 | `RowMajor.lean` | `gdtensor_sim/dcp_backend.py` `_owned_chunk_local_run` row-major decode | `shapeProd`, `coordAt`, `packedFlat`, `localFlat`; inverse lemma `packedFlat_coordAt` (global flat → coords → repack == global flat) for nonempty shapes; triangulation on shape `[2,4]`. |
 | `ChunkRun.lean` | same function, tail `local[-1]-local[0]+1 != len → None` | insertion-sort criterion `isSingleRun`; membership/length preservation; soundness `singleRun_elem_in_window` (when accepted, every owned local lies in the pread window). Triangulation: column shard `{0,1,4,5}` rejected (`=false`), row-contiguous run `[2,3]` accepted (`=true`). |
 | `Leader.lean` | `gdtensor_sim/models.py` grouping: `t0 = min(t for t,_ in cells)` | head-init `foldMin`/`leaderRow`; `leaderRow_le` (leader ≤ every cell row) and `leaderRow_mem` (leader achieved by some cell). `lexMinCell`/`leaderCell` model the lex-min `(row, rank)` entry `TensorComponentPos(ids[t0], leader.rank)`. Triangulation: leader of `[(5,0),(2,0),(7,0)]` is **2** (min, not max-member 7); row tie `[(2,5),(2,3)]` → `(2,3)` (min rank). Value equality: permuted cell lists give the same leader. |
-| `Coverage.lean` | `gdtensor/internal/api.py` `NodeState._covers` | `prodCovers` = production "some single acked interval spans every required interval" (**no union merge**). `idealCoverInterval` = the ideal elementwise-union coverage. Lemma `prodSpanning_implies_ideal` (single-spanning ⇒ ideal holds); append/union lemmas for the ideal side only. |
+| `Coverage.lean` | Legacy interval predicate; not current runtime | `prodCovers` = historical "some single ACK interval spans every required interval" (**no union merge**). Current `_NodeState.ack` removes exact owed pieces instead. `idealCoverInterval` = ideal elementwise-union coverage. Lemma `prodSpanning_implies_ideal` (single-spanning ⇒ ideal holds); append/union lemmas for the ideal side only. |
 | `NegativeFixtures.lean` | — | intentionally broken examples; the gate **expects** Lean to reject them (see below). |
 
 ## Preconditions stated explicitly
@@ -47,10 +47,10 @@ rejection is instead a syntax/unbound error.
 - The Lean side does **not** prove the whole Python file, nor that the Python
   runtime is correct. It states lemmas about the *modeled* functions and checks
   concrete triangulation instances by `decide`.
-- Production `NodeState._covers` has **no multi-interval union merge**. The
-  fixture `acks [(0,2),(2,4)]` covers `[0,4)` **ideally** but `prodCovers`
-  returns **false** for it. The union lemmas live on the *ideal* predicate only;
-  we do **not** fake a proof that production merges intervals.
+- Legacy `prodCovers` has **no multi-interval union merge**. The fixture
+  `acks [(0,2),(2,4)]` covers `[0,4)` **ideally** but `prodCovers`
+  returns **false** for it. The union lemmas live on the *ideal* predicate only.
+  Current `_NodeState.ack` uses exact owed pieces, not either interval predicate.
 - Row-major inverse and window lemmas are stated for finite concrete geometries
   plus the universally-quantified list/interval theorems; they are not a full
   refinement of the C++/Python implementation.
@@ -69,8 +69,8 @@ rejection is instead a syntax/unbound error.
 - **basic** (address mapping + labels): `RowMajor.lean`, `Leader.lean`,
   `ChunkRun.lean` — row-major global→chunk-local mapping, single-run criterion,
   non-contiguous rejection, leader = min row.
-- **advanced** (ACK coverage): `Coverage.lean` — ideal union coverage vs the
-  production single-spanning predicate.
+- **advanced** (legacy ACK coverage algebra): `Coverage.lean` — ideal union
+  coverage vs the historical single-spanning predicate.
 
 ## Negative fixtures (must be rejected, on purpose)
 
@@ -79,9 +79,9 @@ rejection is instead a syntax/unbound error.
 
 1. column shard `{0,1,4,5}` is a single contiguous run (false: gap 1..4);
 2. leader row is the max member (false: it is the min);
-3. production merges `[(0,2),(2,4)]` to cover `[0,4)` (false: no union merge);
+3. legacy `prodCovers` merges `[(0,2),(2,4)]` to cover `[0,4)` (false: no union merge);
 4. chunk-local flat of `(1,0)` in chunk `(2,2)` is 4 (false: it is 2);
-5. ideal union coverage implies production `_covers` (false converse);
+5. ideal union coverage implies legacy `prodCovers` (false converse);
 6. on a row tie, max rank wins (false: production picks min rank).
 
 ## Proof scale
