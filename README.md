@@ -196,6 +196,36 @@ GitHub Actions 在 push main、PR 和手动触发时运行。Python 3.12 / 3.13 
 
 `formal/` 中的 TLA+ / Lean 制品描述抽象模型，不证明 Python 实现。
 
+### torchrun + Gloo CPU 同步
+
+`gdtensor_sim.coord.GlooCoordinator` 使用调用方初始化的默认 process group。`vote()` 对 CPU `int32` 张量执行 `all_reduce(MIN)`，任一 rank 失败则全部返回 `False`；`wait()` 调用 `barrier()`。所有 rank 必须以相同顺序调用这两个方法。torch 仍是可选依赖。
+
+单机两个 rank：
+
+```bash
+uv run --locked --extra torch-cpu torchrun --standalone \
+  --nproc-per-node=2 --module gdtensor_sim.gloo_torchrun
+```
+
+两台主机各运行两个 rank。先在各主机安装同一代码和依赖，再把 `RDZV_ENDPOINT` 设为 node 0 上可达的地址：
+
+```bash
+# node 0
+export RDZV_ENDPOINT=node0:29500
+uv run --locked --extra torch-cpu torchrun \
+  --nnodes=2 --node-rank=0 --nproc-per-node=2 \
+  --rdzv-backend=c10d --rdzv-endpoint="$RDZV_ENDPOINT" \
+  --rdzv-id=gdtensor-gloo-demo --module gdtensor_sim.gloo_torchrun
+
+# node 1：使用相同的 RDZV_ENDPOINT
+uv run --locked --extra torch-cpu torchrun \
+  --nnodes=2 --node-rank=1 --nproc-per-node=2 \
+  --rdzv-backend=c10d --rdzv-endpoint="$RDZV_ENDPOINT" \
+  --rdzv-id=gdtensor-gloo-demo --module gdtensor_sim.gloo_torchrun
+```
+
+示例检查全票成功、每个 rank 单独失败时的全局失败传播，以及失败后的复用。`tests/torch/test_gloo_coordinator.py` 在同一主机的两个 torchrun agent 上执行四个 CPU rank；这不是物理双机证据。
+
 ## 仿真 CLI
 
 ```bash

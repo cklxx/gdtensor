@@ -44,6 +44,8 @@ DCP 仅在源 accessor 首次读取时加载。每个 filler session 仍全量�
 - `sim/`：具体文件实现、真实 DCP、生命周期、故障、CLI 子进程。
 - `support/`：共享 fixture；测试文件之间不互相导入。
 
+`torch/test_gloo_coordinator.py` 通过两个 torchrun agent 启动四个 CPU rank，检查 Gloo 投票、失败传播、屏障和重复使用。`test_lawa.py` 的真实 rank 保存也使用 `GlooCoordinator`。两个 agent 位于同一测试主机，不证明物理双机部署。
+
 ### 新增真实文件验收
 
 `sim/test_real_file_accessors.py` 有 6 个参数展开用例。
