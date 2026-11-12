@@ -1,38 +1,12 @@
 """Concrete file accessor for the simulation storage sessions."""
 
 import ctypes
-import os
 import numpy as np
 from gdtensor.access import DTensorDataAccessor
 from ._layout import PayloadIndex
 from ._result import Fail, catch, invalid, io_error
 from gdtensor.builder import Err, Ok
 from .iobackend import FileIO
-
-
-def _file_identity(path, fd=None):
-    path = os.path.realpath(path)
-    stat = os.stat(path)
-    identity = (
-        path,
-        stat.st_dev,
-        stat.st_ino,
-        stat.st_size,
-        stat.st_mtime_ns,
-        stat.st_ctime_ns,
-    )
-    if fd is not None:
-        opened = os.fstat(fd)
-        actual = (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_size,
-            opened.st_mtime_ns,
-            opened.st_ctime_ns,
-        )
-        if identity[1:] != actual:
-            raise OSError("source path was replaced; open a new load session")
-    return identity
 
 
 def buffer_address(buf) -> int:
@@ -68,13 +42,7 @@ class StorageDataAccessor(DTensorDataAccessor):
         paths = sorted(self.session.abspath(p) for p in self.index.files)
         local = {self.session.abspath(p) for p in self.session.my_files()}
         return tuple(
-            _file_identity(
-                path,
-                self.io.fds.get(self.session.rank, path, "r")
-                if path in local
-                else None,
-            )
-            for path in paths
+            self.io.identity(self.session.rank, path, path in local) for path in paths
         )
 
     def _file_offset(self, rng):

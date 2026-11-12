@@ -33,7 +33,6 @@ from __future__ import annotations
 import json
 import os
 import struct
-from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -48,7 +47,7 @@ from gdtensor.builder import (
 from ._geometry import nbytes_of, numel_of, owned_box
 from ._layout import PayloadIndex, SlotPayload, build_payload_index, pos_key
 from ._result import catch, invalid, io_error, not_found
-from .iobackend import FileIO
+from .iobackend import FileIO, SdkFileIO
 from gdtensor.session import StorageLoadSession, StorageSaveSession
 
 HF_INDEX_NAME = "model.safetensors.index.json"
@@ -145,22 +144,6 @@ class _Base:
         return sorted(out)
 
 
-def _size_file(path, size):
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        os.ftruncate(fd, size)
-    finally:
-        os.close(fd)
-
-
-def _sync_file(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 def _finish_publication(session, published, error):
     if not published:
         return error
@@ -192,10 +175,9 @@ class SaveSessionBase(_Base, StorageSaveSession):
 
     def _open_file(self, path):
         full = self.abspath(path)
-        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         header = self._header(path)
         self.data_start[path] = len(header)
-        _size_file(full, len(header) + self.index.files[path].payload_size)
+        self.io.create_staging(full, len(header) + self.index.files[path].payload_size)
         if header and self.index.files[path].leader.rank == self.rank:
             self.io.pwrite(self.rank, full, 0, header)
 
@@ -241,7 +223,7 @@ class SaveSessionBase(_Base, StorageSaveSession):
     def commit(self) -> None:
         if self.state != "open":
             raise invalid("session", f"commit on {self.state} session")
-        self.io.fds.close_rank(self.rank)
+        self.io.close_rank(self.rank)
         if not self._vote(True):  # barrier: every writer is done (or failed)
             self.state = "aborted"
             self._discard()
@@ -267,7 +249,7 @@ class SaveSessionBase(_Base, StorageSaveSession):
     def abort(self) -> None:
         if self.state in ("committed", "aborted"):
             raise invalid("session", f"abort on {self.state} session")
-        self.io.fds.close_rank(self.rank)
+        self.io.close_rank(self.rank)
         if self.state == "unknown":
             self.state = "aborted"  # final path may exist: delete nothing
             return
@@ -277,7 +259,7 @@ class SaveSessionBase(_Base, StorageSaveSession):
 
     def _discard(self) -> None:
         for path in self._leader_files():
-            Path(self.abspath(path)).unlink(missing_ok=True)
+            self.io.discard(self.abspath(path))
 
 
 class SafeTensorsSaveSession(SaveSessionBase):
@@ -296,8 +278,8 @@ class SafeTensorsSaveSession(SaveSessionBase):
     def _publish(self) -> None:
         for path in self._leader_files():
             tmp, final = self.abspath(path), os.path.join(self.root, path)
-            _sync_file(tmp)
-            os.replace(tmp, final)
+            self.io.sync(tmp)
+            self.io.publish(tmp, final)
 
     def _after_barrier(self) -> None:
         """Single-writer publication point.
@@ -329,11 +311,9 @@ class SafeTensorsSaveSession(SaveSessionBase):
         )
         doc = {"metadata": {"total_size": total}, "weight_map": weight_map}
         tmp = os.path.join(self.root, HF_INDEX_NAME + ".tmp")
-        with open(tmp, "w") as f:
-            json.dump(doc, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(self.root, HF_INDEX_NAME))
+        raw = json.dumps(doc, indent=2).encode()
+        self.io.write_all(self.rank, tmp, raw)
+        self.io.publish(tmp, os.path.join(self.root, HF_INDEX_NAME))
 
     def _write_commit_marker(self) -> None:
         """Atomically publish the checkpoint-complete marker.
@@ -344,11 +324,9 @@ class SafeTensorsSaveSession(SaveSessionBase):
         shards = sorted(self.index.files)
         doc = {"format": "safetensors", "files": shards}
         tmp = os.path.join(self.root, COMMIT_MARKER_NAME + ".tmp")
-        with open(tmp, "w") as f:
-            json.dump(doc, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(self.root, COMMIT_MARKER_NAME))
+        raw = json.dumps(doc, indent=2).encode()
+        self.io.write_all(self.rank, tmp, raw)
+        self.io.publish(tmp, os.path.join(self.root, COMMIT_MARKER_NAME))
 
 
 class LoadSessionBase(_Base, StorageLoadSession):
@@ -394,7 +372,7 @@ class LoadSessionBase(_Base, StorageLoadSession):
     def finish(self) -> None:
         if self.state != "open":
             raise invalid("session", f"finish on {self.state} session")
-        self.io.fds.close_rank(self.rank, self.root)
+        self.io.close_rank(self.rank, self.root)
         self.state = "finished"
 
 
@@ -425,7 +403,7 @@ class SafeTensorsLoadSession(LoadSessionBase):
 
     def _read_commit_marker(self, marker: str) -> dict:
         try:
-            raw = Path(marker).read_text()
+            raw = self.io.read_all(self.rank, marker)
         except OSError as exc:
             raise io_error(
                 "open",
@@ -507,6 +485,8 @@ def make_storage_view(
     fmt = layout.container_format
     if fmt not in ("safetensors", "distcp"):
         raise invalid("container_format", f"unknown container_format {fmt!r}")
+    if fmt == "distcp" and isinstance(io, SdkFileIO):
+        raise invalid("io", "SdkFileIO supports safetensors only")
     save_cls = {"safetensors": SafeTensorsSaveSession}
     load_cls = {"safetensors": SafeTensorsLoadSession}
 
@@ -522,7 +502,7 @@ def make_storage_view(
                 **kwargs,
             )
         except BaseException:
-            io.fds.close_rank(rank, root)
+            io.close_rank(rank, root)
             raise
 
     @catch
