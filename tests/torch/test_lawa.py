@@ -14,7 +14,7 @@ import gdtensor
 import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
-from gdtensor_sim.coord import ProcessCoordinator
+from gdtensor_sim.coord import GlooCoordinator
 from tests.support.crc import crc_of, verify_payload
 from tests.support.lawa import normalize_weights as _normalize_weights
 from tests.support.oracle import TorchAccessor
@@ -443,7 +443,6 @@ def _worker(
     fmt,
     dim,
     reverse,
-    coord,
     world,
     tensor_count,
     epochs,
@@ -471,7 +470,6 @@ def _worker(
             fmt,
             dim,
             reverse,
-            coord,
             world,
             tensor_count,
             progress,
@@ -493,7 +491,6 @@ def _distributed_worker(
     fmt,
     dim,
     reverse,
-    coord,
     world,
     tensor_count,
     progress,
@@ -508,6 +505,7 @@ def _distributed_worker(
         world_size=world,
         timeout=timedelta(seconds=30),
     )
+    coord = GlooCoordinator()
     try:
         _run_worker(
             torch,
@@ -572,7 +570,6 @@ def test_lawa_real_ranks(
 ):
     torch = pytest.importorskip("torch")
     ctx = mp.get_context("spawn")
-    coord = ProcessCoordinator(world, ctx, timeout=30)
     procs = [
         ctx.Process(
             target=_worker,
@@ -583,7 +580,6 @@ def test_lawa_real_ranks(
                 fmt,
                 dim,
                 reverse,
-                coord,
                 world,
                 tensor_count,
                 epochs,

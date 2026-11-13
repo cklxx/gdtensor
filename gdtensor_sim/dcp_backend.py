@@ -562,8 +562,7 @@ class DcpLoadSession(StorageLoadSession):
 
         with open(os.path.join(self.root, ".metadata"), "rb") as handle:
             metadata = pickle.load(handle)
-        names = set(self.index.files)
-        names.update(sd.relative_path for sd in metadata.storage_data.values())
+        names = {sd.relative_path for sd in metadata.storage_data.values()}
         names.add(".metadata")
         paths = [os.path.join(self.root, p) for p in names]
         return tuple(_file_identity(p) for p in sorted(paths))

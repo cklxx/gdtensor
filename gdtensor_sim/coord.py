@@ -41,6 +41,23 @@ class ThreadCoordinator:
         self._barrier.wait(self.timeout)
 
 
+class GlooCoordinator:
+    """Use the default Gloo process group initialized by ``torchrun``."""
+
+    def vote(self, ok: bool) -> bool:
+        import torch
+        from torch.distributed import ReduceOp, all_reduce
+
+        result = torch.tensor(int(ok), dtype=torch.int32, device="cpu")
+        all_reduce(result, op=ReduceOp.MIN)
+        return bool(result.item())
+
+    def wait(self) -> None:
+        from torch.distributed import barrier
+
+        barrier()
+
+
 class ProcessCoordinator:
     """Same contract across forked processes."""
 
@@ -72,4 +89,4 @@ class ProcessCoordinator:
 
 Coordinator = Optional[
     object
-]  # ThreadCoordinator | ProcessCoordinator | None (single rank)
+]  # ThreadCoordinator | ProcessCoordinator | GlooCoordinator | None (single rank)
