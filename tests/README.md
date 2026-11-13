@@ -46,6 +46,8 @@ DCP 仅在源 accessor 首次读取时加载。每个 filler session 仍全量�
 
 `torch/test_gloo_coordinator.py` 通过两个 torchrun agent 启动四个 CPU rank，检查 Gloo 投票、失败传播、屏障和重复使用。`test_lawa.py` 的真实 rank 保存也使用 `GlooCoordinator`。两个 agent 位于同一测试主机，不证明物理双机部署。
 
+`torch/test_gloo_checkpoint_matrix.py` 分别启动 2、4 个真实 torchrun rank。每种 world size 执行 12 组笛卡尔积：源格式（safetensors、distcp）× 目标格式 × 读取方式（直读、一层缓存、两层缓存），合计 24 个场景。每组执行两轮加载和跨格式 `rank_save`，检查逐 rank 数值、目标重开读取、独立 CRC/精确字节/元素覆盖，以及源文件不变。直读要求两轮源读量相同；缓存要求第一轮各层实际填充，第二轮零源读、零新增缓存写且末层缓存实际交付。测试缓存通过 mmap 共享进程间字节和有效位，并在 `PYTHONOPTIMIZE=1` 下运行。
+
 ### 新增真实文件验收
 
 `sim/test_real_file_accessors.py` 有 6 个参数展开用例。

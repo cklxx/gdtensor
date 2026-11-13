@@ -122,7 +122,7 @@ def bf16_schema(p):
     return gb.DTensorTable(table), points, values
 
 
-def storage_view(root, ct, p, kind, mode, fmt, *, save=False):
+def storage_view(root, ct, p, kind, mode, fmt, *, save=False, coord=None):
     world = int(np.prod(p))
     table = []
     for order, nd in enumerate(ct.named_d_tensors):
@@ -158,7 +158,7 @@ def storage_view(root, ct, p, kind, mode, fmt, *, save=False):
         fmt,
         kind,
         [i % p[0] for i in range(len(table))],
-        ThreadCoordinator(world) if save else None,
+        coord or (ThreadCoordinator(world) if save else None),
     ).view
 
 

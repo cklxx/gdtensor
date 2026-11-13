@@ -27,6 +27,12 @@ def _result(fn):
     return call
 
 
+def _pwrite_exact(fd, data, offset):
+    written = os.pwrite(fd, data, offset)
+    if written != len(data):
+        raise OSError(f"short write: {written} != {len(data)}")
+
+
 def _file_name(kind, order, rank, stages):
     if kind == "single":
         return "model"
@@ -267,6 +273,23 @@ class _FileAccessor(ga.DTensorDataAccessor):
     def __init__(self, storage, writing):
         self.storage, self.writing = storage, writing
 
+    def cache_identity(self):
+        identities = []
+        for name in sorted(self.storage.files):
+            path = (self.storage.root / name).resolve()
+            stat = path.stat()
+            identities.append(
+                (
+                    str(path),
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+            )
+        return tuple(identities)
+
     def _address(self, rng):
         _, size, header, _ = self.storage.files[rng.file_path]
         assert 0 <= rng.contiguous_payload_offset <= size - rng.size
@@ -291,7 +314,7 @@ class _FileAccessor(ga.DTensorDataAccessor):
             return result
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            assert os.pwrite(fd, data.tobytes(), offset) == data.nbytes
+            _pwrite_exact(fd, data.tobytes(), offset)
         finally:
             os.close(fd)
 
