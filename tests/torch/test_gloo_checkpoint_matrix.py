@@ -37,6 +37,7 @@ def test_gloo_checkpoint_format_cache_matrix(tmp_path, world):
     command = [
         str(torchrun),
         "--standalone",
+        "--start-method=spawn",
         f"--nproc-per-node={world}",
         "--module",
         "tests.torch.gloo_checkpoint_matrix",
