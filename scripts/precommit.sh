@@ -15,18 +15,18 @@ fi
 export PYTHONPATH="."
 
 echo "[precommit] 1/5 fmt check"
-uv run --locked --extra torch-cpu ruff format --check gdtensor gdtensor_sim tests
+uv run --locked --extra torch-cpu ruff format --check gdtensor gdtensor_conn tests
 
 echo "[precommit] 2/5 lint"
-uv run --locked --extra torch-cpu ruff check --no-cache gdtensor gdtensor_sim tests
+uv run --locked --extra torch-cpu ruff check --no-cache gdtensor gdtensor_conn tests
 
 echo "[precommit] 3/5 byte-compile"
-uv run --locked --extra torch-cpu python -m compileall -q gdtensor gdtensor_sim tests
+uv run --locked --extra torch-cpu python -m compileall -q gdtensor gdtensor_conn tests
 
 echo "[precommit] 4/5 package imports"
 uv run --locked --extra torch-cpu python - <<'PY'
 import gdtensor, gdtensor.io, gdtensor.builder, gdtensor.session, gdtensor.access, gdtensor.tag
-import gdtensor_sim.models, gdtensor_sim.runner
+import gdtensor_conn.models, gdtensor_conn.runner
 print("imports ok")
 PY
 

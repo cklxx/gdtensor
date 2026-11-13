@@ -12,7 +12,7 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-from gdtensor_sim.file_cache import (
+from gdtensor_conn.file_cache import (
     Device,
     DiskNodeCache,
     DiskStorage,
@@ -802,7 +802,7 @@ def test_memory_cache_read_rejects_a_different_source():
 
 def test_dcp_metadata_payload_change_invalidates_identity(tmp_path):
     import pickle
-    from gdtensor_sim.dcp_backend import DcpLoadSession
+    from gdtensor_conn.dcp_backend import DcpLoadSession
 
     payload = tmp_path / "__1_0.distcp"
     payload.write_bytes(b"original")

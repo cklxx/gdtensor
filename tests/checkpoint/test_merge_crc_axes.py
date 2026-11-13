@@ -19,7 +19,7 @@ import pytest
 
 import gdtensor.io as gio
 import gdtensor.builder as gb
-from gdtensor_sim.coord import ThreadCoordinator
+from gdtensor_conn.coord import ThreadCoordinator
 from tests.support import axes
 from tests.support.checkpoint import (
     corrupt_distcp_payload,

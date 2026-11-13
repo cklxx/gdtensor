@@ -41,11 +41,11 @@ def test_world3_rank2_middle_pread_bytes_match(tmp_path):
     """
     import gdtensor.builder as gb
     from gdtensor.builder import global_tensor_meta_of
-    from gdtensor_sim._geometry import nonempty_columns
-    from gdtensor_sim._layout import build_payload_index
-    from gdtensor_sim.models import build_layout
+    from gdtensor_conn._geometry import nonempty_columns
+    from gdtensor_conn._layout import build_payload_index
+    from gdtensor_conn.models import build_layout
     from tests.support.schemas import tensor_schema
-    from gdtensor_sim.dcp_backend import DcpLoadSession
+    from gdtensor_conn.dcp_backend import DcpLoadSession
 
     # world=3 row-shard on axis 0, axis1/2 replicated.
     ct, _, _ = tensor_schema((3, 1, 1))

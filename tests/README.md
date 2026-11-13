@@ -28,8 +28,8 @@ bash scripts/formal_gate.sh
 | 层级 | 实现 | 实际行为 |
 |---|---|---|
 | 核心接口 | `gdtensor/access.py::DTensorDataAccessor` | 抽象 `read_to_buffer`、`write_from_buffer`；不绑定文件格式 |
-| safetensors | `gdtensor_sim/access.py::StorageDataAccessor` | callback 与 buffer 交互；`FileIO` 执行 `os.pread/os.pwrite`；session 校验文件和 slot 范围 |
-| PyTorch DCP | `gdtensor_sim/dcp_backend.py` | process 模式写真实 stage 文件；commit 调用 DCP save；load session 延迟读取，仅实际源读取触发 DCP load |
+| safetensors | `gdtensor_conn/access.py::StorageDataAccessor` | callback 与 buffer 交互；`FileIO` 执行 `os.pread/os.pwrite`；session 校验文件和 slot 范围 |
+| PyTorch DCP | `gdtensor_conn/dcp_backend.py` | process 模式写真实 stage 文件；commit 调用 DCP save；load session 延迟读取，仅实际源读取触发 DCP load |
 | 文件缓存测试 | `tests/support/cache_oracle.py::FileCache` | 每 slot 独立文件；flush/fsync、pread；记录 rank ACK，完成后删除 slot 文件 |
 | 计算端独立 oracle | `tests/support/oracle.py::ArrayFabric` | 稠密全局下标生成预期值，校验每 rank 局部数组；存储与缓存仍真实落盘 |
 

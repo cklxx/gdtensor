@@ -10,7 +10,7 @@ import safetensors
 
 import gdtensor.builder as gb
 import gdtensor.tag as gt
-from gdtensor_sim.coord import ThreadCoordinator
+from gdtensor_conn.coord import ThreadCoordinator
 from tests.support.oracle import slice_points
 from tests.support.storage import FileStorage
 
@@ -208,7 +208,7 @@ def _distcp_regions(root):
     """Independently decode a genuine torch DCP checkpoint.
 
     Reads the pickle ``.metadata`` and loads tensors through torch's own DCP
-    reader (not through gdtensor_sim), then yields each tensor's raw element
+    reader (not through gdtensor_conn), then yields each tensor's raw element
     bytes. This is the independent byte/CRC oracle for the distcp container.
     """
     import pickle

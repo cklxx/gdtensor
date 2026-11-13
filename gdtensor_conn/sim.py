@@ -1,11 +1,11 @@
-"""gdtensor simulator CLI: save with concurrent pwrite, then load.
+"""gdtensor connector CLI: save with concurrent pwrite, then load.
 
 The store is a local directory. Formats: safetensors (tmp + rename,
 index.json) or distcp (.metadata). The CLI reports write/read patterns and
 verifies the loaded bytes.
 
 Example:
-  python -m gdtensor_sim.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer
+  python -m gdtensor_conn.sim --root /tmp/ck --tp 4 --dp 4 --pp 2 --optimizer
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from .models import (
     storage_table,
 )
 from .runner import load_threads, run_processes, save_threads
-from gdtensor_sim.fabric import ComputeFabric
+from gdtensor_conn.fabric import ComputeFabric
 
 
 def _actual_distcp_bytes(root: str) -> tuple[int, int]:

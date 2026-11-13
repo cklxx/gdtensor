@@ -218,8 +218,8 @@ class FileStorage:
 
     def _real_dcp_session(self, load: bool, rank: int):
         """Route distcp through the genuine torch DCP backend (no JSON metadata)."""
-        from gdtensor_sim._layout import build_payload_index
-        from gdtensor_sim.dcp_backend import DcpLoadSession, DcpSaveSession
+        from gdtensor_conn._layout import build_payload_index
+        from gdtensor_conn.dcp_backend import DcpLoadSession, DcpSaveSession
 
         index = build_payload_index(self.table, self.layout)
         if load:

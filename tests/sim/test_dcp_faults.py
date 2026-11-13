@@ -13,7 +13,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from gdtensor_sim import dcp_backend as db
+from gdtensor_conn import dcp_backend as db
 from tests.support.schemas import tensor_schema
 
 
@@ -33,7 +33,7 @@ def test_missing_slot_raises_instead_of_silent_checkpoint(tmp_path):
 
 
 def test_partial_slot_raises_byte_length_mismatch(tmp_path):
-    from gdtensor_sim._geometry import nonempty_columns
+    from gdtensor_conn._geometry import nonempty_columns
 
     nd = _one_tensor()
     stage = db._Stage(str(tmp_path))
@@ -52,7 +52,7 @@ def test_stage_is_cleared_after_publish_no_stale_reuse(tmp_path):
     stage = db._Stage(str(tmp_path))
     # Simulate a fully-staged tensor then publish through the save path.
     from gdtensor.builder import global_tensor_meta_of
-    from gdtensor_sim._geometry import nonempty_columns, iv_total
+    from gdtensor_conn._geometry import nonempty_columns, iv_total
 
     for nd in ct.named_d_tensors:
         meta = global_tensor_meta_of(nd)
@@ -94,14 +94,14 @@ class _FailingCoord:
 
 def test_publish_failure_propagates_as_io_error(tmp_path):
     """If the coordinator vote fails, commit must raise, not silently succeed."""
-    from gdtensor_sim.dcp_backend import DcpSaveSession
+    from gdtensor_conn.dcp_backend import DcpSaveSession
 
     ct, _, _ = tensor_schema((1, 1, 1))
-    layout = __import__("gdtensor_sim.models", fromlist=["build_layout"]).build_layout(
+    layout = __import__("gdtensor_conn.models", fromlist=["build_layout"]).build_layout(
         ct, 1, "safetensors", lambda t, w, nd: f"f{t}.safetensors"
     )
     index = __import__(
-        "gdtensor_sim._layout", fromlist=["build_payload_index"]
+        "gdtensor_conn._layout", fromlist=["build_payload_index"]
     ).build_payload_index(ct, layout)
     session = DcpSaveSession(
         0, str(tmp_path), ct, layout, index, coord=_FailingCoord(), mode="thread"
@@ -116,7 +116,7 @@ def test_publish_failure_propagates_as_io_error(tmp_path):
 def test_write_integrity_correct_length_but_partial_coverage_raises(tmp_path):
     """A slot buffer of the right byte count must still fail if one owned
     interval was never filled: assembly checks filled.all() over every element."""
-    from gdtensor_sim._geometry import iv_total, nonempty_columns
+    from gdtensor_conn._geometry import iv_total, nonempty_columns
     from gdtensor.builder import global_tensor_meta_of
 
     nd = _one_tensor()

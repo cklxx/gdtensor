@@ -292,7 +292,7 @@ def test_type_aliases_and_namespace_separation():
 @pytest.mark.parametrize(
     "file",
     sorted((ROOT / "tests").rglob("*.py"))
-    + sorted((ROOT / "gdtensor_sim").rglob("*.py")),
+    + sorted((ROOT / "gdtensor_conn").rglob("*.py")),
     ids=lambda p: str(p.relative_to(ROOT)),
 )
 def test_tests_and_sim_use_no_core_internal_api(file):
@@ -342,7 +342,7 @@ def _check_core_node(node, file, forbidden):
     if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
         assert node.name not in forbidden, (file, node.name)
     if isinstance(node, ast.ImportFrom):
-        assert not (node.module or "").startswith(("gdtensor_sim", "tests")), file
+        assert not (node.module or "").startswith(("gdtensor_conn", "tests")), file
 
 
 def test_no_reduction_api():
@@ -363,7 +363,7 @@ def test_no_reduction_api():
     "file",
     sorted(
         path
-        for directory in ("gdtensor", "gdtensor_sim", "tests")
+        for directory in ("gdtensor", "gdtensor_conn", "tests")
         for path in (ROOT / directory).rglob("*.py")
     ),
     ids=lambda path: str(path.relative_to(ROOT)),

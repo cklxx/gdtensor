@@ -20,7 +20,7 @@ from gdtensor.builder import ComputeDTensorsView, DTensorTable, GDTensorIOError
 from .formats import make_storage_view
 from .iobackend import FileIO
 from gdtensor.builder import Err, Ok
-from gdtensor_sim.fabric import ComputeDataAccessor, ComputeFabric
+from gdtensor_conn.fabric import ComputeDataAccessor, ComputeFabric
 
 
 def compute_view(

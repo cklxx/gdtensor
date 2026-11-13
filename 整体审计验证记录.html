@@ -106,12 +106,12 @@
   <tbody>
     <tr><td colspan="5" style="background:var(--panel);font-weight:600;">P0：无</td></tr>
     <tr>
-      <td><code>P1-1</code></td><td><span class="badge b-p1">P1</span></td><td>DCP / <code>gdtensor_sim/dcp_backend.py</code></td>
+      <td><code>P1-1</code></td><td><span class="badge b-p1">P1</span></td><td>DCP / <code>gdtensor_conn/dcp_backend.py</code></td>
       <td><code>get_file_offset</code> 对内轴分片（列并行 Shard(1)）/ 3-D 跨步槽返回与槽字节不匹配的 Ok 偏移；外部 pread 静默读错字节。</td>
       <td><span class="badge b-fail">未修</span></td>
     </tr>
     <tr>
-      <td><code>P2-2</code></td><td><span class="badge b-p2">P2</span></td><td>DCP CLI / <code>gdtensor_sim/sim.py:210</code></td>
+      <td><code>P2-2</code></td><td><span class="badge b-p2">P2</span></td><td>DCP CLI / <code>gdtensor_conn/sim.py:210</code></td>
       <td><code>--format distcp</code> 保存成功后按布局推名汇总字节时 FileNotFoundError，非测试入口每次必崩。</td>
       <td><span class="badge b-fail">未修</span></td>
     </tr>
@@ -173,7 +173,7 @@
 <div class="finding">
   <h3>P2-2 · distcp CLI 保存后必崩 <span class="badge b-fail">未修</span></h3>
   <div class="kv">
-    <div class="k">复现命令</div><div><code>PYTHONPATH=. .venv/bin/python -m gdtensor_sim.sim --root log/audit-df1/dcp/run/cli-report-repro --layers 1 --hidden 16 --ffn 32 --vocab 64 --tp 2 --format distcp --layout single</code>（不删除任何目录、不写 /tmp；入口 bug 无需 fresh dir 即可复现）</div>
+    <div class="k">复现命令</div><div><code>PYTHONPATH=. .venv/bin/python -m gdtensor_conn.sim --root log/audit-df1/dcp/run/cli-report-repro --layers 1 --hidden 16 --ffn 32 --vocab 64 --tp 2 --format distcp --layout single</code>（不删除任何目录、不写 /tmp；入口 bug 无需 fresh dir 即可复现）</div>
     <div class="k">实际结果</div><div>exit=1；所有 rank 报 save committed，磁盘只有 <code>__0_0.distcp</code>；<code>sim.py:210</code> <code>sum(os.path.getsize(root/f) for f in index.files)</code> 抛 <code>FileNotFoundError: model.distcp</code>（布局推名，torch no_dist 从不写该名），在 load/verify 之前崩溃。对照 safetensors 同参数 exit=0、load_bytes_verified=true。</div>
     <div class="k">影响</div><div>文档化的 CLI distcp 示例每次非零退出；pytest 从不触 <code>sim.main()</code> 的报告段，CI 保持绿——非测试入口盲区。</div>
     <div class="k">建议</div><div>distcp 的数据字节从<b>实际磁盘产物</b>推导（读 <code>.metadata</code> 的 <code>storage_data.relative_path</code> 列表，或 listdir 排除 <code>.metadata</code>），不要用 <code>PayloadIndex.files</code>；CI 加一条 CLI smoke 断言。</div>
@@ -285,7 +285,7 @@
     <tr><td>F1 payload 翻位（生产加载）/ F1b 深查</td><td><span class="badge b-design">CONF-1 设计确认</span></td><td>不 raise；独立 oracle 会抓到</td></tr>
     <tr><td>F2 .metadata pickle 损坏 / F3 缺 <code>__0_0.distcp</code> / F5 改名 / F7 只读根发布</td><td><span class="badge b-ok">PASS（loud）</span></td><td>均包成 Err 抛出</td></tr>
     <tr><td>F4 同根重复保存（staging 复用）</td><td><span class="badge b-ok">PASS</span></td><td><code>_clear_stage</code> 工作正常</td></tr>
-    <tr><td>包边界：<code>gdtensor/</code> import gdtensor_sim 或 torch</td><td><span class="badge b-ok">PASS</span></td><td>grep 无；方向 business→core</td></tr>
+    <tr><td>包边界：<code>gdtensor/</code> import gdtensor_conn 或 torch</td><td><span class="badge b-ok">PASS</span></td><td>grep 无；方向 business→core</td></tr>
     <tr><td>非测试入口 CLI distcp smoke</td><td><span class="badge b-fail">FAIL · P2-2</span></td><td>exit=1，sim.py:210 FileNotFoundError</td></tr>
     <tr><td>非测试入口 CLI safetensors smoke</td><td><span class="badge b-ok">PASS</span></td><td>exit=0，load_bytes_verified=true</td></tr>
   </tbody>
@@ -345,8 +345,8 @@
   <li><b>TLA</b>：CopyPlan 状态变量 layout/savePlan/saveDone/loadPlan/loadDone，AtomicPublish 状态变量 phase/visible/crashed；<b>11 个配置</b>（CopyPlan S=2,3 × N=1,2,3,5,6 共 10 + AtomicPublish 1）全部 No error found——注意是 11 个配置，非 11 个不同模型。</li>
   <li><b>未覆盖</b>：新 <code>api.py:83-295</code> _NodeState（slot 容量上限、全消费者 ACK 释放、cohort 错误世代、活存阻塞）在形式模型中<b>无</b>对应。形式覆盖未完<b>不等于 bug</b>，但「整体验证」未覆盖该状态机（其正确性由独立 oracle 测试支撑）。</li>
   <li><b>CI</b>：checks job 仅允许「could not import torch」类 skip，torch job 0 skip；<b>CI 不执行任何 formal 步骤</b>（Lean/TLA 仅本地门禁，存在漂移风险）。</li>
-  <li><b>mutation</b>：9/9 killed（original 串全库唯一命中、baseline 先过），但全部打 core；<b>零 gdtensor_sim 对抗</b>——无 slot-state 变异，也无 DCP fault-offset 变异（出 bug 的 <code>get_file_offset</code> 无 mutation 守护）。</li>
-  <li><b>NoTorch 导入阻断</b>：独立子进程 torch 物理阻断下，core <code>gdtensor{,io,builder,session,access,tag}</code> 与 <code>gdtensor_sim{,models,runner,sim}</code> 全部 import EXIT 0。</li>
+  <li><b>mutation</b>：9/9 killed（original 串全库唯一命中、baseline 先过），但全部打 core；<b>零 gdtensor_conn 对抗</b>——无 slot-state 变异，也无 DCP fault-offset 变异（出 bug 的 <code>get_file_offset</code> 无 mutation 守护）。</li>
+  <li><b>NoTorch 导入阻断</b>：独立子进程 torch 物理阻断下，core <code>gdtensor{,io,builder,session,access,tag}</code> 与 <code>gdtensor_conn{,models,runner,sim}</code> 全部 import EXIT 0。</li>
   <li><b>跨 repro 互证</b>：DCP P1-1 与 P2-2 经两路独立 repro 互证成立，不重复立案。</li>
 </ul>
 

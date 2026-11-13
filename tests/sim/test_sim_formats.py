@@ -10,9 +10,9 @@ import pytest
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-from gdtensor_sim.coord import ThreadCoordinator
-from gdtensor_sim.formats import make_storage_view
-from gdtensor_sim.models import ParallelConfig, layout_builder, storage_table
+from gdtensor_conn.coord import ThreadCoordinator
+from gdtensor_conn.formats import make_storage_view
+from gdtensor_conn.models import ParallelConfig, layout_builder, storage_table
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import SRC, run_ranks, tensor_schema
 

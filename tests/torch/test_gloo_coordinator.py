@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from gdtensor_sim.coord import GlooCoordinator
+from gdtensor_conn.coord import GlooCoordinator
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,7 +33,7 @@ def _run_node(torchrun, node, port, env):
         f"--rdzv-endpoint=127.0.0.1:{port}",
         f"--rdzv-id=gdtensor-{os.getpid()}",
         "--module",
-        "gdtensor_sim.gloo_torchrun",
+        "gdtensor_conn.gloo_torchrun",
     ]
     process = subprocess.Popen(
         command,

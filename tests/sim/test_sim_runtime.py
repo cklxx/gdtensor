@@ -7,15 +7,15 @@ import pytest
 
 import gdtensor.builder as gb
 from gdtensor.builder import global_tensor_meta_of
-from gdtensor_sim.fabric import ComputeFabric
-from gdtensor_sim.models import (
+from gdtensor_conn.fabric import ComputeFabric
+from gdtensor_conn.models import (
     ParallelConfig,
     fill_pattern,
     layout_builder,
     pattern_bytes,
     storage_table,
 )
-from gdtensor_sim.runner import load_threads, run_processes, save_threads
+from gdtensor_conn.runner import load_threads, run_processes, save_threads
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import DST, LAYOUTS, SRC, bf16_schema, tensor_schema
 
