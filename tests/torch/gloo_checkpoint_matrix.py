@@ -394,3 +394,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # ponytail: bypass native atexit after explicit Gloo teardown; test IO is complete.
+    os._exit(0)
