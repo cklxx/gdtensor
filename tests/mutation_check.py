@@ -42,7 +42,7 @@ def _production_manifest(root=ROOT):
     """relpath -> sha256 of every production source file (the frozen tree)."""
     paths = [
         path
-        for pkg in ("gdtensor", "gdtensor_sim")
+        for pkg in ("gdtensor", "gdtensor_conn")
         for path in (Path(root) / pkg).rglob("*.py")
         if "__pycache__" not in path.parts
     ]
@@ -124,7 +124,7 @@ MUTATIONS = [
     # makes a gapped range look contiguous, so the detector (negative row offset
     # contract) flips from raise to Ok. importorskip("torch") -> torch group.
     (
-        "gdtensor_sim/dcp_backend.py",
+        "gdtensor_conn/dcp_backend.py",
         "if local[-1] - local[0] + 1 != len(local):",
         "if local[-1] - local[0] + 1 == len(local):",
         "tests/sim/test_audit_dcp_regressions.py::test_col_shard_get_file_offset_must_raise_invalidarg",
@@ -210,14 +210,14 @@ MUTATIONS = [
         "notorch",
     ),
     (
-        "gdtensor_sim/file_cache.py",
+        "gdtensor_conn/file_cache.py",
         "if len(raw) != size or hashlib.sha256(raw).digest() != digest:",
         "if len(raw) != size:",
         "tests/io/test_file_cache_correctness.py::test_corrupt_cache_fails_before_delivery[checksum]",
         "notorch",
     ),
     (
-        "gdtensor_sim/file_cache.py",
+        "gdtensor_conn/file_cache.py",
         'raise OSError("cache short write made no progress")',
         "return",
         "tests/io/test_file_cache_correctness.py::test_zero_short_write_never_publishes",
@@ -364,7 +364,7 @@ MUTATIONS = [
         "notorch",
     ),
     (
-        "gdtensor_sim/file_cache.py",
+        "gdtensor_conn/file_cache.py",
         "namespace = ga._content_digest(identity)[:20]",
         'namespace = "all-sources"',
         "tests/io/test_file_cache_correctness.py::test_source_file_identity_prevents_stale_hit[same_path]",
@@ -500,21 +500,21 @@ MUTATIONS = [
         "notorch",
     ),
     (
-        "gdtensor_sim/file_cache.py",
+        "gdtensor_conn/file_cache.py",
         "namespace = ga._content_digest(identity)[:20]",
         "namespace = repr(identity)",
         "tests/io/test_file_cache_correctness.py::test_cache_identity_content_prevents_repr_collision",
         "notorch",
     ),
     (
-        "gdtensor_sim/file_cache.py",
+        "gdtensor_conn/file_cache.py",
         "digest_raw = os.pread(fd, record_size, self.bases[tid] + record_off)",
         "digest_raw = raw",
         "tests/io/test_file_cache_correctness.py::test_overlapping_write_refreshes_combined_integrity_record",
         "notorch",
     ),
     (
-        "gdtensor_sim/file_cache.py",
+        "gdtensor_conn/file_cache.py",
         "records = sorted(self.integrity_keys.get((namespace, node, tid), ()))",
         "records = []",
         "tests/io/test_file_cache_correctness.py::test_adjacent_integrity_records_cover_one_read",
@@ -531,7 +531,7 @@ MUTATIONS = [
         "notorch",
     ),
     (
-        "gdtensor_sim/ssh_cache.py",
+        "gdtensor_conn/ssh_cache.py",
         'namespace = ga._content_digest(getattr(rng, "source_identity", None))',
         'namespace = repr(getattr(rng, "source_identity", None))',
         "tests/io/test_ssh_cache.py::test_source_keys_use_identity_content_not_repr",
@@ -610,7 +610,7 @@ def _run(snapshot, detector, log):
 
 
 def _copy_checkout(snapshot):
-    for name in ("gdtensor", "gdtensor_sim", "tests", "docs"):
+    for name in ("gdtensor", "gdtensor_conn", "tests", "docs"):
         shutil.copytree(
             ROOT / name,
             snapshot / name,

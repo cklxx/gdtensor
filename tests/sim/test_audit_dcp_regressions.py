@@ -16,7 +16,7 @@ Contract pinned here:
   whose pread sweeps into the peer rank's bytes;
 - in-process ``rank_load`` data path stays correct regardless.
 
-The oracle here never imports ``gdtensor_sim.dcp_backend._raw_payload_bases``.
+The oracle here never imports ``gdtensor_conn.dcp_backend._raw_payload_bases``.
 """
 
 from __future__ import annotations

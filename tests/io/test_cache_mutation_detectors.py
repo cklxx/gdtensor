@@ -11,7 +11,7 @@ import safetensors.numpy
 import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
-from gdtensor_sim.formats import make_storage_view
+from gdtensor_conn.formats import make_storage_view
 from tests.support.cache_oracle import (
     FileCache,
     cache_view,

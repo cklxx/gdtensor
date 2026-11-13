@@ -10,7 +10,7 @@ from torch.distributed import (
     init_process_group,
 )
 
-from gdtensor_sim.coord import GlooCoordinator
+from gdtensor_conn.coord import GlooCoordinator
 
 
 def _check(ok: bool, message: str) -> None:

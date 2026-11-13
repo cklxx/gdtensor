@@ -1,7 +1,7 @@
 /-
 Single-contiguous-run criterion for the DCP slot mapping.
 
-Mirrors the tail of ``gdtensor_sim/dcp_backend.py`` ``_owned_chunk_local_run``
+Mirrors the tail of ``gdtensor_conn/dcp_backend.py`` ``_owned_chunk_local_run``
 (frozen source, audit df1):
 
     local.sort()

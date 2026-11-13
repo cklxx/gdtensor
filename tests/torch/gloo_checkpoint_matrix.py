@@ -19,8 +19,8 @@ import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
 from gdtensor import Result
-from gdtensor_sim.access import buffer_address
-from gdtensor_sim.coord import GlooCoordinator
+from gdtensor_conn.access import buffer_address
+from gdtensor_conn.coord import GlooCoordinator
 from tests.support.checkpoint import file_bytes, small_schema
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import storage_view

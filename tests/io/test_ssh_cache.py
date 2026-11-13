@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import gdtensor.builder as gb
-from gdtensor_sim.ssh_cache import SSHCache
+from gdtensor_conn.ssh_cache import SSHCache
 
 
 def cache():

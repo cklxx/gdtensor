@@ -4,8 +4,8 @@ set -euxo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 printf '\n[review 1/7] fmt, lint, exports, signatures and <=3 indentation levels\n'
-uv run --locked ruff format --check gdtensor gdtensor_sim tests
-uv run --locked ruff check gdtensor gdtensor_sim tests
+uv run --locked ruff format --check gdtensor gdtensor_conn tests
+uv run --locked ruff check gdtensor gdtensor_conn tests
 uv run --locked pytest -v -p no:cacheprovider tests/core/test_api_conformance.py \
   -k 'code_blocks or exports or function_signatures'
 

@@ -1,9 +1,9 @@
-"""Real-process smoke: run ``python -m gdtensor_sim.sim`` end-to-end as a
+"""Real-process smoke: run ``python -m gdtensor_conn.sim`` end-to-end as a
 subprocess for both checkpoint formats and a layout, with a bounded timeout and
 a fresh unique work dir.
 
 Calling ``main()`` in-process proves the function works, but not that the
-console entry point ``python -m gdtensor_sim.sim`` wires argv, dispatch and the
+console entry point ``python -m gdtensor_conn.sim`` wires argv, dispatch and the
 report step together. This test exercises the real module entry point.
 
 Regression for P2-2: the reporting step used to raise FileNotFoundError on a
@@ -29,7 +29,7 @@ def _run_cli(root, fmt, layout):
     argv = [
         sys.executable,
         "-m",
-        "gdtensor_sim.sim",
+        "gdtensor_conn.sim",
         "--root",
         str(root),
         "--layers",

@@ -34,8 +34,8 @@ import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
 from gdtensor import Result
-from gdtensor_sim.formats import make_storage_view
-from gdtensor_sim.iobackend import FileIO
+from gdtensor_conn.formats import make_storage_view
+from gdtensor_conn.iobackend import FileIO
 from tests.support.cache_oracle import ResidentCache, storage_schema
 from tests.support.cluster_sim import Cluster, NodeCache
 
@@ -295,7 +295,7 @@ def test_dcp_only_filler_sessions_load_full_source(tmp_path, monkeypatch):
     )
 
     # Opening sessions does not load payload; only actual fillers load DCP.
-    import gdtensor_sim.dcp_backend as dcp_backend
+    import gdtensor_conn.dcp_backend as dcp_backend
 
     calls = {"n": 0}
     orig = dcp_backend._real_dcp_load
@@ -365,7 +365,7 @@ def test_dcp_metadata_only_payload_change_refreshes_cached_bytes(tmp_path, monke
         src=sv, cache=_cache_view(cache_mem, 1, 1), dst=cv, num_ranks_per_node=K
     )
 
-    import gdtensor_sim.dcp_backend as dcp_backend
+    import gdtensor_conn.dcp_backend as dcp_backend
 
     calls = {"n": 0}
     original_load = dcp_backend._real_dcp_load

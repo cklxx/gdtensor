@@ -15,10 +15,10 @@ import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
 from gdtensor import Result
-from gdtensor_sim.coord import ThreadCoordinator
-from gdtensor_sim.formats import COMMIT_MARKER_NAME, make_storage_view
-from gdtensor_sim.iobackend import SdkFileIO
-from gdtensor_sim.models import ParallelConfig, layout_builder, storage_table
+from gdtensor_conn.coord import ThreadCoordinator
+from gdtensor_conn.formats import COMMIT_MARKER_NAME, make_storage_view
+from gdtensor_conn.iobackend import SdkFileIO
+from gdtensor_conn.models import ParallelConfig, layout_builder, storage_table
 from tests.support.cache_oracle import storage_schema
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import run_ranks, tensor_schema

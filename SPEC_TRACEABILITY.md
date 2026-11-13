@@ -22,12 +22,12 @@
 | B.2.4 递归约束与同一错误对象返回 | `internal/constraints.py` | [`test_constraints.py`](tests/core/test_constraints.py) |
 | 第 7 节文件布局场景 | 业务或测试构造 PhysicalLayoutTable | [`test_data_correctness.py`](tests/checkpoint/test_data_correctness.py)、[`test_matrix.py`](tests/checkpoint/test_matrix.py)；每 rank 文件、共享文件、多文件、按 stage、跨 world |
 | 第 10 节 LAWA | 测试调用方在 torch.DTensor 上计算 | [`test_lawa.py`](tests/torch/test_lawa.py)；朴素 / Welford、k=1/2/3/5、2–32 个真实进程 |
-| 格式生命周期及 metadata 发布 | `gdtensor_sim/formats.py` | [`test_sim_formats.py`](tests/sim/test_sim_formats.py)；元数据错误、metadata 延迟、leader 发布失败 |
-| 删除领域越界 | 模型、布局策略、文件格式、模拟内存与协调放入 `gdtensor_sim/` | [`test_api_conformance.py`](tests/core/test_api_conformance.py) 的定义及依赖检查 |
+| 格式生命周期及 metadata 发布 | `gdtensor_conn/formats.py` | [`test_sim_formats.py`](tests/sim/test_sim_formats.py)；元数据错误、metadata 延迟、leader 发布失败 |
+| 删除领域越界 | 模型、布局策略、文件格式、模拟内存与协调放入 `gdtensor_conn/` | [`test_api_conformance.py`](tests/core/test_api_conformance.py) 的定义及依赖检查 |
 
 [`test_api_conformance.py`](tests/core/test_api_conformance.py) 还检查 core / sim / tests 的代码块缩进不超过三层。`scripts/review.sh` 使用小数据并打印中间执行结果。环境、依赖和格式化统一由 uv 管理。
 
-核心测试的 session、文件 fixture 和内存 fixture 只依赖设计 API。格式实现测试调用 `gdtensor_sim` 中的具体实现；独立数据 oracle 不调用这些实现的区间或布局算法。
+核心测试的 session、文件 fixture 和内存 fixture 只依赖设计 API。格式实现测试调用 `gdtensor_conn` 中的具体实现；独立数据 oracle 不调用这些实现的区间或布局算法。
 
 设计方已明确两条规则：
 

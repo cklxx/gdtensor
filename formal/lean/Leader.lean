@@ -1,7 +1,7 @@
 /-
 Group leader = minimum row index in full table order.
 
-Mirrors ``gdtensor_sim/models.py`` layout grouping (frozen source):
+Mirrors ``gdtensor_conn/models.py`` layout grouping (frozen source):
 
     for t, nd in enumerate(table.named_d_tensors):     # t = ABSOLUTE row index
         ...

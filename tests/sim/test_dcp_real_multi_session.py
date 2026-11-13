@@ -156,9 +156,9 @@ def test_real_sharded_public_session_pread_bytes_match(tmp_path):
     _spawn_save(root)
 
     import gdtensor.builder as gb
-    from gdtensor_sim._layout import build_payload_index
-    from gdtensor_sim.models import build_layout
-    from gdtensor_sim.dcp_backend import DcpLoadSession
+    from gdtensor_conn._layout import build_payload_index
+    from gdtensor_conn.models import build_layout
+    from gdtensor_conn.dcp_backend import DcpLoadSession
 
     table = _build_gdtensor_table_world2()
     layout = build_layout(table, 2, "safetensors", lambda t, w, nd: f"__{w}_0.distcp")
@@ -214,9 +214,9 @@ def test_real_col_sharded_public_session_pread_bytes_match(tmp_path):
 
     import gdtensor.builder as gb
     import gdtensor.tag as gt
-    from gdtensor_sim._layout import build_payload_index
-    from gdtensor_sim.models import build_layout
-    from gdtensor_sim.dcp_backend import DcpLoadSession
+    from gdtensor_conn._layout import build_payload_index
+    from gdtensor_conn.models import build_layout
+    from gdtensor_conn.dcp_backend import DcpLoadSession
 
     placements = [gb.Replicate(), gb.Shard(1)]
     mesh = gb.ReshapedMesh(gb.ArrangedMesh(gt.WorldSize(2)), [1, 2])
@@ -275,9 +275,9 @@ def test_world1_slot_spanning_two_chunks_returns_err(tmp_path):
 
     import gdtensor.builder as gb
     import gdtensor.tag as gt
-    from gdtensor_sim._layout import build_payload_index
-    from gdtensor_sim.models import build_layout
-    from gdtensor_sim.dcp_backend import DcpLoadSession
+    from gdtensor_conn._layout import build_payload_index
+    from gdtensor_conn.models import build_layout
+    from gdtensor_conn.dcp_backend import DcpLoadSession
 
     # world=1: single slot owns the whole tensor.
     placements = [gb.Replicate(), gb.Replicate()]
@@ -359,9 +359,9 @@ def test_col_shard_sub_slot_second_row_pread(tmp_path):
 
     import gdtensor.builder as gb
     import gdtensor.tag as gt
-    from gdtensor_sim._layout import build_payload_index
-    from gdtensor_sim.models import build_layout
-    from gdtensor_sim.dcp_backend import DcpLoadSession
+    from gdtensor_conn._layout import build_payload_index
+    from gdtensor_conn.models import build_layout
+    from gdtensor_conn.dcp_backend import DcpLoadSession
 
     # world=4 mesh (2 rows x 2 cols): rank2 = row1, col0.
     placements = [gb.Shard(0), gb.Shard(1)]

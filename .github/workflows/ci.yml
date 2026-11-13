@@ -37,11 +37,11 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked
       - name: Format
-        run: uv run --locked ruff format --check gdtensor gdtensor_sim tests
+        run: uv run --locked ruff format --check gdtensor gdtensor_conn tests
       - name: Lint
-        run: uv run --locked ruff check --no-cache gdtensor gdtensor_sim tests
+        run: uv run --locked ruff check --no-cache gdtensor gdtensor_conn tests
       - name: Compile
-        run: uv run --locked python -m compileall -q gdtensor gdtensor_sim tests
+        run: uv run --locked python -m compileall -q gdtensor gdtensor_conn tests
       - name: Pure core + IO tests (no torch; zero skip)
         # Real DCP cache cases run in the torch job, with the same zero-skip gate.
         run: |

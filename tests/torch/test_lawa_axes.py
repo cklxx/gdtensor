@@ -29,7 +29,7 @@ import pytest
 import gdtensor
 import gdtensor.builder as gb
 import gdtensor.io as gio
-from gdtensor_sim.coord import ProcessCoordinator
+from gdtensor_conn.coord import ProcessCoordinator
 from tests.support import axes
 from tests.support.oracle import TorchAccessor
 from tests.support.schemas import payload_regions

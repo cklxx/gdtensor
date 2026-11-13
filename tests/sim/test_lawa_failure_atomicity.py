@@ -1,6 +1,6 @@
 """E2: a failed LAWA mean save is atomic at the checkpoint level and rerunnable.
 
-Uses the real safetensors save session (gdtensor_sim.formats). Visibility is
+Uses the real safetensors save session (gdtensor_conn.formats). Visibility is
 gated by a single completion marker published by one writer after every
 shard rename; load refuses a directory without a matching marker. The LAWA
 mean is a brand-new checkpoint and must never overwrite its inputs.
@@ -25,9 +25,9 @@ import numpy as np
 
 import gdtensor.builder as gb
 import gdtensor.io as gio
-from gdtensor_sim.coord import ThreadCoordinator
-from gdtensor_sim.formats import COMMIT_MARKER_NAME, make_storage_view
-from gdtensor_sim.models import ParallelConfig, layout_builder, storage_table
+from gdtensor_conn.coord import ThreadCoordinator
+from gdtensor_conn.formats import COMMIT_MARKER_NAME, make_storage_view
+from gdtensor_conn.models import ParallelConfig, layout_builder, storage_table
 from tests.support.checkpoint import file_bytes
 from tests.support.oracle import ArrayFabric
 from tests.support.schemas import SRC, run_ranks, tensor_schema, verify_crc

@@ -13,7 +13,7 @@
 
 `Ok` / `Err` 只从 `gdtensor.tag` 导入。五个 torch 桥函数只从顶层导入。session / accessor 接口只从各自的 namespace 导入。`Result` 使用设计 C.2 指定的 Python 3.12 类型别名。
 
-`gdtensor/internal/` 保存 plan、range、约束和区间运算。`gdtensor_sim/` 保存业务模型、布局策略、文件格式实现、模拟内存和多 rank runner。核心不导出 `ComputeFabric`，不决定 PP/DP/TP 拓扑或文件布局，不执行 LAWA。
+`gdtensor/internal/` 保存 plan、range、约束和区间运算。`gdtensor_conn/` 保存业务模型、布局策略、文件格式实现、模拟内存和多 rank runner。核心不导出 `ComputeFabric`，不决定 PP/DP/TP 拓扑或文件布局，不执行 LAWA。
 
 IO 使用 session 的 `init_data_accessor()`。自定义 accessor 不需要内部 `index` 或 `bind`。buffer 回调支持分块，读写两侧可以使用不同的分块大小。LAWA 在 `torch.DTensor` 上计算，通过顶层桥函数取出和写回张量。
 
@@ -29,8 +29,8 @@ safetensors 可以通过 `SdkFileIO` 接入外部同步文件系统 SDK。外部
 
 ```python
 from gdtensor.io import chain_load, rank_load, rank_save
-from gdtensor_sim.formats import make_storage_view
-from gdtensor_sim.iobackend import SdkFileIO
+from gdtensor_conn.formats import make_storage_view
+from gdtensor_conn.iobackend import SdkFileIO
 
 client = YourFileSystemClient(endpoint="...", credentials="...")
 storage_view = make_storage_view(
@@ -47,7 +47,7 @@ rank_save(rank, compute_view, storage_view)
 chain_load(rank, read_chain)  # read_chain 的 source 使用上述 storage_view
 ```
 
-client 采用 `gdtensor_sim.iobackend.FileSystemClient` 的结构化协议，不需要继承基类：
+client 采用 `gdtensor_conn.iobackend.FileSystemClient` 的结构化协议，不需要继承基类：
 
 | 方法 | 必须满足的语义 |
 |---|---|
@@ -81,7 +81,7 @@ client 采用 `gdtensor_sim.iobackend.FileSystemClient` 的结构化协议，不
 - 当前适配仅覆盖 safetensors。向 DCP view 传 `SdkFileIO` 会明确报错；DCP 仍使用原有 Torch 后端。
 - client 必须提供 range read/write。只支持整对象 PUT 的 SDK 需要先在外部实现完整 shard staging，不能把每个 CopyPlan range 当成独立对象上传。
 - 第一阶段 `DiskNodeCache` 仍写本地盘，不随 source SDK 迁移。
-- `gdtensor_sim` 是 simulation/test harness，不是 release core API。生产框架的 builder 应在 `begin_load/begin_save` 中注入同一 backend。
+- `gdtensor_conn` 是 connector/test harness，不是 release core API。生产框架的 builder 应在 `begin_load/begin_save` 中注入同一 backend。
 
 完整可运行的内存 client 和读写示例见 `tests/sim/test_sdk_file_io.py`。
 
@@ -176,7 +176,7 @@ CRC 只计算 payload 字节。独立 oracle 同时逐字节比较，并为每�
 
 ```bash
 uv sync --locked --extra torch
-uv run --locked ruff format gdtensor gdtensor_sim tests
+uv run --locked ruff format gdtensor gdtensor_conn tests
 uv run --locked --extra torch ty check --error-on-warning
 uv run --locked --extra torch pyrefly check --min-severity=warn
 scripts/review.sh
@@ -198,13 +198,13 @@ GitHub Actions 在 push main、PR 和手动触发时运行。Python 3.12 / 3.13 
 
 ### torchrun + Gloo CPU 同步
 
-`gdtensor_sim.coord.GlooCoordinator` 使用调用方初始化的默认 process group。`vote()` 对 CPU `int32` 张量执行 `all_reduce(MIN)`，任一 rank 失败则全部返回 `False`；`wait()` 调用 `barrier()`。所有 rank 必须以相同顺序调用这两个方法。torch 仍是可选依赖。
+`gdtensor_conn.coord.GlooCoordinator` 使用调用方初始化的默认 process group。`vote()` 对 CPU `int32` 张量执行 `all_reduce(MIN)`，任一 rank 失败则全部返回 `False`；`wait()` 调用 `barrier()`。所有 rank 必须以相同顺序调用这两个方法。torch 仍是可选依赖。
 
 单机两个 rank：
 
 ```bash
 uv run --locked --extra torch-cpu torchrun --standalone \
-  --nproc-per-node=2 --module gdtensor_sim.gloo_torchrun
+  --nproc-per-node=2 --module gdtensor_conn.gloo_torchrun
 ```
 
 两台主机各运行两个 rank。先在各主机安装同一代码和依赖，再把 `RDZV_ENDPOINT` 设为 node 0 上可达的地址：
@@ -215,13 +215,13 @@ export RDZV_ENDPOINT=node0:29500
 uv run --locked --extra torch-cpu torchrun \
   --nnodes=2 --node-rank=0 --nproc-per-node=2 \
   --rdzv-backend=c10d --rdzv-endpoint="$RDZV_ENDPOINT" \
-  --rdzv-id=gdtensor-gloo-demo --module gdtensor_sim.gloo_torchrun
+  --rdzv-id=gdtensor-gloo-demo --module gdtensor_conn.gloo_torchrun
 
 # node 1：使用相同的 RDZV_ENDPOINT
 uv run --locked --extra torch-cpu torchrun \
   --nnodes=2 --node-rank=1 --nproc-per-node=2 \
   --rdzv-backend=c10d --rdzv-endpoint="$RDZV_ENDPOINT" \
-  --rdzv-id=gdtensor-gloo-demo --module gdtensor_sim.gloo_torchrun
+  --rdzv-id=gdtensor-gloo-demo --module gdtensor_conn.gloo_torchrun
 ```
 
 示例检查全票成功、每个 rank 单独失败时的全局失败传播，以及失败后的复用。`tests/torch/test_gloo_coordinator.py` 在同一主机的两个 torchrun agent 上执行四个 CPU rank；这不是物理双机证据。
@@ -229,7 +229,7 @@ uv run --locked --extra torch-cpu torchrun \
 ## 仿真 CLI
 
 ```bash
-uv run --locked python -m gdtensor_sim.sim --root /tmp/gdtensor-ck \
+uv run --locked python -m gdtensor_conn.sim --root /tmp/gdtensor-ck \
   --tp 4 --dp 4 --pp 2 --optimizer --layout hf --format safetensors
 ```
 

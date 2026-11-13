@@ -14,7 +14,7 @@ import gdtensor
 import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
-from gdtensor_sim.coord import GlooCoordinator
+from gdtensor_conn.coord import GlooCoordinator
 from tests.support.crc import crc_of, verify_payload
 from tests.support.lawa import normalize_weights as _normalize_weights
 from tests.support.oracle import TorchAccessor

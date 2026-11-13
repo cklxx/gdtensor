@@ -1,7 +1,7 @@
 /-
 Row-major global -> chunk-local coordinate mapping for the DCP storage layout.
 
-Mirrors the real algorithm in ``gdtensor_sim/dcp_backend.py``
+Mirrors the real algorithm in ``gdtensor_conn/dcp_backend.py``
 ``_owned_chunk_local_run`` (frozen source, audit df1), lines 246-260:
 
     for g in owned_flat:

@@ -34,7 +34,7 @@ def test_raw_offset_resolves_by_structure_not_content_search(tmp_path):
     c = torch.arange(7, dtype=torch.bfloat16)
     _save(tmp_path, [("alpha", a), ("beta", b), ("gamma", c)])
 
-    from gdtensor_sim.dcp_backend import _raw_payload_bases
+    from gdtensor_conn.dcp_backend import _raw_payload_bases
 
     bases = _raw_payload_bases(str(tmp_path))
     raw = open(tmp_path / "__0_0.distcp", "rb").read()
@@ -52,11 +52,11 @@ def test_session_get_file_offset_preads_byte_exact(tmp_path):
     that preads byte-exact tensor bytes (existing pos); missing pos is NotFound."""
     import gdtensor.builder as gb
     from gdtensor.builder import global_tensor_meta_of
-    from gdtensor_sim._geometry import nonempty_columns
-    from gdtensor_sim._layout import build_payload_index
-    from gdtensor_sim.models import build_layout
+    from gdtensor_conn._geometry import nonempty_columns
+    from gdtensor_conn._layout import build_payload_index
+    from gdtensor_conn.models import build_layout
     from tests.support.schemas import tensor_schema
-    from gdtensor_sim.dcp_backend import DcpLoadSession
+    from gdtensor_conn.dcp_backend import DcpLoadSession
 
     ct, _, _ = tensor_schema((1, 1, 1))
     _DT = {
@@ -98,11 +98,11 @@ def test_middle_slot_within_chunk_offset_preads_distinct_ranges(tmp_path):
     same base for every slot in the chunk."""
     import gdtensor.builder as gb
     from gdtensor.builder import global_tensor_meta_of
-    from gdtensor_sim._geometry import nonempty_columns
-    from gdtensor_sim._layout import build_payload_index
-    from gdtensor_sim.models import build_layout
+    from gdtensor_conn._geometry import nonempty_columns
+    from gdtensor_conn._layout import build_payload_index
+    from gdtensor_conn.models import build_layout
     from tests.support.schemas import tensor_schema
-    from gdtensor_sim.dcp_backend import DcpLoadSession
+    from gdtensor_conn.dcp_backend import DcpLoadSession
 
     ct, _, _ = tensor_schema((1, 1, 1))
     state = {}

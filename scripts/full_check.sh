@@ -12,17 +12,17 @@ unset PYTHONPATH
 
 # Keep the same locked CPU torch environment for every full-check step.
 echo "[full-check] 1/5 fmt check"
-uv run --locked --extra torch-cpu ruff format --check gdtensor gdtensor_sim tests
+uv run --locked --extra torch-cpu ruff format --check gdtensor gdtensor_conn tests
 
 echo "[full-check] 2/5 lint"
-uv run --locked --extra torch-cpu ruff check --no-cache gdtensor gdtensor_sim tests
+uv run --locked --extra torch-cpu ruff check --no-cache gdtensor gdtensor_conn tests
 
 echo "[full-check] 3/5 type check"
 uv run --locked --extra torch-cpu ty check --error-on-warning
 uv run --locked --extra torch-cpu pyrefly check --min-severity=warn
 
 echo "[full-check] 4/5 byte-compile"
-uv run --locked --extra torch-cpu python -m compileall -q gdtensor gdtensor_sim tests
+uv run --locked --extra torch-cpu python -m compileall -q gdtensor gdtensor_conn tests
 
 # The basic path (fmt/lint/types/compile/pytest) is self-contained. The
 # advanced formal gate is a separate opt-in step, independent of basic:

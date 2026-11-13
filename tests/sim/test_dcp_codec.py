@@ -1,6 +1,6 @@
 """Hermetic contract tests for the real-DCP backend dtype codec.
 
-These lock the byte-exact dtype contract of gdtensor_sim.dcp_backend: staged
+These lock the byte-exact dtype contract of gdtensor_conn.dcp_backend: staged
 slot bytes are the raw element bytes of the tensor dtype, and BF16 is never
 widened through float32. No mesh / compute fabric is needed -- only the raw
 buffer -> torch tensor reconstruction that the staging publisher relies on.
@@ -12,7 +12,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from gdtensor_sim import dcp_backend as db
+from gdtensor_conn import dcp_backend as db
 
 from tests.support.crc import crc_of, verify_payload
 

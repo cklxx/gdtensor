@@ -11,7 +11,7 @@ import pytest
 import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
-from gdtensor_sim.coord import ThreadCoordinator
+from gdtensor_conn.coord import ThreadCoordinator
 from tests.support.oracle import ArrayFabric
 from tests.support.storage import FileStorage
 

@@ -17,8 +17,8 @@ import gdtensor.builder as gb
 import gdtensor.io as gio
 import gdtensor.tag as gt
 from gdtensor import Result
-from gdtensor_sim.formats import make_storage_view
-from gdtensor_sim.iobackend import FileIO
+from gdtensor_conn.formats import make_storage_view
+from gdtensor_conn.iobackend import FileIO
 from tests.support.cache_oracle import storage_schema
 from tests.support.oracle import ArrayFabric
 
@@ -121,9 +121,9 @@ def test_file_callback_error_does_not_write_payload(tmp_path):
 
 
 def test_cache_identity_does_not_open_nonlocal_shards(tmp_path, monkeypatch):
-    from gdtensor_sim.access import StorageDataAccessor
-    from gdtensor_sim._layout import PayloadIndex
-    import gdtensor_sim.iobackend as iobackend
+    from gdtensor_conn.access import StorageDataAccessor
+    from gdtensor_conn._layout import PayloadIndex
+    import gdtensor_conn.iobackend as iobackend
 
     names = {"a.safetensors", "b.safetensors"}
     for name in names:
