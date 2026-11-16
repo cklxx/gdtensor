@@ -979,26 +979,35 @@ class _RankRun:
         for node, segs in sorted(by_node.items()):
             self._fill_node_batches(layer, node, segs, batch_read)
 
-    def _fill_node_batches(self, layer, node, segs, batch_read) -> None:
+    def _fill_node_batches(self, layer, node, segs, batch_read) -> bool:
+        moved = False
         batches = _bounded_batches(
             segs, lambda seg: sum(size for _key, _off, size in seg.parents)
         )
         for batch in batches:
-            self._fill_reserved_batch(layer, node, batch, batch_read)
+            moved = self._fill_reserved_batch(layer, node, batch, batch_read) or moved
+        return moved
 
-    def _fill_reserved_batch(self, layer, node, batch, batch_read) -> None:
+    def _fill_reserved_batch(self, layer, node, batch, batch_read) -> bool:
         if self._reserve(layer, node, batch):
             self._fill_parent_batch(layer, node, batch, batch_read)
-            return
+            return True
+        moved = False
         for seg in batch:
-            self._fill_one(layer, node, seg.key)
+            moved = self._fill_one(layer, node, seg.key, batch_read) or moved
+        return moved
 
-    def _fill_one(self, layer: int, node: int, key) -> None:
+    def _fill_one(self, layer: int, node: int, key, batch_read=None) -> bool:
         if self._adopt(layer, node, key):
-            return
+            return False
         seg = self.plan.segments[layer][node][key]
-        if self._reserve(layer, node, [seg]):
+        if not self._reserve(layer, node, [seg]):
+            return False
+        if batch_read is None:
             self._fill(layer, node, seg)
+        else:
+            self._fill_parent_batch(layer, node, [seg], batch_read)
+        return True
 
     def _fill_parent_batch(self, layer, node, segs, batch_read) -> None:
         """Fill one reserved child-node batch from its parent cache node."""
@@ -1407,7 +1416,7 @@ class _RankRun:
             self._block(version, deadline, pending) if not moved else None
 
     def _step(self, pending: list) -> bool:
-        """Drain every filled piece; else fill one segment. True on progress."""
+        """Drain every filled piece; else fill ready segments. True on progress."""
         done = self._classify_drains(pending, self.last)
         self._drain_hot(done)
         for piece in done:
@@ -1415,20 +1424,18 @@ class _RankRun:
         return (
             bool(done)
             or self._service_step()
-            or any(self._ensure(self.last, n, k) for n, k, _o, _s in pending)
+            or self._ensure_items([(self.last, n, k) for n, k, _o, _s in pending])
         )
 
     def _service_step(self) -> bool:
-        ready = next(
-            (
-                item
-                for item in self.services
-                if self._completed(*item) or self._ensure(*item)
-            ),
-            None,
-        )
+        ready = next((item for item in self.services if self._completed(*item)), None)
+        moved = False if ready is not None else self._ensure_items(self.services)
         if ready is None:
-            return False
+            ready = next(
+                (item for item in self.services if self._completed(*item)), None
+            )
+        if ready is None:
+            return moved
         self.services.remove(ready)
         return True
 
@@ -1511,25 +1518,57 @@ class _RankRun:
             slot = self.t.node(layer, node).slots.get(key)
             return slot is not None and slot["filled"]
 
-    def _ensure(self, layer: int, node: int, key) -> bool:
-        """Try to make one segment resident; True when this call filled it.
+    def _ensure_items(self, items: list) -> bool:
+        items = list(dict.fromkeys(items))
+        moved = self._ensure_parent_batches(items)
+        return moved or any(
+            self._ensure(*item) for item in items if not self._has_parent_batch(item[0])
+        )
 
-        Upstream segments are requested only while this layer has room, so a
-        full layer does not pin upstream budget for a segment it cannot admit.
-        """
-        seg = self.plan.segments[layer][node][key]
-        if not self._can_fill(layer, node, key):
-            return False
-        if not self._room(layer, node, seg):
-            return False
-        if self._adopt(layer, node, key):
-            return False
-        if layer > 0 and not self._parents_ready(layer, node, seg):
-            return False
-        if not self._reserve(layer, node, [seg]):
+    def _has_parent_batch(self, layer: int) -> bool:
+        return (
+            layer > 0
+            and getattr(self.caches[layer - 1].data_accessor, "read_bytes_batch", None)
+            is not None
+        )
+
+    def _ensure_parent_batches(self, items: list) -> bool:
+        by_node = {}
+        for layer, node, key in items:
+            seg = (
+                self._prepare_fill(layer, node, key)
+                if self._has_parent_batch(layer)
+                else None
+            )
+            by_node.setdefault((layer, node), []).append(
+                seg
+            ) if seg is not None else None
+        moved = False
+        for (layer, node), segs in sorted(by_node.items()):
+            batch_read = self.caches[layer - 1].data_accessor.read_bytes_batch
+            moved = self._fill_node_batches(layer, node, segs, batch_read) or moved
+        return moved
+
+    def _ensure(self, layer: int, node: int, key) -> bool:
+        """Try to make one segment resident; True when this call filled it."""
+        seg = self._prepare_fill(layer, node, key)
+        if seg is None or not self._reserve(layer, node, [seg]):
             return False
         self._fill(layer, node, seg)
         return True
+
+    def _prepare_fill(self, layer: int, node: int, key):
+        """Check child capacity before filling or adopting its parents."""
+        seg = self.plan.segments[layer][node][key]
+        if not self._can_fill(layer, node, key):
+            return None
+        if not self._room(layer, node, seg):
+            return None
+        if self._adopt(layer, node, key):
+            return None
+        if layer > 0 and not self._parents_ready(layer, node, seg):
+            return None
+        return seg
 
     def _can_fill(self, layer: int, node: int, key) -> bool:
         return self.rank in self.plan.fill_ranks[(layer, node, key)]

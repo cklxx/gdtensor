@@ -107,6 +107,8 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 
 同形状对照用一层或两层缓存，各轮不清缓存。断言分两段：第 1 轮存储读取等于冷读字节；暖轮存储读取为 0，缓存读取大于 0，填充条数保持第 1 轮的水平。
 
+`test_file_cache_correctness.py` 参数化覆盖 all-fit 和 non-all-fit 的父层批量冷读、标量回退、reservation 回退、4 MiB 边界、损坏或畸形批次和写失败。`test_cache_reuse_layout.py` 在真实容量回收及 file/thread 协调下检查多 range 父层批次。
+
 跨轮复用读取缓存 accessor 的有效范围和源身份。`has_bytes` 默认返回 False。文件后端自动使用完整路径和 stat；调用方不用传版本号。同名文件变更会失效。DCP 身份包含 `.metadata` 及其中 `storage_data` 引用的全部 payload。safetensors identity 同时校验路径 stat 和本 rank `my_files()` 中实际 pread fd 的 fstat，打开 session 后原子替换路径会拒绝加载；非本地 shard 只做 stat，不新增 fd。内部 range 传递 `source_identity`，后端必须按身份隔离字节；未知身份仅允许当轮复用。视图结构保持不变。
 
 实测：36 个用例全部通过（12 个冷读、24 个缓存对照，四个层组合各 12 个）。包括冷读与压测在内的 `tests/io` 两组共 181 个用例通过，用时 100 秒。

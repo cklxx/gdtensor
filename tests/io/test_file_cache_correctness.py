@@ -317,8 +317,7 @@ def _thread_results(chain, cluster, world):
     return results
 
 
-def test_non_all_fit_hot_uses_batch_reads(tmp_path, monkeypatch):
-    chain, cluster, caches, dst, data = _cold_parent_case(tmp_path, monkeypatch)
+def _force_non_all_fit(monkeypatch):
     original_init = internal_api._RankRun.__init__
 
     def non_all_fit(run, *args):
@@ -326,6 +325,11 @@ def test_non_all_fit_hot_uses_batch_reads(tmp_path, monkeypatch):
         run._all_fit = False
 
     monkeypatch.setattr(internal_api._RankRun, "__init__", non_all_fit)
+
+
+def test_non_all_fit_hot_uses_batch_reads(tmp_path, monkeypatch):
+    chain, cluster, caches, dst, data = _cold_parent_case(tmp_path, monkeypatch)
+    _force_non_all_fit(monkeypatch)
     try:
         results = _thread_results(chain, cluster, 4)
         assert all(type(result) is gb.Ok for result in results.values()), results
@@ -384,9 +388,12 @@ def _corrupt_second_batch_range(cache, original, corrupted, seen):
     return wrapped
 
 
+@pytest.mark.parametrize("all_fit", [True, False], ids=["all-fit", "non-all-fit"])
 @pytest.mark.parametrize("mode", ["batch", "no_batch", "reserve_fallback", "bounded"])
-def test_cold_parent_batch_load_and_fallback(tmp_path, monkeypatch, mode):
+def test_cold_parent_batch_load_and_fallback(tmp_path, monkeypatch, mode, all_fit):
     chain, cluster, caches, dst, data = _cold_parent_case(tmp_path, monkeypatch)
+    if not all_fit:
+        _force_non_all_fit(monkeypatch)
     parent = caches[0]
     api = sys.modules[gio.chain_load.__module__]
     if mode == "bounded":
@@ -414,7 +421,7 @@ def test_cold_parent_batch_load_and_fallback(tmp_path, monkeypatch, mode):
     failed = []
 
     def fail_one_batch(self, layer, node, segs):
-        if layer == 1 and len(segs) > 1 and not failed:
+        if layer == 1 and len(segs) > 1:
             failed.append((node, len(segs)))
             return False
         return original_reserve(self, layer, node, segs)
@@ -433,6 +440,7 @@ def test_cold_parent_batch_load_and_fallback(tmp_path, monkeypatch, mode):
         assert sum(map(len, batches)) + len(scalar_reads) == parent_ranges
         if mode in ("batch", "bounded"):
             assert 0 < len(batches) < parent_ranges
+            assert any(len(batch) > 1 for batch in batches)
             assert not scalar_reads
         if mode == "bounded":
             assert len(batches) > 4
@@ -440,14 +448,21 @@ def test_cold_parent_batch_load_and_fallback(tmp_path, monkeypatch, mode):
         if mode == "no_batch":
             assert len(scalar_reads) == parent_ranges
         if mode == "reserve_fallback":
-            assert len(failed) == 1 and len(scalar_reads) == failed[0][1]
+            assert failed and not scalar_reads
+            assert len(batches) == parent_ranges
+            assert all(len(batch) == 1 for batch in batches)
     finally:
         for cache in caches:
             cache.close()
 
 
-def test_cold_parent_checksum_failure_publishes_no_batch_bytes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("all_fit", [True, False], ids=["all-fit", "non-all-fit"])
+def test_cold_parent_checksum_failure_publishes_no_batch_bytes(
+    tmp_path, monkeypatch, all_fit
+):
     chain, cluster, caches, dst, data = _cold_parent_case(tmp_path, monkeypatch)
+    if not all_fit:
+        _force_non_all_fit(monkeypatch)
     parent, terminal = caches
     api = sys.modules[gio.chain_load.__module__]
     try:
@@ -469,6 +484,56 @@ def test_cold_parent_checksum_failure_publishes_no_batch_bytes(tmp_path, monkeyp
         assert errors and all(error == errors[0] for error in errors), results
         assert type(results[corrupted[0]]) is not gb.Ok
         node = corrupted[0]
+        assert node not in dst.parts
+        assert not [fill for fill in terminal.fills[fill_count:] if fill[1] == node]
+        table = api._slots(chain)
+        with table.cond:
+            state = table.node(1, node)
+            assert not state.slots and state.resident == 0
+            assert state.error is not None
+            assert table.inflight == 0
+    finally:
+        for cache in caches:
+            cache.close()
+
+
+@pytest.mark.parametrize("coordinator", ["thread", "file"])
+@pytest.mark.parametrize("all_fit", [True, False], ids=["all-fit", "non-all-fit"])
+def test_cold_parent_batch_read_failure_cleans_reservations(
+    tmp_path, monkeypatch, all_fit, coordinator
+):
+    chain, cluster, caches, dst, _data = _cold_parent_case(tmp_path, monkeypatch)
+    monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", coordinator)
+    if coordinator == "file":
+        (tmp_path / "coord").mkdir()
+    if not all_fit:
+        _force_non_all_fit(monkeypatch)
+    parent, terminal = caches
+    api = sys.modules[gio.chain_load.__module__]
+    original_batch = parent.read_bytes_batch
+    failed, lock = [], threading.Lock()
+
+    def fail_first_multi_range(ranges):
+        with lock:
+            should_fail = len(ranges) > 1 and not failed
+            failed.append(parent.cluster.rank) if should_fail else None
+        if should_fail:
+            raise OSError("injected parent batch read failure")
+        return original_batch(ranges)
+
+    try:
+        results = _thread_results(chain, cluster, 4)
+        assert all(type(result) is gb.Ok for result in results.values()), results
+        terminal.clear()
+        dst.parts.clear()
+        fill_count = len(terminal.fills)
+        monkeypatch.setattr(parent, "read_bytes_batch", fail_first_multi_range)
+        results = _thread_results(chain, cluster, 4)
+        assert failed, results
+        errors = [result.value for result in results.values() if type(result) is gb.Err]
+        assert errors and all(error == errors[0] for error in errors), results
+        node = failed[0]
+        assert type(results[node]) is not gb.Ok
         assert node not in dst.parts
         assert not [fill for fill in terminal.fills[fill_count:] if fill[1] == node]
         state = api._slots(chain).node(1, node)
@@ -610,10 +675,17 @@ def test_hot_checksum_failure_publishes_no_multi_range_batch(tmp_path, monkeypat
             cache.close()
 
 
+@pytest.mark.parametrize("all_fit", [True, False], ids=["all-fit", "non-all-fit"])
 @pytest.mark.parametrize("path", ["hot", "cold_parent"])
-@pytest.mark.parametrize("malformation", ["missing_item", "short_payload"])
-def test_bad_batch_results_publish_nothing(tmp_path, monkeypatch, path, malformation):
+@pytest.mark.parametrize(
+    "malformation", ["missing_item", "extra_item", "short_payload"]
+)
+def test_bad_batch_results_publish_nothing(
+    tmp_path, monkeypatch, path, malformation, all_fit
+):
     chain, cluster, caches, dst, _data = _cold_parent_case(tmp_path, monkeypatch)
+    if not all_fit:
+        _force_non_all_fit(monkeypatch)
     api = sys.modules[gio.chain_load.__module__]
     terminal = caches[1]
     target = caches[0] if path == "cold_parent" else terminal
@@ -623,6 +695,8 @@ def test_bad_batch_results_publish_nothing(tmp_path, monkeypatch, path, malforma
         data = list(original(ranges))
         if malformation == "missing_item":
             return data[:-1]
+        if malformation == "extra_item":
+            return data + [data[0]]
         data[1] = data[1][:-1]
         return data
 
@@ -651,8 +725,13 @@ def test_bad_batch_results_publish_nothing(tmp_path, monkeypatch, path, malforma
             cache.close()
 
 
-def test_cold_parent_write_failure_cleans_remaining_reservations(tmp_path, monkeypatch):
+@pytest.mark.parametrize("all_fit", [True, False], ids=["all-fit", "non-all-fit"])
+def test_cold_parent_write_failure_cleans_remaining_reservations(
+    tmp_path, monkeypatch, all_fit
+):
     chain, cluster, caches, _dst, _data = _cold_parent_case(tmp_path, monkeypatch)
+    if not all_fit:
+        _force_non_all_fit(monkeypatch)
     terminal = caches[1]
     api = sys.modules[gio.chain_load.__module__]
     original_write = terminal.write_from_buffer
