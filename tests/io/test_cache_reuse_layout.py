@@ -53,6 +53,7 @@ class ReusedFiles(ga.DTensorDataAccessor):
         self.live = dict.fromkeys(budgets, 0)
         self.peak = dict.fromkeys(budgets, 0)
         self.writes, self.reads, self.deleted, self.reused = [], [], [], []
+        self.read_batches = []
         self.block = None
         self.entered, self.release, self.fast = (
             threading.Event(),
@@ -100,18 +101,33 @@ class ReusedFiles(ga.DTensorDataAccessor):
 
     def read_to_buffer(self, global_range, read_to_buffer):
         rng = global_range
-        node, consumer = self._address(rng)
-        if self.block == (node, consumer) and rng.global_tensor_offset == 0:
-            self.entered.set()
-            assert self.release.wait(10), "slow cache consumer was not released"
-        with self.lock:
-            key, data = self._read(node, consumer, rng)
+        consumer, key, data = self._read_data(rng)
         result = read_to_buffer(data.ctypes.data, data.nbytes)
         if type(result) is not gb.Ok:
             return result
         with self.lock:
             self._ack(key, consumer, rng)
         return result
+
+    def read_bytes_batch(self, ranges):
+        self.read_batches.append(list(ranges))
+        reads = [(rng, *self._read_data(rng)) for rng in ranges]
+        with self.lock:
+            self._ack_batch(reads)
+        return [data.tobytes() for _rng, _consumer, _key, data in reads]
+
+    def _ack_batch(self, reads):
+        for rng, consumer, key, _data in reads:
+            self._ack(key, consumer, rng)
+
+    def _read_data(self, rng):
+        node, consumer = self._address(rng)
+        if self.block == (node, consumer) and rng.global_tensor_offset == 0:
+            self.entered.set()
+            assert self.release.wait(10), "slow cache consumer was not released"
+        with self.lock:
+            key, data = self._read(node, consumer, rng)
+        return consumer, key, data
 
     def _read(self, node, consumer, rng):
         needed = _bytes(rng)
@@ -200,11 +216,11 @@ def _table(meta, placements, mesh):
     )
 
 
-def _cache_view(meta, accessor, nodes, steps):
+def _cache_view(meta, accessor, nodes, steps, width=1):
     mesh = gb.StCacheOuterProductMesh(
         gb.ArrangedMesh(gt.NumSteps(steps)),
         gb.LiteralMesh(nodes, gt.NumNodes(max(nodes) + 1)),
-        gb.ArrangedMesh(gt.ConcurrencyWidth(1)),
+        gb.ArrangedMesh(gt.ConcurrencyWidth(width)),
     )
     return gb.CacheDTensorsView(
         ["w"], _table(meta, [gb.Shard(0), gb.Replicate(), gb.Shard(0)], mesh), accessor
@@ -224,7 +240,23 @@ def _save(root, values, meta):
     return make_storage_view(["w"], table, layout, str(root))
 
 
-def _build(root, values, points, placement, steps):
+def _cache_cells(values, steps, width):
+    rows = values.shape[0]
+    row_bytes = values.size // rows * values.dtype.itemsize
+    step_rows = -(-rows // steps)
+    cells = []
+    for step in range(steps):
+        lo = min(step * step_rows, rows)
+        hi = min(lo + step_rows, rows)
+        slot_rows = -(-(hi - lo) // width)
+        for slot in range(width):
+            start = lo + min(slot * slot_rows, hi - lo)
+            stop = lo + min((slot + 1) * slot_rows, hi - lo)
+            cells.append(set(range(start * row_bytes, stop * row_bytes)))
+    return cells
+
+
+def _build(root, values, points, placement, steps, width=1):
     itemsize = values.dtype.itemsize
     meta = gb.GlobalTensorMeta(
         list(values.shape), "F32" if itemsize == 4 else "U8", itemsize
@@ -240,12 +272,15 @@ def _build(root, values, points, placement, steps):
         for node in range(2)
     }
     upper = {0: {node: set().union(*ranks.values()) for node, ranks in lower.items()}}
-    first_rows = (values.shape[0] + steps - 1) // steps
-    cell_bytes = first_rows * (values.size // values.shape[0]) * itemsize
-    first_cell = set(range(cell_bytes))
+    cells = _cache_cells(values, steps, width)
     budgets = [
         {
-            node: len(first_cell & set().union(*consumers.values()))
+            node: sum(
+                sorted(
+                    (len(cell & set().union(*consumers.values())) for cell in cells),
+                    reverse=True,
+                )[:width]
+            )
             for node, consumers in demands.items()
         }
         for demands in (upper, lower)
@@ -260,7 +295,8 @@ def _build(root, values, points, placement, steps):
     dst = ArrayFabric(table, {r: {"w": p} for r, p in points.items()})
     src = _save(root / "checkpoint", values, meta)
     views = [
-        _cache_view(meta, c, nodes, steps) for c, nodes in zip(caches, ([0], [0, 1]))
+        _cache_view(meta, c, nodes, steps, width)
+        for c, nodes in zip(caches, ([0], [0, 1]))
     ]
     chains = [
         gb.TwoLayerCachedDTensorsReadChain(
@@ -326,6 +362,17 @@ def _check(caches, dst, values):
     for cache in caches:
         cache.assert_finished()
         assert all(0 < cache.peak[n] <= budget for n, budget in cache.budgets.items())
+
+
+def test_two_layer_physical_reuse_batches_parent_reads(tmp_path):
+    values = np.random.default_rng(631).integers(0, 256, 32, dtype=np.uint8)
+    points = {rank: np.arange(32) for rank in range(4)}
+    chains, cluster, caches, dst = _build(
+        tmp_path, values, points, gb.Replicate(), steps=4, width=2
+    )
+    _run(chains, cluster, caches)
+    _check(caches, dst, values)
+    assert any(len(batch) > 1 for batch in caches[0].read_batches)
 
 
 @pytest.mark.parametrize("blocked_layer", [0, 1], ids=["slow-child-node", "slow-rank"])
