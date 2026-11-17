@@ -248,10 +248,14 @@ def resolve_storage_mesh(mesh) -> Tuple[np.ndarray, int]:
         raise invalid("mesh", "tensor_slots must be an ArrangedMesh")
     t_size = tag_int(mesh.tensor_slots.size, ConstantOne, TensorCount)
     w_size, w_ranks = _content_slots(mesh.content_slots)
+    # Slot id of cell (t, w) is t * W + w; columns outside w_ranks stay -1.
+    # One NumPy assignment fills every row: this grid is rebuilt for each
+    # mesh of each file list, so a Python loop over t and w dominated setup.
     cells = np.full((t_size, w_size), -1, dtype=np.int64)
-    for t in range(t_size):
-        for w in w_ranks:
-            cells[t, w] = t * w_size + w
+    if t_size:
+        columns = np.asarray(w_ranks, dtype=np.int64)
+        rows = np.arange(t_size, dtype=np.int64)[:, None]
+        cells[:, columns] = rows * w_size + columns
     return cells, w_size
 
 

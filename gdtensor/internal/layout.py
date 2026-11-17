@@ -220,6 +220,33 @@ def nonempty_columns(nd: NamedDTensor) -> Dict[int, np.ndarray]:
     return out
 
 
+_ListGroup = Tuple[DisjointStorageMeshList, List[TensorComponentPos]]
+
+
+def grouped_lists(layout: PhysicalLayoutTable) -> List[_ListGroup]:
+    """Physical lists of a layout with the positions that point at each.
+
+    Lists group by value, so equal but distinct lists (a deep copy) are one
+    physical file. Entries normally share one list object per file, and
+    hashing a list walks every mesh in it. Each distinct object is therefore
+    hashed once per call: an identity map sends later entries of the same
+    object straight to its group.
+
+    The identity map lives only for this call. Builders are mutable, so no
+    hash is kept on a list or across calls; nothing here can mutate a list
+    while the call runs.
+    """
+    by_identity: Dict[int, _ListGroup] = {}
+    by_value: Dict[DisjointStorageMeshList, _ListGroup] = {}
+    for pos, lst in layout.tensor_entries.items():
+        group = by_identity.get(id(lst))
+        if group is None:
+            group = by_value.setdefault(lst, (lst, []))
+            by_identity[id(lst)] = group
+        group[1].append(pos)
+    return list(by_value.values())
+
+
 def unique_lists(
     layout: PhysicalLayoutTable,
     table: DTensorTable,
@@ -231,11 +258,8 @@ def unique_lists(
     keys are ordered by DTensorTable header row of their tensor_id, then by
     rank. This is independent of dict insertion order or file row order.
     """
-    by_list: Dict[Any, list] = {}
-    for pos, lst in layout.tensor_entries.items():
-        by_list.setdefault(lst, [lst, []])[1].append(pos)
     leaders: Dict[TensorComponentPos, DisjointStorageMeshList] = {}
-    for lst, positions in by_list.values():
+    for lst, positions in grouped_lists(layout):
         leader = min(positions, key=lambda p: (order_of(table, p.tensor_id), p.rank))
         if leader in leaders and leaders[leader] != lst:
             raise invalid("tensor_entries", "different physical lists share a leader")
