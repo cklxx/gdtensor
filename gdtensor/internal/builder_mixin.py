@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Tuple
 from dataclasses import fields
+from functools import lru_cache
 
 # kind: "scalar" | "list" | "dict" | "object" | "oneof" | "nullable"
 FieldSpec = Tuple[str, str]
@@ -31,20 +32,30 @@ def _singular(name: str) -> str:
     return name
 
 
+@lru_cache(maxsize=None)
+def _compared_field_names(cls: type) -> Tuple[str, ...]:
+    """Names of the fields a product class hashes and compares.
+
+    This is the class schema, fixed when the class is defined. It holds no
+    field value, so reusing it cannot make a hash stale: products stay
+    mutable and every ``field_hash`` call still reads their current values.
+    """
+    return tuple(f.name for f in fields(cls) if f.compare)
+
+
+def _freeze(v):
+    if isinstance(v, (list, tuple)):
+        return tuple(_freeze(x) for x in v)
+    if isinstance(v, dict):
+        return frozenset((_freeze(k), _freeze(x)) for k, x in v.items())
+    return v
+
+
 def field_hash(self) -> int:
     """Hash a product data class by its fields (C.2: products are dict keys)."""
-
-    def freeze(v):
-        if isinstance(v, list) or isinstance(v, tuple):
-            return tuple(freeze(x) for x in v)
-        if isinstance(v, dict):
-            return frozenset((freeze(k), freeze(x)) for k, x in v.items())
-        return v
-
-    return hash(
-        (type(self),)
-        + tuple(freeze(getattr(self, f.name)) for f in fields(self) if f.compare)
-    )
+    cls = type(self)
+    names = _compared_field_names(cls)
+    return hash((cls,) + tuple(_freeze(getattr(self, name)) for name in names))
 
 
 def _field_methods(name: str, kind: str) -> dict:

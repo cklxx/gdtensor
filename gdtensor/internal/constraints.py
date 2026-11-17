@@ -202,7 +202,7 @@ def _meta(o):
 
 
 def _layout(o):
-    from .layout import list_cells
+    from .layout import grouped_lists, list_cells
 
     if o.container_format not in ("safetensors", "distcp"):
         return _err(
@@ -212,12 +212,11 @@ def _layout(o):
         )
     # Group physical lists by equality: entries pointing at value-equal lists
     # (deepcopy) are the same physical file (approved delta), never by object id.
-    lists: dict[Any, Any] = {}
-    for lst in o.tensor_entries.values():
-        lists.setdefault(lst, lst)
+    # Each distinct list object is hashed once per call (see grouped_lists).
+    lists = [lst for lst, _positions in grouped_lists(o)]
     # Pass 1: labels + geometric cells + file disjointness (first-error wins).
     seen_cells = set()
-    for lst in lists.values():
+    for lst in lists:
         labels_error = _list_row_labels(lst)
         if labels_error is not None:
             return labels_error
@@ -252,7 +251,7 @@ def _check_file_path_keys(o, lists):
         if pos not in o.tensor_entries:
             msg = f"file_paths key {pos.tensor_id},{pos.rank} is not a tensor entry"
             return _err(o, "file_paths_keys_are_leaders", msg)
-    for lst in lists.values():
+    for lst in lists:
         labels_error = _list_row_labels(lst)
         if labels_error is not None:
             return labels_error
