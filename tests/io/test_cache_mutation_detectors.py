@@ -1,8 +1,11 @@
 """Detect capacity/ACK mutants through public IO and real on-disk slots."""
 
+import sys
 import threading
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,6 +22,11 @@ from tests.support.cache_oracle import (
     storage_schema,
 )
 from tests.support.oracle import ArrayFabric
+
+
+_runtime = sys.modules[gio.chain_load.__module__]
+_NodeState = _runtime._NodeState
+Fail = _runtime.Fail
 
 
 @pytest.fixture(autouse=True)
@@ -133,3 +141,71 @@ def test_ack_releases_slot_only_after_every_cohort_member(tmp_path, monkeypatch)
     assert len(cache.writes) == 1, "early release forced a second disk fill"
     assert not cache.slots
     _outputs(dst, values)
+
+
+def test_node_state_ack_matches_exact_piece_model():
+    key = ("w", 0, 4)
+    pieces = {(("rank", 0), 0, 2), (("rank", 1), 2, 2)}
+    owed = set(pieces)
+    seg = SimpleNamespace(key=key, size=4, owed=lambda: set(owed))
+    state = _NodeState(4, {0, 1})
+    assert state.reserve([seg])
+    model = set(owed)
+    sequence = [
+        (("rank", 9), 0, 4),
+        (("rank", 0), 0, 2),
+        (("rank", 0), 0, 2),
+        (("rank", 9), 2, 2),
+        (("rank", 1), 2, 2),
+    ]
+    for piece in sequence:
+        known = piece in model
+        model.discard(piece)
+        expected_release = known and not model
+        assert state.ack(key, piece) == expected_release
+        assert state.slots.get(key, {}).get("owed", set()) == model
+        assert state.resident == (0 if expected_release else 4)
+    with pytest.raises(Fail) as caught:
+        state.ack(key, pieces.pop())
+    assert caught.value.error.check_name == "cache_ack"
+    assert state.resident == 0
+
+
+def test_completed_segment_cannot_be_reserved_again():
+    key = ("w", 0, 4)
+    seg = SimpleNamespace(key=key, size=4, owed=lambda: {(("rank", 0), 0, 4)})
+    state = _NodeState(4, {0})
+    state.completed.add(key)
+    assert not state.reserve([seg])
+    assert state.resident == 0
+    assert not state.slots
+
+
+def test_previous_generation_child_does_not_ack_current_parent():
+    key = ("w", 0, 4)
+    consumer = ("seg", 1, 1, key)
+    piece = (consumer, 0, 4)
+    seg = SimpleNamespace(key=key, node=0, consumers={consumer: [(0, 4)]})
+    parent = _NodeState(4, set())
+    parent.started = 10
+    child = _NodeState(4, set())
+    child.completed.add(key)
+    child.completed_at[key] = 5
+    states = {(0, 0): parent, (1, 1): child}
+    run = object.__new__(_runtime._RankRun)
+    run.t = SimpleNamespace(node=lambda layer, node: states[layer, node])
+    reserved = SimpleNamespace(key=key, size=4, owed=lambda: {piece})
+    assert parent.reserve([reserved])
+    run._settle_completed_children(0, 0, seg)
+    assert parent.slots[key]["owed"] == {piece}
+    assert parent.resident == 4
+
+
+def test_unknown_ack_does_not_release_consumer_free_slot():
+    key = ("w", 0, 4)
+    seg = SimpleNamespace(key=key, size=4, owed=set)
+    state = _NodeState(4, set())
+    assert state.reserve([seg])
+    assert not state.ack(key, (("rank", 9), 0, 4))
+    assert state.resident == 4
+    assert key in state.slots

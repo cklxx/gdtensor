@@ -1,6 +1,7 @@
 """Owner cleanup through public IO and injected filesystem failures."""
 
 import errno
+import fcntl
 import multiprocessing as mp
 import os
 import pickle
@@ -53,10 +54,10 @@ class _Cache(NodeCache):
         return result
 
 
-def _build():
+def _build(source=None, cache=None):
     values = np.array([31, 0, 247, 83, 19, 206, 55, 132], dtype=np.uint8)
     cluster = Cluster(1, 2)
-    source = StorageMem(cluster, values)
+    source = StorageMem(cluster, values) if source is None else source
     table, layout = storage_schema(["w"], size=len(values))
     session_factory = lambda _view, _rank: gb.Ok(_Session(source))
     storage = gb.StorageDTensorsView(
@@ -67,7 +68,7 @@ def _build():
         begin_save=session_factory,
         begin_load=session_factory,
     )
-    cache = _Cache(cluster, len(values))
+    cache = _Cache(cluster, len(values)) if cache is None else cache
     dst = RankMem(cluster, len(values), 2)
     chain = gb.OneLayerCachedDTensorsReadChain(
         src=storage,
@@ -92,6 +93,126 @@ def _load_round(chain, cluster, dst, values):
         np.testing.assert_array_equal(dst.buffers[rank], expected)
 
 
+def _range_offset(rng):
+    if hasattr(rng, "global_tensor_offset"):
+        return rng.global_tensor_offset
+    return rng.contiguous_payload_offset
+
+
+def _file_counter(root, name, delta=0):
+    path = Path(root) / f"{name}.count"
+    with path.open("a+b") as file:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        file.seek(0)
+        value = int(file.read() or b"0") + delta
+        if delta:
+            file.seek(0)
+            file.truncate()
+            file.write(str(value).encode())
+            file.flush()
+            os.fsync(file.fileno())
+        return value
+
+
+def _publish(path, data):
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with tmp.open("wb") as file:
+        file.write(data)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(tmp, path)
+
+
+class _FileSource:
+    def __init__(self, root):
+        self.root = Path(root)
+        self.path = self.root / "source.bin"
+
+    def cache_identity(self):
+        stat = self.path.stat()
+        return (
+            str(self.path),
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+
+    def read_to_buffer(self, global_range, read_to_buffer):
+        off, size = _range_offset(global_range), global_range.size
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+            data = os.pread(fd, size, off)
+        finally:
+            os.close(fd)
+        assert len(data) == size
+        _file_counter(self.root, "source", size)
+        view = np.frombuffer(data, dtype=np.uint8)
+        return read_to_buffer(view.ctypes.data, size)
+
+
+class _ProcessFileCache:
+    """Independent cache objects; only files and flock state cross processes."""
+
+    def __init__(self, root, explicit):
+        self.root = Path(root)
+        self.explicit = explicit
+        self.valid = set()
+
+    def cache_namespace(self):
+        return "real-file-shared" if self.explicit else None
+
+    def _paths(self, rng):
+        key = (rng.global_tensor_id, _range_offset(rng), rng.size)
+        base = self.root / f"{key[0]}-{key[1]}-{key[2]}"
+        return key, base.with_suffix(".bin"), base.with_suffix(".valid")
+
+    def has_bytes(self, global_range):
+        key, payload, validity = self._paths(global_range)
+        valid = validity.exists() if self.explicit else key in self.valid
+        return valid and payload.exists() and payload.stat().st_size == key[2]
+
+    def write_from_buffer(self, global_range, write_from_buffer):
+        key, payload, validity = self._paths(global_range)
+        data = np.empty(global_range.size, dtype=np.uint8)
+        result = write_from_buffer(data.ctypes.data, data.nbytes)
+        if type(result) is not gb.Ok:
+            return result
+        _publish(payload, data.tobytes())
+        if self.explicit:
+            _publish(validity, b"valid")
+        else:
+            self.valid.add(key)
+        _file_counter(self.root, "writes", key[2])
+        return result
+
+    def read_to_buffer(self, global_range, read_to_buffer):
+        tid = global_range.global_tensor_id
+        off, size = _range_offset(global_range), global_range.size
+        candidates = [
+            (payload, off - int(start))
+            for payload in self.root.glob(f"{tid}-*.bin")
+            for _tid, start, length in [payload.stem.rsplit("-", 2)]
+            if int(start) <= off and off + size <= int(start) + int(length)
+        ]
+        assert len(candidates) == 1, (tid, off, size, candidates)
+        payload, relative = candidates[0]
+        fd = os.open(payload, os.O_RDONLY)
+        try:
+            data = os.pread(fd, size, relative)
+        finally:
+            os.close(fd)
+        assert len(data) == global_range.size
+        view = np.frombuffer(data, dtype=np.uint8)
+        return read_to_buffer(view.ctypes.data, view.nbytes)
+
+
+def _process_file_round(root, explicit):
+    cache = _ProcessFileCache(root, explicit)
+    chain, cluster, _cache, dst, values = _build(_FileSource(root), cache)
+    _load_round(chain, cluster, dst, values)
+
+
 def _report(function, args, sender):
     try:
         function(*args)
@@ -113,7 +234,11 @@ def _stop(process):
 
 
 def _run_bounded(function, *args):
-    ctx = mp.get_context("spawn")
+    _run_bounded_in("spawn", function, *args)
+
+
+def _run_bounded_in(method, function, *args):
+    ctx = mp.get_context(method)
     receiver, sender = ctx.Pipe(duplex=False)
     process = ctx.Process(target=_report, args=(function, args, sender))
     try:
@@ -224,6 +349,61 @@ def _slots_in_thread(chain, errors):
 def _slots_in_child(chain):
     assert internal_api._slots(chain) is not None
     assert not internal_api._FINGERPRINTS
+
+
+def _send_slot_key(chain, sender):
+    try:
+        sender.send(internal_api._slots(chain).key)
+    except BaseException:
+        sender.send(traceback.format_exc()[-6000:])
+    finally:
+        sender.close()
+
+
+def _namespace_fork_case(explicit):
+    chain, _cluster, cache, _dst, _values = _build()
+    cache.namespace = "explicitly-shared" if explicit else None
+    parent_key = internal_api._slots(chain).key
+    ctx = mp.get_context("fork")
+    receiver, sender = ctx.Pipe(duplex=False)
+    child = ctx.Process(target=_send_slot_key, args=(chain, sender))
+    try:
+        child.start()
+        sender.close()
+        child.join(10)
+        assert not child.is_alive(), "child namespace probe hung"
+        assert child.exitcode == 0, child.exitcode
+        assert receiver.poll(0), "child did not report its namespace"
+        child_key = receiver.recv()
+        assert isinstance(child_key, str), child_key
+        assert (child_key == parent_key) is explicit
+    finally:
+        _stop(child)
+        receiver.close()
+        sender.close()
+
+
+@pytest.mark.parametrize(
+    "explicit",
+    [pytest.param(False, id="implicit"), pytest.param(True, id="explicit")],
+)
+def test_cache_namespace_process_scope_after_fork(explicit):
+    _run_bounded(_namespace_fork_case, explicit)
+
+
+@pytest.mark.parametrize("method", ["fork", "spawn"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["implicit", "explicit"])
+def test_real_file_cache_process_namespace(tmp_path, method, explicit):
+    values = np.array([31, 0, 247, 83, 19, 206, 55, 132], dtype=np.uint8)
+    (tmp_path / "source.bin").write_bytes(values.tobytes())
+    _run_bounded_in(method, _process_file_round, tmp_path, explicit)
+    assert _file_counter(tmp_path, "source") == len(values)
+    assert _file_counter(tmp_path, "writes") == len(values)
+
+    _run_bounded_in(method, _process_file_round, tmp_path, explicit)
+    expected = len(values) if explicit else 2 * len(values)
+    assert _file_counter(tmp_path, "source") == expected
+    assert _file_counter(tmp_path, "writes") == expected
 
 
 def _hold_fingerprint_lock(entered, release):

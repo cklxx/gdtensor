@@ -34,19 +34,19 @@ Terms:
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 
 from .dtensor import (
-    EMPTY,
     box_of,
     box_to_intervals,
     global_tensor_meta_of,
     iv_intersect,
     iv_normalize,
-    iv_total,
+    iv_prefix,
     named_of,
     naive_of,
     owned_intervals,
@@ -59,7 +59,7 @@ from .mesh import (
     cache_num_steps,
 )
 from .plan import CHECK, _Side, _pair
-from .ranges import RangeFromComputeView
+from .ranges import RangeFromComputeView, RangeFromStorageView
 from .result import check_failed, invalid
 
 SegKey = Tuple[str, int, int]  # (tensor id, byte offset, byte size)
@@ -138,7 +138,8 @@ def build_chain_plan(chain, with_storage: bool = True) -> ChainPlan:
     plan = ChainPlan(
         [list(view.tensor_ids) for view in caches], k, layer_nodes, parent, serve, ranks
     )
-    demand = _demands(plan, chain.dst)
+    wants = {rank: _rank_wants(chain.dst, rank) for rank in plan.ranks}
+    demand = _demands(plan, wants)
     side = _Side(chain.src) if with_storage else None
     for layer, view in enumerate(caches):
         plan.segments.append(
@@ -164,9 +165,9 @@ def build_chain_plan(chain, with_storage: bool = True) -> ChainPlan:
         _link_storage(plan, side)
     for layer in range(1, len(caches)):
         _link_parents(plan, layer)
-    _link_drains(plan, chain.dst)
-    _link_fill_ranks(plan)
-    _link_cohorts(plan)
+    _link_drains(plan, chain.dst, wants)
+    closures = _link_fill_ranks(plan)
+    _link_cohorts(plan, closures)
     return plan
 
 
@@ -214,25 +215,41 @@ def _rank_wants(dst, rank: int) -> Dict[str, np.ndarray]:
     wants = {}
     for tid in dst.tensor_ids:
         iv = owned_intervals(named_of(dst.d_tensor_table, tid), "compute", rank)
-        if iv_total(iv):
-            wants[tid] = iv_normalize(iv)
+        if iv.size:
+            wants[tid] = iv
     return wants
 
 
-def _merge(acc: Dict[str, np.ndarray], wants: Dict[str, np.ndarray]) -> None:
-    for tid, iv in wants.items():
-        acc[tid] = iv_normalize(np.concatenate((acc.get(tid, EMPTY), iv)))
+def _merge_pending(pending: Dict[str, list]) -> Dict[str, np.ndarray]:
+    return {
+        tid: intervals[0]
+        if len(intervals) == 1
+        else iv_normalize(np.concatenate(intervals))
+        for tid, intervals in pending.items()
+    }
 
 
-def _demands(plan: ChainPlan, dst) -> List[Dict[int, Dict[str, np.ndarray]]]:
-    demand: List[Dict[int, Dict[str, np.ndarray]]] = [
-        {n: {} for n in nodes} for nodes in plan.layer_nodes
-    ]
+def _demands(plan: ChainPlan, wants: Dict[int, Dict[str, np.ndarray]]):
+    """Merge each node once after collecting its rank or child intervals."""
+    pending = [{n: {} for n in nodes} for nodes in plan.layer_nodes]
     for rank in plan.ranks:
-        _merge(demand[-1][plan.serve[rank // plan.k]], _rank_wants(dst, rank))
-    for layer in range(len(plan.tids) - 1, 0, -1):
+        for tid, iv in wants[rank].items():
+            node_pending = pending[-1][plan.serve[rank // plan.k]]
+            node_pending.setdefault(tid, []).append(iv)
+    demand = [{} for _ in plan.tids]
+    for layer in range(len(plan.tids) - 1, -1, -1):
+        demand[layer] = {
+            node: _merge_pending(node_pending)
+            for node, node_pending in pending[layer].items()
+        }
+        if layer == 0:
+            continue
         for child, want in demand[layer].items():
-            _merge(demand[layer - 1][plan.parent[layer][child]], want)
+            parent_pending = pending[layer - 1][plan.parent[layer][child]]
+            _ = [
+                parent_pending.setdefault(tid, []).append(iv)
+                for tid, iv in want.items()
+            ]
     return demand
 
 
@@ -265,23 +282,24 @@ def _split(a: int, b: int, points) -> List[Tuple[int, int]]:
 def _layer_segments(view, layer: int, node: int, demand, cuts) -> Dict[SegKey, Segment]:
     """Demanded cell bytes, split at the boundaries from _cuts."""
     segs: Dict[SegKey, Segment] = {}
+    n_index = _view_nodes(view).index(node)
     for tid in view.tensor_ids:
         want = demand.get(tid)
-        if want is None or not iv_total(want):
+        if want is None or not want.size:
             continue
         points = cuts.get(tid, ())
-        for seg in _tensor_segments(view, layer, node, tid, want):
-            segs.update(
-                (p.key, p)
-                for p in (
-                    Segment(layer, node, tid, a, b - a, seg.cell)
-                    for a, b in _split(seg.off, seg.off + seg.size, points)
-                )
-            )
+        segs.update(
+            (seg.key, seg)
+            for off, size, cell in _tensor_segments(view, n_index, tid, want)
+            for a, b in _split(off, off + size, points)
+            for seg in (Segment(layer, node, tid, a, b - a, cell),)
+        )
     return segs
 
 
-def _tensor_segments(view, layer: int, node: int, tid: str, want) -> List[Segment]:
+def _tensor_segments(
+    view, n_index: int, tid: str, want
+) -> Iterable[Tuple[int, int, tuple]]:
     naive = naive_of(named_of(view.d_tensor_table, tid))
     shape = (
         cache_num_steps(naive.mesh),
@@ -289,24 +307,18 @@ def _tensor_segments(view, layer: int, node: int, tid: str, want) -> List[Segmen
         cache_concurrency_width(naive.mesh),
     )
     meta = naive.global_tensor_meta
-    n_index = cache_node_set(naive.mesh).index(node)
-    out: List[Segment] = []
     for s in range(shape[0]):
         for c in range(shape[2]):
             lo, hi = box_of(naive, shape, (s, n_index, c))
-            box = iv_normalize(box_to_intervals(meta.global_shape, lo, hi))
-            out.extend(
-                Segment(
-                    layer,
-                    node,
-                    tid,
+            box = box_to_intervals(meta.global_shape, lo, hi)
+            yield from (
+                (
                     int(a) * meta.itemsize,
                     int(b - a) * meta.itemsize,
                     (tid, s, c),
                 )
                 for a, b in iv_intersect(box, want)
             )
-    return out
 
 
 def _budget(view, segs: Dict[SegKey, Segment]) -> int:
@@ -322,35 +334,97 @@ def _budget(view, segs: Dict[SegKey, Segment]) -> int:
 
 
 def _link_storage(plan: ChainPlan, side) -> None:
+    grouped: Dict[str, List[Segment]] = {}
     for segs in plan.segments[0].values():
         for seg in segs.values():
+            grouped.setdefault(seg.tid, []).append(seg)
+    for tid, segments in grouped.items():
+        for seg in segments:
             seg.storage = _storage_pieces(side, seg)
+        side._propagation_storage.pop(tid, None)
 
 
-def _storage_pieces(side, seg: Segment) -> list:
+def _storage_pieces_generic(side, seg: Segment) -> list:
     isz = global_tensor_meta_of(named_of(side.table, seg.tid)).itemsize
     iv = np.array([[seg.off // isz, (seg.off + seg.size) // isz]], dtype=np.int64)
     pairs = _pair([(iv, ("compute", seg.tid, isz))], side.src_candidates(seg.tid, 0))
-    pieces = sorted(
+    return sorted(
         ((src, dst.global_tensor_offset - seg.off) for src, dst in pairs),
         key=lambda p: p[1],
     )
-    if sum(src.size for src, _ in pieces) != seg.size:
-        raise check_failed(CHECK, f"storage does not cover cache {seg.key}")
+
+
+def _storage_index(side, tid: str) -> tuple | None:
+    """Flatten disjoint storage slots once; retain source order for overlaps."""
+    cache = getattr(side, "_propagation_storage", None)
+    if cache is None:
+        cache = side._propagation_storage = {}
+    if tid not in cache:
+        entries = _storage_entries(side, tid)
+        overlap = any(
+            previous[1] > entry[0] for previous, entry in zip(entries, entries[1:])
+        )
+        isz = global_tensor_meta_of(named_of(side.table, tid)).itemsize
+        cache[tid] = (
+            None if overlap else (entries, [entry[0] for entry in entries], isz)
+        )
+    return cache[tid]
+
+
+def _storage_entries(side, tid: str) -> list:
+    entries = [
+        (int(a) * isz, int(b) * isz, path, cpo + int(prefix) * isz, isz)
+        for iv, path, cpo, isz in side.storage_pieces(tid)
+        for (a, b), prefix in zip(iv, iv_prefix(iv, iv[:, 0]))
+    ]
+    entries.sort(key=lambda entry: entry[0])
+    return entries
+
+
+def _storage_pieces(side, seg: Segment) -> list:
+    indexed = _storage_index(side, seg.tid)
+    if indexed is None:
+        return _storage_pieces_generic(side, seg)
+    entries, starts, isz = indexed
+    cursor, end, pieces, missing = seg.off, seg.off + seg.size, [], 0
+    position = max(0, bisect_right(starts, cursor) - 1)
+    for start, stop, path, source_off, _isz in entries[position:]:
+        if start >= end or cursor == end:
+            break
+        a, b = max(cursor, start), min(end, stop)
+        if b <= a:
+            continue
+        if a > cursor:
+            missing += a - cursor
+        src = RangeFromStorageView(path, source_off + a - start, b - a)
+        pieces.append((src, a - seg.off))
+        cursor = b
+    missing += end - cursor
+    if missing:
+        raise invalid(
+            "src_view", f"no source covers {missing // isz} destination elements"
+        )
     return pieces
 
 
-def _by_tid(segs: Dict[SegKey, Segment]) -> Dict[str, List[Segment]]:
-    index: Dict[str, List[Segment]] = {}
+def _by_tid(segs: Dict[SegKey, Segment]) -> Dict[str, tuple]:
+    grouped: Dict[str, List[Segment]] = {}
     for seg in sorted(segs.values(), key=lambda s: s.off):
-        index.setdefault(seg.tid, []).append(seg)
-    return index
+        grouped.setdefault(seg.tid, []).append(seg)
+    return {
+        tid: (segments, [seg.off for seg in segments])
+        for tid, segments in grouped.items()
+    }
 
 
 def _cover(index, tid: str, off: int, size: int, consumer) -> list:
     """Upstream pieces covering [off, off + size); registers the consumer."""
     end, pieces = off + size, []
-    for seg in index.get(tid, ()):
+    segments, starts = index.get(tid, ((), ()))
+    start = max(0, bisect_right(starts, off) - 1)
+    for seg in segments[start:]:
+        if seg.off >= end:
+            break
         a, b = max(off, seg.off), min(end, seg.off + seg.size)
         if b > a:
             pieces.append((seg.key, a, b - a))
@@ -368,14 +442,14 @@ def _link_parents(plan: ChainPlan, layer: int) -> None:
             seg.parents = _cover(index, seg.tid, seg.off, seg.size, consumer)
 
 
-def _link_drains(plan: ChainPlan, dst) -> None:
+def _link_drains(plan: ChainPlan, dst, wants) -> None:
+    indices = {node: _by_tid(segments) for node, segments in plan.segments[-1].items()}
     for rank in plan.ranks:
         node = plan.serve[rank // plan.k]
-        index = _by_tid(plan.segments[-1][node])
         plan.drains[rank] = [
             (node, key, off, size)
-            for tid, iv in _rank_wants(dst, rank).items()
-            for key, off, size in _rank_pieces(index, dst, tid, iv, rank)
+            for tid, iv in wants[rank].items()
+            for key, off, size in _rank_pieces(indices[node], dst, tid, iv, rank)
         ]
 
 
@@ -409,10 +483,9 @@ def _parent_items(plan: ChainPlan, layer: int, node: int, key) -> list:
     return [(layer - 1, pnode, pkey) for pkey, _o, _s in seg.parents]
 
 
-def execution_closure(plan: ChainPlan, rank: int) -> set:
-    """Drain dependencies plus DN service work assigned to this rank."""
+def _execution_closure(plan: ChainPlan, rank: int, closure: set) -> set:
     todo = list(plan.services.get(rank, ()))
-    seen = rank_closure(plan, rank)
+    seen = set(closure)
     while todo:
         item = todo.pop()
         if item not in seen:
@@ -421,30 +494,47 @@ def execution_closure(plan: ChainPlan, rank: int) -> set:
     return seen
 
 
-def _link_fill_ranks(plan: ChainPlan) -> None:
+def execution_closure(plan: ChainPlan, rank: int) -> set:
+    """Drain dependencies plus DN service work assigned to this rank."""
+    return _execution_closure(plan, rank, rank_closure(plan, rank))
+
+
+def _link_fill_ranks(plan: ChainPlan) -> Dict[int, set]:
     closures = {r: rank_closure(plan, r) for r in plan.ranks}
+    consumers: Dict[tuple, list] = {}
+    for rank, closure in closures.items():
+        for item in closure:
+            consumers.setdefault(item, []).append(rank)
     plan.services = {r: [] for r in plan.ranks}
+    local = {
+        node: [r for r in plan.ranks if r // plan.k == node]
+        for nodes in plan.layer_nodes
+        for node in nodes
+    }
     for layer, nodes in enumerate(plan.segments):
         for node, segments in nodes.items():
-            _assign_node_fills(plan, closures, layer, node, segments)
+            _assign_node_fills(plan, consumers, local[node], layer, node, segments)
+    del consumers, local
+    for rank in plan.ranks:
+        closures[rank] = _execution_closure(plan, rank, closures[rank])
+    return closures
 
 
-def _assign_node_fills(plan, closures, layer, node, segments) -> None:
-    local = [r for r in plan.ranks if r // plan.k == node]
+def _assign_node_fills(plan, consumers, local, layer, node, segments) -> None:
     for key in sorted(segments):
         item = (layer, node, key)
-        consumers = [r for r in plan.ranks if item in closures[r]]
-        eligible = [r for r in local if r in consumers]
+        ranks = consumers.get(item, ())
+        eligible = [r for r in local if r in ranks]
         helper = (local or plan.ranks)[0]
         plan.fill_ranks[item] = tuple(eligible or [helper])
         if not eligible:
             plan.services[helper].append(item)
 
 
-def _link_cohorts(plan: ChainPlan) -> None:
+def _link_cohorts(plan: ChainPlan, closures) -> None:
     plan.cohort = [{n: set() for n in nodes} for nodes in plan.layer_nodes]
     for rank in plan.ranks:
-        for layer, node, _key in execution_closure(plan, rank):
+        for layer, node, _key in closures[rank]:
             plan.cohort[layer][node].add(rank)
 
 

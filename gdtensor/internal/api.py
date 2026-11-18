@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import ctypes
 import logging
 import os
@@ -14,6 +14,8 @@ import threading
 import time
 import weakref
 from typing import Any
+
+import numpy as np
 
 from .plan import (
     d_tensors_view_rank_plan_load,
@@ -89,18 +91,24 @@ def _read(src_acc, src) -> bytes:
         raise invalid(
             "buffer_len", f"read chunks have {read_size} bytes, expected {src.size}"
         )
-    return b"".join(chunks)
+    return _join_bytes(chunks)
+
+
+def _join_bytes(chunks) -> bytes:
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
 
 def _write(dst_acc, dst, data: bytes) -> None:
     written = 0
+    view = np.frombuffer(data, dtype=np.uint8)
+    source = view.ctypes.data
 
     def give(buffer_ptr: int, buffer_len: int):
         nonlocal written
         if buffer_len < 0 or written + buffer_len > dst.size:
             raise invalid("buffer_len", "write chunks exceed range size")
         if buffer_len:
-            ctypes.memmove(buffer_ptr, data[written : written + buffer_len], buffer_len)
+            ctypes.memmove(buffer_ptr, source + written, buffer_len)
         written += buffer_len
         return Ok(None)
 
@@ -222,23 +230,31 @@ class _NodeState:
         self.cohort = set(cohort)
         self.slots: dict = {}  # key -> {"filled", "owed"}
         self.completed: set = set()  # filled this generation, including released slots
+        self.completed_at: dict = {}  # key -> table version when completed
         self.resident = 0
         self.gen = 0
+        self.started = 0  # table version when this generation opened
         self.active = 0
         self.joined: set = set()
+        self.entered: dict = {}  # rank -> number of calls joined at this node
+        self.call = 0  # greatest rank call admitted to the current generation
         self.error = None  # public Error value, pickle-safe
 
-    def join(self, rank: int) -> int:
-        """Join the current generation, or open a new one when the previous
-        generation is idle and either complete or re-entered by this rank."""
+    def join(self, rank: int, version: int = 0) -> int:
+        """Join this rank's next call, opening a generation only when it is newer."""
+        call = self.entered.get(rank, 0) + 1
         idle = self.active == 0 and self.joined
-        if idle and (rank in self.joined or self.cohort <= self.joined):
+        if idle and (rank in self.joined or call > self.call):
             self.gen += 1
+            self.started = version
             self.slots, self.resident, self.error = {}, 0, None
             self.completed = set()
+            self.completed_at = {}
             self.joined = set()
         self.active += 1
         self.joined.add(rank)
+        self.entered[rank] = call
+        self.call = max(self.call, call)
         return self.gen
 
     def fits(self, size: int) -> bool:
@@ -275,7 +291,9 @@ class _NodeState:
         slot = self.slots.get(key)
         if slot is None:
             raise check_failed("cache_ack", f"segment {key} released before {piece}")
-        slot["owed"].discard(piece)
+        if piece not in slot["owed"]:
+            return False
+        slot["owed"].remove(piece)
         if not slot["owed"]:
             self.release(key)
             return True
@@ -298,7 +316,7 @@ class _NodeState:
 
 
 class _SlotTable:
-    """In-process coordinator for one concrete chain: one lock, one version."""
+    """In-process coordinator: one lock, one version, targeted all-fit waits."""
 
     # One process's threads share this table; the file table sets this False so
     # every state change is persisted. Threads can skip a notify when a change
@@ -308,7 +326,21 @@ class _SlotTable:
     def __init__(self, plan, key: str | None = None) -> None:
         self.plan = plan
         self.key = key
-        self.cond = threading.Condition()
+        self.lock = threading.RLock()
+        self.cond = threading.Condition(self.lock)
+        self.activity_lock = threading.Lock()
+        self.rank_conds = {rank: threading.Condition(self.lock) for rank in plan.ranks}
+        self.waiters = {}
+        last = len(plan.budget) - 1
+        for rank in plan.ranks:
+            _ = [
+                self.waiters.setdefault((last, node, key), set()).add(rank)
+                for node, key, _off, _size in plan.drains.get(rank, ())
+            ]
+            _ = [
+                self._add_waiter(rank, layer, node, key)
+                for layer, node, key in plan.services.get(rank, ())
+            ]
         self.version = 0
         self.inflight = 0
         self.nodes = {
@@ -325,13 +357,27 @@ class _SlotTable:
     def node(self, layer: int, node: int) -> _NodeState:
         return self.nodes[(layer, node)]
 
+    def _add_waiter(self, rank, layer, node, key) -> None:
+        self.waiters.setdefault((layer, node, key), set()).add(rank)
+        if layer == 0:
+            return
+        seg = self.plan.segments[layer][node][key]
+        pnode = self.plan.parent[layer][node]
+        for pkey, _off, _size in seg.parents:
+            self.waiters.setdefault((layer - 1, pnode, pkey), set()).add(rank)
+
     @property
     def _in_mem(self) -> bool:
         return getattr(self, "in_memory", False)
 
-    def bump(self) -> None:
+    def bump(self, ranks=None) -> None:
         self.version += 1
-        self.cond.notify_all()
+        if ranks is None:
+            self.cond.notify_all()
+            _ = [cond.notify_all() for cond in self.rank_conds.values()]
+            return
+        for rank in ranks:
+            self.rank_conds[rank].notify_all()
 
     def mark_touched(self, key) -> None:
         """No-op: this table shares one in-memory state, so there is no
@@ -344,7 +390,8 @@ class _SlotTable:
         """Thread callers cannot outlive a killed process."""
 
     def activity(self, owner, delta: int) -> None:
-        self.inflight += delta
+        with self.activity_lock:
+            self.inflight += delta
 
     def finish(self, owner) -> None:
         """No process registration in the thread coordinator."""
@@ -361,7 +408,7 @@ class _SlotTable:
 
 _COORD_ENV = "GDTENSOR_CACHE_COORDINATOR"
 _COORD_DIR_ENV = "GDTENSOR_CACHE_DIR"
-_MAGIC = "gdtensor-coord-v4"
+_MAGIC = "gdtensor-coord-v5"
 
 
 def _DBG(*parts) -> None:
@@ -775,10 +822,10 @@ def _resolve_fingerprint(chain, entry, leader):
 
 
 @contextmanager
-def _shared_cache_key(chain, identity, namespaces):
+def _shared_cache_key(chain, identity, namespaces, active=None):
     """Share one active fingerprint; expire it after the last caller."""
     key = id(chain)
-    entry, leader = _fingerprint_entry(chain)
+    entry, leader = _fingerprint_entry(chain) if active is None else active
     try:
         try:
             fingerprint = _resolve_fingerprint(chain, entry, leader)
@@ -787,7 +834,8 @@ def _shared_cache_key(chain, identity, namespaces):
             raise invalid("cache_identity", str(exc)) from None
         yield cache_key
     finally:
-        _fingerprint_release(key, entry)
+        if active is None:
+            _fingerprint_release(key, entry)
 
 
 def _drop_table(key, view_id, expected) -> None:
@@ -826,7 +874,7 @@ def _slot_table(cache_key, chain, views):
     return table
 
 
-def _slots(chain, source_identity=None):
+def _slots(chain, source_identity=None, active_fingerprint=None):
     from .propagation import cache_layers
 
     identity = (
@@ -839,8 +887,10 @@ def _slots(chain, source_identity=None):
     for view in views:
         accessor = view.data_accessor
         namespace = getattr(accessor, "cache_namespace", lambda: None)()
-        namespaces.append(("object", id(accessor)) if namespace is None else namespace)
-    with _shared_cache_key(chain, identity, namespaces) as key:
+        namespaces.append(
+            ("object", os.getpid(), id(accessor)) if namespace is None else namespace
+        )
+    with _shared_cache_key(chain, identity, namespaces, active_fingerprint) as key:
         directory = os.path.realpath(
             os.environ.get(_COORD_DIR_ENV, tempfile.gettempdir())
         )
@@ -865,29 +915,32 @@ class _RankRun:
     drain what is filled, otherwise fill what fits, otherwise wait.
     """
 
-    def __init__(self, table, rank: int, caches, storage, dst) -> None:
+    def __init__(self, table, rank: int, caches, storage, dst, source_identity) -> None:
         from .propagation import execution_closure
 
         self.t, self.plan, self.rank = table, table.plan, rank
         self.caches, self.storage, self.dst = caches, storage, dst
-        self.source_identity = storage.data_accessor.cache_identity()
+        self.source_identity = source_identity
+        self.source_digest = _content_digest(source_identity)
         self.last = len(caches) - 1
         closure = execution_closure(self.plan, rank)
         self.closure = closure
         self._absent: set = set()
+        self._parent_blocks = {}
         self.services = list(self.plan.services.get(rank, ()))
         self.gens = dict.fromkeys(sorted({(lay, n) for lay, n, _k in closure}), 0)
         self.wait = _wait_seconds()
-        # All-fit plans never evict or reuse a segment during the load, so
-        # the deterministic plan can drive execution without per-piece
-        # consumer probes. File mode keeps the legacy loop (its state must
-        # persist every transition for peer processes).
+        # All-fit hot plans never evict or reuse a segment during the load, so
+        # the deterministic preflight can skip consumer obligations. Cold plans
+        # use layer-ordered fills and targeted dependency waits.
+        # File mode keeps the legacy loop (its state must persist every transition).
         self._all_fit = table._in_mem and all(
             budget >= demand
             for layer, demands in enumerate(self.plan.demand)
             for node, demand in demands.items()
             for budget in (self.plan.budget[layer][node],)
         )
+        self.wait_cond = table.rank_conds[rank] if self._all_fit else table.cond
 
     def run(self) -> None:
         with self.t.participate(self.rank) as self.owner:
@@ -896,7 +949,10 @@ class _RankRun:
     def _run(self) -> None:
         with self.t.cond:
             self.t.check_alive()
-            self.gens = {ln: self.t.node(*ln).join(self.rank) for ln in self.gens}
+            version = self.t.version
+            self.gens = {
+                ln: self.t.node(*ln).join(self.rank, version) for ln in self.gens
+            }
             [self.t.mark_touched(ln) for ln in self.gens]
             self.t.bump()
         try:
@@ -904,7 +960,6 @@ class _RankRun:
             self._loop(list(self.plan.drains[self.rank])) if not self._all_fit else None
             self._run_all_fit() if self._all_fit else None
             self._version_checked()
-            self._check_source()
         except BaseException as exc:
             self._fail_all_fit(exc)
             raise
@@ -942,42 +997,77 @@ class _RankRun:
             hot = len(self._classify_drains(owned, layer, seal=False)) == len(owned)
             layer += 1
         if not hot:
-            self._fill_all_layers()
+            self._run_all_fit_cold(pending)
+            return
         self._drain_hot(pending)
 
-    def _fill_all_layers(self) -> None:
-        for layer in range(len(self.caches)):
-            self._fill_layer(layer)
-
-    def _fill_layer(self, layer: int) -> None:
-        mine = sorted(item for item in self.closure if item[0] == layer)
-        batch_read = (
-            getattr(self.caches[layer - 1].data_accessor, "read_bytes_batch", None)
-            if layer > 0
-            else None
-        )
-        if batch_read is None:
-            self._fill_layer_scalar(layer, mine)
-        else:
-            self._fill_layer_batch(layer, mine, batch_read)
-        self._wait_layer(layer, mine)
-
-    def _fill_layer_scalar(self, layer, mine) -> None:
-        for _layer, node, key in mine:
-            self._fill_one(layer, node, key) if self._can_fill(
-                layer, node, key
-            ) else None
-
-    def _collect_parent_fill(self, layer, node, key, by_node) -> None:
-        if self._can_fill(layer, node, key) and not self._adopt(layer, node, key):
-            by_node.setdefault(node, []).append(self.plan.segments[layer][node][key])
-
-    def _fill_layer_batch(self, layer, mine, batch_read) -> None:
+    def _run_all_fit_cold(self, pending: list) -> None:
+        """Fill owned work once in layer order, then drain the rank's reads."""
+        owned = sorted(item for item in self.closure if self._can_fill(*item))
         by_node = {}
-        for _layer, node, key in mine:
-            self._collect_parent_fill(layer, node, key, by_node)
-        for node, segs in sorted(by_node.items()):
-            self._fill_node_batches(layer, node, segs, batch_read)
+        for item in owned:
+            by_node.setdefault(item[:2], []).append(item)
+        with self.t.cond:
+            _ = [self.t._add_waiter(self.rank, *item) for item in owned]
+        for (layer, node), items in sorted(by_node.items()):
+            self._fill_cold_node(layer, node, items)
+        for node, key in dict.fromkeys((p[0], p[1]) for p in pending):
+            self._wait_cold_slot(self.last, node, key)
+        self._drain_hot(pending)
+
+    def _fill_cold_node(self, layer: int, node: int, items: list) -> None:
+        pieces = [(node, key, key[1], key[2]) for _layer, _node, key in items]
+        self._classify_drains(pieces, layer)
+        with self.t.cond:
+            state = self.t.node(layer, node)
+            items = [
+                item
+                for item in items
+                if item[2] not in state.completed and item[2] not in state.slots
+            ]
+        if not items:
+            return
+        if layer == 0:
+            _ = [self._ensure(*item) for item in items]
+            return
+        pnode = self.plan.parent[layer][node]
+        parents = {
+            pkey
+            for _layer, _node, key in items
+            for pkey, _off, _size in self.plan.segments[layer][node][key].parents
+        }
+        for pkey in sorted(parents):
+            self._wait_cold_slot(layer - 1, pnode, pkey)
+        if self._has_parent_batch(layer):
+            self._ensure_items(items)
+            return
+        for item in items:
+            self._ensure(*item)
+
+    def _wait_cold_slot(self, layer: int, node: int, key) -> None:
+        """Wait for one published dependency without rescanning other segments."""
+        deadline = time.monotonic() + self.wait
+        with self.wait_cond:
+            self._wait_cold_locked(layer, node, key, deadline)
+
+    def _wait_cold_locked(self, layer: int, node: int, key, deadline: float) -> None:
+        state = self.t.node(layer, node)
+        while not self._slot_filled(layer, node, key):
+            deadline = self._cold_wait_once(state, layer, node, key, deadline)
+
+    def _cold_wait_once(self, state, layer: int, node: int, key, deadline: float):
+        self.t.check_alive()
+        state.check(self.gens[layer, node])
+        deadline = time.monotonic() + self.wait if self.t.inflight > 0 else deadline
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise self._timeout_at(layer, node, key)
+        version = self.t.version
+        self.wait_cond.wait_for(
+            lambda: self._slot_filled(layer, node, key) or self.t.version != version,
+            timeout=left,
+        )
+        return time.monotonic() + self.wait if self.t.version != version else deadline
 
     def _fill_node_batches(self, layer, node, segs, batch_read) -> bool:
         moved = False
@@ -1050,7 +1140,7 @@ class _RankRun:
         if sum(size for _key, _off, size in seg.parents) != seg.size:
             raise invalid("cache_segment", "parent bytes do not match segment")
         end = start + len(seg.parents)
-        payload = b"".join(data[start:end])
+        payload = _join_bytes(data[start:end])
         if len(payload) != seg.size:
             raise invalid("buffer_len", "parent payload has wrong byte count")
         return payload, end
@@ -1076,61 +1166,6 @@ class _RankRun:
             self.t.mark_touched((layer, node))
             self.t.bump()
 
-    def _wait_layer(self, layer: int, items: list) -> None:
-        nodes = dict.fromkeys(node for _layer, node, _key in items)
-        deadline = time.monotonic() + self.wait
-        seen = -1
-        for item in items:
-            deadline, seen = self._wait_layer_item(layer, item, deadline, nodes, seen)
-
-    def _wait_layer_item(self, layer: int, item, deadline, nodes, seen: int):
-        done = False
-        while not done and not self._adopted(*item):
-            deadline, seen, done = self._wait_layer_round(
-                layer, item, deadline, nodes, seen
-            )
-        return time.monotonic() + self.wait, seen
-
-    def _wait_layer_round(self, layer, item, deadline, nodes, seen):
-        version = self._version_checked()
-        with self.t.cond:
-            return self._wait_layer_locked(layer, item, deadline, nodes, seen, version)
-
-    def _wait_layer_locked(self, layer, item, deadline, nodes, seen, version):
-        # Completed is monotonic within a generation. Any completed segment in
-        # this layer proves progress, not only this item.
-        completed = sum(len(self.t.node(layer, node).completed) for node in nodes)
-        if completed != seen:
-            seen = completed
-            deadline = time.monotonic() + self.wait
-        if self._slot_filled(*item):
-            return time.monotonic() + self.wait, seen, True
-        self._wait_layer_pending(layer, deadline, version)
-        return deadline, seen, False
-
-    def _wait_layer_pending(self, layer, deadline, version) -> None:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            self._wait_layer_timeout(layer)
-        self.t.cond.wait_for(
-            lambda: self.t.version != version,
-            timeout=min(max(left, 0.05), 0.05),
-        )
-
-    def _wait_layer_timeout(self, layer: int) -> None:
-        if self.t.inflight == 0:
-            raise check_failed(
-                "cache_wait",
-                f"rank {self.rank}: cache layer {layer} segments were not "
-                f"filled within {self.wait}s (all-fit plan)",
-            )
-
-    def _check_source(self):
-        if self.source_identity != self.storage.data_accessor.cache_identity():
-            raise check_failed(
-                "cache_source_changed", "source file changed during load"
-            )
-
     def _adopt(self, layer: int, node: int, key) -> bool:
         """Adopt a segment the cache view already reports as present.
 
@@ -1139,8 +1174,6 @@ class _RankRun:
         """
         if (layer, node, key) in self._absent:
             return False
-        if self._adopted(layer, node, key):
-            return True
         if self.source_identity is None:
             return False
         piece = (node, key, key[1], key[2])
@@ -1167,11 +1200,9 @@ class _RankRun:
             self.t._absent_memo[(layer, node, key)] = memo[0]
 
     def _range(self, key, node):
-        return _CacheRange(key[0], key[1], key[2], node, self.source_identity)
-
-    def _adopted(self, layer: int, node: int, key) -> bool:
-        with self.t.cond:
-            return self._slot_filled(layer, node, key)
+        return _CacheRange(
+            key[0], key[1], key[2], node, self.source_identity, self.source_digest
+        )
 
     def _slot_filled(self, layer: int, node: int, key) -> bool:
         state = self.t.node(layer, node)
@@ -1244,17 +1275,22 @@ class _RankRun:
         if piece in ready or node_key in seen:
             return
         seen.add(node_key)
-        if (layer, piece[0], piece[1]) not in self._absent:
-            probe_keys.append(node_key)
+        item = (layer, piece[0], piece[1])
+        if item in self._absent:
+            return
+        memo_hit = (
+            self.t._in_mem
+            and self.t._absent_memo.get(item) == self.t.node(layer, piece[0]).gen
+        )
+        if memo_hit:
+            self._absent.add(item)
+            return
+        probe_keys.append(node_key)
 
     def _probe_drain_bytes(self, keys, layer: int) -> list:
         """Probe one cache layer outside the coordinator lock."""
         if self.source_identity is None:
             return []
-        if self.source_identity != self.storage.data_accessor.cache_identity():
-            raise check_failed(
-                "cache_source_changed", "source file changed during load"
-            )
         acc = self.caches[layer].data_accessor
         segs = []
         batch_probe = getattr(acc, "has_bytes_batch", None)
@@ -1280,6 +1316,12 @@ class _RankRun:
         ranges = [self._range(key, node) for node, key in batch]
         if batch_probe(ranges):
             segs.extend(self.plan.segments[layer][node][key] for node, key in batch)
+            return
+        if len(batch) == 1:
+            node, key = batch[0]
+            memo = self._absent_memo_fp(layer, node, key)
+            self._absent.add((layer, node, key))
+            self._absent_memo_store(layer, node, key, memo)
             return
         for node, key in batch:
             self._probe_one(node, key, acc, segs, layer)
@@ -1325,6 +1367,10 @@ class _RankRun:
         if reserve:
             state.slots[seg.key]["filled"] = True
         state.completed.add(seg.key)
+        state.completed_at[seg.key] = self.t.version
+        self._settle_completed_children(layer, seg.node, seg)
+        if reserve and layer > 0:
+            self._ack_parents_locked(layer, seg.node, seg)
         sealed.add((seg.node, seg.key))
         changed.append(seg.node)
 
@@ -1405,10 +1451,19 @@ class _RankRun:
         self.t.mark_touched(ln)
 
     def _loop(self, pending: list) -> None:
-        """The wait limit restarts after every unit of progress."""
+        """The wait limit restarts after local or peer progress."""
         deadline = time.monotonic() + self.wait
+        observed = None
         while pending or self.services:
             version = self._version_checked()
+            # In-memory probes do not bump version. File-mode probe commits
+            # also change version, but they are not evidence of cache progress.
+            deadline = (
+                time.monotonic() + self.wait
+                if self.t._in_mem and (observed is None or version != observed)
+                else deadline
+            )
+            observed = version
             moved = self._step(pending)
             deadline = time.monotonic() + self.wait if moved else deadline
             # A peer can release budget during _step. Keep the pre-step version
@@ -1417,17 +1472,24 @@ class _RankRun:
 
     def _step(self, pending: list) -> bool:
         """Drain every filled piece; else fill ready segments. True on progress."""
+        if self._all_fit and self._service_step():
+            # All-fit has no capacity release dependency on local drains. Do
+            # not rescan every pending piece before each assigned service fill.
+            return True
         done = self._classify_drains(pending, self.last)
         self._drain_hot(done)
         for piece in done:
             pending.remove(piece)
+        items = [(self.last, n, k) for n, k, _o, _s in pending]
         return (
             bool(done)
-            or self._service_step()
-            or self._ensure_items([(self.last, n, k) for n, k, _o, _s in pending])
+            or (not self._all_fit and self._service_step())
+            or self._ensure_items(items)
         )
 
     def _service_step(self) -> bool:
+        if self._all_fit:
+            return self._service_all_fit()
         ready = next((item for item in self.services if self._completed(*item)), None)
         moved = False if ready is not None else self._ensure_items(self.services)
         if ready is None:
@@ -1438,6 +1500,19 @@ class _RankRun:
             return moved
         self.services.remove(ready)
         return True
+
+    def _service_all_fit(self) -> bool:
+        if not self.services:
+            return False
+        item = self.services[0]
+        if self._completed(*item):
+            self.services.pop(0)
+            return True
+        moved = self._ensure_items([item])
+        if self._completed(*item):
+            self.services.pop(0)
+            return True
+        return moved
 
     def _version_checked(self) -> int:
         with self.t.cond:
@@ -1450,24 +1525,50 @@ class _RankRun:
         pass with no own progress times out only when nothing is in flight:
         a slow fill or drain counts as progress, so healthy peers never hit
         the wait limit."""
-        with self.t.cond:
+        with self.wait_cond:
             done = self._block_locked(version, deadline, pending)
         if not done:
             raise self._timeout(pending)
 
-    def _block_locked(self, version, deadline, pending) -> bool:
-        # A peer can publish between _step and this wait.
-        ready = any(
+    def _all_fit_ready(self, pending) -> bool:
+        services = self.services[:1] if self._all_fit else self.services
+        return any(
             self._slot_filled(self.last, node, key)
             for node, key, _off, _size in pending
-        ) or any(
-            key in self.t.node(layer, node).completed
-            for layer, node, key in self.services
-        )
-        if ready:
+        ) or any(self._service_ready(*item) for item in services)
+
+    def _service_ready(self, layer, node, key) -> bool:
+        state = self.t.node(layer, node)
+        if key in state.completed:
             return True
+        if not self._all_fit or layer == 0 or key in state.slots:
+            return False
+        seg = self.plan.segments[layer][node][key]
+        pnode = self.plan.parent[layer][node]
+        return all(
+            self._slot_filled(layer - 1, pnode, pkey)
+            for pkey, _off, _size in seg.parents
+        )
+
+    def _block_locked(self, version, deadline, pending) -> bool:
+        # A peer can publish between _step and this wait.
+        if self._all_fit_ready(pending):
+            return True
+        if self._all_fit and self.t._in_mem:
+            return self._block_all_fit(version, deadline, pending)
         moved = self._wait_deadline(version, deadline)
         return moved or self._wait_inflight(version)
+
+    def _block_all_fit(self, version, deadline, pending) -> bool:
+        # Unrelated fills must not wake every rank into a full pending scan.
+        # A bounded poll still discovers parents needed by local fills.
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return self._wait_inflight(version)
+        self.wait_cond.wait_for(
+            lambda: self._all_fit_ready(pending), timeout=min(left, 0.05)
+        )
+        return True
 
     def _wait_deadline(self, version: int, deadline: float) -> bool:
         ready = False
@@ -1490,7 +1591,7 @@ class _RankRun:
     def _wait_inflight(self, version: int) -> bool:
         done = False
         while not done and self.t.inflight > 0:
-            done = self.t.cond.wait_for(
+            done = self.wait_cond.wait_for(
                 lambda: self.t.version != version or self.t.inflight == 0,
                 timeout=0.05,
             )
@@ -1500,6 +1601,9 @@ class _RankRun:
         layer, node, key = (
             (self.last, pending[0][0], pending[0][1]) if pending else self.services[0]
         )
+        return self._timeout_at(layer, node, key)
+
+    def _timeout_at(self, layer: int, node: int, key):
         state = self.t.node(layer, node)
         owed = state.owed_to()
         msg = (
@@ -1513,17 +1617,21 @@ class _RankRun:
         with self.t.cond:
             return key in self.t.node(layer, node).completed
 
-    def _filled(self, layer: int, node: int, key) -> bool:
-        with self.t.cond:
-            slot = self.t.node(layer, node).slots.get(key)
-            return slot is not None and slot["filled"]
-
     def _ensure_items(self, items: list) -> bool:
         items = list(dict.fromkeys(items))
-        moved = self._ensure_parent_batches(items)
-        return moved or any(
-            self._ensure(*item) for item in items if not self._has_parent_batch(item[0])
-        )
+        # Service lists contain lower-layer fills followed by child fills. Do
+        # not scan every child dependency before making immediately available
+        # lower-layer progress; large fan-outs can otherwise exceed cache_wait
+        # in one scan while their parent owners have done no useful work.
+        batched = []
+        moved = any(self._ensure_or_batch(item, batched) for item in items)
+        return moved or self._ensure_parent_batches(batched)
+
+    def _ensure_or_batch(self, item, batched) -> bool:
+        if not self._has_parent_batch(item[0]):
+            return self._ensure(*item)
+        batched.append(item)
+        return False
 
     def _has_parent_batch(self, layer: int) -> bool:
         return (
@@ -1535,11 +1643,7 @@ class _RankRun:
     def _ensure_parent_batches(self, items: list) -> bool:
         by_node = {}
         for layer, node, key in items:
-            seg = (
-                self._prepare_fill(layer, node, key)
-                if self._has_parent_batch(layer)
-                else None
-            )
+            seg = self._prepare_fill(layer, node, key)
             by_node.setdefault((layer, node), []).append(
                 seg
             ) if seg is not None else None
@@ -1558,13 +1662,13 @@ class _RankRun:
         return True
 
     def _prepare_fill(self, layer: int, node: int, key):
-        """Check child capacity before filling or adopting its parents."""
+        """Adopt hot bytes before checking ownership for a cold fill."""
         seg = self.plan.segments[layer][node][key]
-        if not self._can_fill(layer, node, key):
-            return None
         if not self._room(layer, node, seg):
             return None
         if self._adopt(layer, node, key):
+            return None
+        if not self._can_fill(layer, node, key):
             return None
         if layer > 0 and not self._parents_ready(layer, node, seg):
             return None
@@ -1595,32 +1699,61 @@ class _RankRun:
             self.t.bump() if ok and not self.t._in_mem else None
         return ok
 
-    def _parents_ready(self, layer: int, node: int, seg) -> bool:
-        """Fill the missing parent segments; True when all are filled.
+    def _parent_blocked(self, layer, pnode, child) -> bool:
+        blocked = self._parent_blocks.get(child)
+        if blocked is None:
+            return False
+        with self.t.cond:
+            # completed is monotonic within this run's generation. An unchanged
+            # size proves that no blocked parent became ready.
+            state = self.t.node(layer - 1, pnode)
+            return len(state.completed) == blocked[1]
 
-        The plan gives every child segment exactly one parent segment, and a
-        segment never exceeds the parent budget, so an empty parent layer
-        always admits it.
-        """
+    def _parents_ready(self, layer: int, node: int, seg) -> bool:
+        """Fill missing parents; skip an unchanged non-owned dependency block."""
+        child = layer, node, seg.key
         pnode = self.plan.parent[layer][node]
+        if self._parent_blocked(layer, pnode, child):
+            return False
         psegs = self.plan.segments[layer - 1][pnode]
         keys = sorted({pkey for pkey, _o, _n in seg.parents})
-        for k in keys:
-            self._adopt(layer - 1, pnode, k)
-        if all(self._filled(layer - 1, pnode, k) for k in keys):
+        with self.t.cond:
+            missing = [
+                psegs[k] for k in keys if not self._slot_filled(layer - 1, pnode, k)
+            ]
+        blocked_keys = tuple(s.key for s in missing)
+        if not missing:
             return True
-        missing = [psegs[k] for k in keys if not self._resident(layer - 1, pnode, k)]
-        if any(not self._can_fill(layer - 1, pnode, s.key) for s in missing):
+        previous = self._parent_blocks.get(child)
+        if self._all_fit and previous is not None and previous[0] == blocked_keys:
             return False
-        if not missing or not self._reserve(layer - 1, pnode, missing):
+        for pseg in missing:
+            self._adopt(layer - 1, pnode, pseg.key)
+        with self.t.cond:
+            missing = [
+                pseg
+                for pseg in missing
+                if not self._slot_filled(layer - 1, pnode, pseg.key)
+            ]
+            completed_mark = len(self.t.node(layer - 1, pnode).completed)
+        if not missing:
+            return True
+        if self._parent_unowned(layer, pnode, child, missing, completed_mark):
+            return False
+        if not self._reserve(layer - 1, pnode, missing):
             return False
         for pseg in missing:
             self._fill(layer - 1, pnode, pseg)
         return True
 
-    def _resident(self, layer: int, node: int, key) -> bool:
-        with self.t.cond:
-            return key in self.t.node(layer, node).slots
+    def _parent_unowned(self, layer, pnode, child, missing, completed_mark) -> bool:
+        blocked = any(not self._can_fill(layer - 1, pnode, s.key) for s in missing)
+        if blocked and self._all_fit:
+            self._parent_blocks[child] = (
+                tuple(s.key for s in missing),
+                completed_mark,
+            )
+        return blocked
 
     def _fill(self, layer: int, node: int, seg, data=None) -> None:
         if not self._can_fill(layer, node, seg.key):
@@ -1645,11 +1778,18 @@ class _RankRun:
             state = self.t.node(layer, node)
             state.slots[seg.key]["filled"] = True
             state.completed.add(seg.key)
+            state.completed_at[seg.key] = self.t.version
+            self._settle_completed_children(layer, node, seg)
             self.t.activity(self.owner, -1)
             self.t.mark_touched((layer, node))
             self._ack_parents_locked(layer, node, seg) if layer > 0 else None
             # Fill completion makes fill/drain predicates true: always bump.
-            self.t.bump()
+            waiters = (
+                self.t.waiters.get((layer, node, seg.key), ())
+                if self._all_fit
+                else None
+            )
+            self.t.bump(waiters) if self._all_fit else self.t.bump()
 
     def _fill_failed(self, layer, node, seg, exc) -> None:
         self._fail(layer, node, exc, seg.key)
@@ -1661,10 +1801,31 @@ class _RankRun:
         _write(self.caches[layer].data_accessor, self._range(seg.key, node), data)
 
     def _ack_parent(self, pstate, pkey, consumer, off, size) -> None:
-        if pkey not in pstate.slots and pkey in pstate.completed:
-            # A hot presence probe records completion without obligations.
+        if pkey not in pstate.slots:
+            # A hot child can satisfy its parent obligation without reserving
+            # the parent in this generation. A released parent has none left.
             return
         pstate.ack(pkey, (consumer, off, size))
+
+    def _settle_completed_children(self, layer: int, node: int, seg) -> None:
+        """Discard obligations to child segments completed before admission."""
+        state = self.t.node(layer, node)
+        if seg.key not in state.slots:
+            return
+        for consumer, pieces in seg.consumers.items():
+            self._settle_completed_child(state, seg.key, consumer, pieces)
+
+    def _settle_completed_child(self, state, key, consumer, pieces) -> None:
+        if consumer[0] != "seg":
+            return
+        _, child_layer, child_node, child_key = consumer
+        child = self.t.node(child_layer, child_node)
+        if child_key not in child.completed:
+            return
+        if child.completed_at.get(child_key, state.started) < state.started:
+            return
+        for off, size in pieces:
+            state.ack(key, (consumer, off, size))
 
     def _ack_parents_locked(self, layer: int, node: int, seg) -> None:
         """ACK this fill's parent pieces; the caller holds the table lock."""
@@ -1684,9 +1845,9 @@ class _RankRun:
     def _source_bytes(self, layer: int, seg) -> bytes:
         if layer == 0:
             acc = self.storage.data_accessor
-            return b"".join(_read(acc, rng) for rng, _off in seg.storage)
+            return _join_bytes([_read(acc, rng) for rng, _off in seg.storage])
         acc = self.caches[layer - 1].data_accessor
-        return b"".join(_read(acc, rng) for rng in self._source_ranges(layer, seg))
+        return _join_bytes([_read(acc, rng) for rng in self._source_ranges(layer, seg)])
 
     def _drain_hot(self, pending) -> None:
         acc = self.caches[self.last].data_accessor
@@ -1746,10 +1907,12 @@ class _RankRun:
                 key, (("rank", self.rank), off, size)
             )
             self.t.mark_touched((self.last, node))
-            # Bump only when a waiter predicate can change: a slot release,
-            # or the last in-flight unit finishing. Other ACKs change no
-            # predicate (waiters read version and inflight only).
-            gated = not self.t._in_mem or released or self.t.inflight == 0
+            # Capacity-limited waits can depend on a slot release or the last
+            # in-flight unit. All-fit readiness ignores ACK releases and uses
+            # bounded in-flight polls, so its ACKs do not broadcast.
+            gated = not self.t._in_mem or (
+                not self._all_fit and (released or self.t.inflight == 0)
+            )
             self.t.bump() if gated else None
 
     def _drain_failed(self, node, exc) -> None:
@@ -1769,6 +1932,10 @@ class _RankRun:
         """Mark a fill or drain as in flight: waiting peers treat in-flight
         work as progress and do not time out. The delta is persisted so a peer
         in another process observes it."""
+        if self.t._in_mem:
+            # Do not serialize every I/O probe behind the global state lock.
+            self.t.activity(self.owner, delta)
+            return
         with self.t.cond:
             self.t.activity(self.owner, delta)
             # +1 makes no waiter predicate true; a -1 to zero is observed by
@@ -1790,16 +1957,29 @@ class _CacheRange(RangeFromComputeView):
 
     cache_node: int = 0
     source_identity: Any = None
+    source_digest: str | None = field(default=None, compare=False, repr=False)
 
 
-def _run_cached(rank: int, chain, storage_session_view) -> None:
+def _run_cached(rank: int, chain, storage_session_view, identity) -> None:
     from .propagation import cache_layers
 
-    identity = storage_session_view.data_accessor.cache_identity()
-    table = _slots(chain, identity)
-    if rank not in table.plan.ranks:
-        raise invalid("rank", f"rank {rank} not in read-chain ranks {table.plan.ranks}")
-    _RankRun(table, rank, cache_layers(chain), storage_session_view, chain.dst).run()
+    active = _fingerprint_entry(chain)
+    try:
+        table = _slots(chain, identity, active)
+        if rank not in table.plan.ranks:
+            raise invalid(
+                "rank", f"rank {rank} not in read-chain ranks {table.plan.ranks}"
+            )
+        _RankRun(
+            table,
+            rank,
+            cache_layers(chain),
+            storage_session_view,
+            chain.dst,
+            identity,
+        ).run()
+    finally:
+        _fingerprint_release(id(chain), active[0])
 
 
 def _run_one_concrete(rank: int, chain) -> None:
@@ -1825,7 +2005,7 @@ def _run_one_concrete(rank: int, chain) -> None:
         if plan is not None:
             _copy(plan, view, chain.dst)
         else:
-            _run_cached(rank, chain, view)
+            _run_cached(rank, chain, view, identity)
         if identity != identity_of():
             raise check_failed(
                 "cache_source_changed", "source file changed during load"

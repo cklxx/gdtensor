@@ -52,7 +52,8 @@ tlc() {
   cat "$log.run" >> "$log"
   rm -f "$HERE"/SlotLifecycle_TTrace_*.bin "$HERE"/SlotLifecycle_TTrace_*.tla \
         "$HERE"/CopyPlan_TTrace_*.bin    "$HERE"/CopyPlan_TTrace_*.tla \
-        "$HERE"/AtomicPublish_TTrace_*.bin "$HERE"/AtomicPublish_TTrace_*.tla || true
+        "$HERE"/AtomicPublish_TTrace_*.bin "$HERE"/AtomicPublish_TTrace_*.tla \
+        "$HERE"/CachePropagation_TTrace_*.bin "$HERE"/CachePropagation_TTrace_*.tla || true
   return $rc
 }
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -331,8 +332,7 @@ def _resolve_slot(index: PayloadIndex, rng):
     fp = index.files.get(rng.file_path)
     if fp is None:
         raise invalid("global_range", f"unknown file {rng.file_path}")
-    starts = [x.contiguous_payload_offset for x in fp.slots]
-    k = int(np.searchsorted(starts, rng.contiguous_payload_offset, side="right")) - 1
+    k = bisect_right(fp.starts, rng.contiguous_payload_offset) - 1
     if k < 0:
         raise invalid("global_range", "payload offset before first slot")
     slot = fp.slots[k]

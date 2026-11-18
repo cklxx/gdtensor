@@ -37,6 +37,7 @@ class FilePayload:
     path: str
     leader: TensorComponentPos
     slots: list = field(default_factory=list)
+    starts: list = field(default_factory=list)
     size: int = 0
 
     @property
@@ -82,6 +83,7 @@ def build_payload_index(table, layout):
                 fp.payload_size,
             )
             fp.slots.append(slot)
+            fp.starts.append(slot.contiguous_payload_offset)
             fp.size += slot.nbytes
             slots[pos] = fp.path, slot
     return PayloadIndex(files, slots)

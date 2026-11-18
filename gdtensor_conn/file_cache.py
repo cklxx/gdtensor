@@ -14,8 +14,8 @@ import gdtensor.access as ga
 import gdtensor.builder as gb
 
 
-def file_identity(path):
-    path = os.path.realpath(path)
+def file_identity(path, canonical=True):
+    path = os.path.realpath(path) if canonical else path
     s = os.stat(path)
     return path, s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
 
@@ -197,11 +197,12 @@ def _truncate_to(fd, size):
 
 
 class DiskNodeCache(ga.DTensorDataAccessor):
-    """Path-scoped cache; publish metadata only after complete physical writes.
+    """Process-local, path-scoped cache with atomic metadata publication.
 
     Metadata checks detect external file mutation. SHA256 checks detect payload
-    corruption before passing bytes to a consumer. Persistence across process
-    restart is deliberately not claimed: unindexed files are cold.
+    corruption before passing bytes to a consumer. Bytes, validity and integrity
+    are process-local; persistence across process restart is deliberately not
+    claimed: unindexed files are cold.
     """
 
     def __init__(self, cluster, sizes, target_of_rank, root, device):
@@ -226,7 +227,8 @@ class DiskNodeCache(ga.DTensorDataAccessor):
         actor = self.cluster.node_of_rank(self.cluster.rank)
         target = getattr(rng, "cache_node", self.target_of_rank(self.cluster.rank))
         identity = getattr(rng, "source_identity", None)
-        namespace = ga._content_digest(identity)[:20]
+        digest = getattr(rng, "source_digest", None)
+        namespace = (digest or ga._content_digest(identity))[:20]
         return actor, target, namespace
 
     def _node_lock(self, namespace, node):
@@ -247,7 +249,7 @@ class DiskNodeCache(ga.DTensorDataAccessor):
         return self.fds[key]
 
     def _stamp(self, namespace, node):
-        return file_identity(self.file_path(namespace, node))
+        return file_identity(self.file_path(namespace, node), canonical=False)
 
     def _check_stamp(self, namespace, node):
         key = namespace, node
@@ -347,7 +349,7 @@ class DiskNodeCache(ga.DTensorDataAccessor):
         result = callback(tmp.ctypes.data, size)
         if type(result) is not gb.Ok:
             return result
-        raw = tmp.tobytes()
+        raw = tmp
         self.cluster.transfer(actor, node, size)
         with self._node_lock(namespace, node):
             self._check_stamp(namespace, node)
@@ -427,8 +429,26 @@ class DiskNodeCache(ga.DTensorDataAccessor):
     def _read_batch_locked(self, namespace, node, ranges, data):
         for tid, off, size in ranges:
             self._require_coverage(namespace, node, tid, off, size)
-        for tid, off, size in ranges:
-            data.append(self._read_range(namespace, node, tid, off, size))
+        start = time.monotonic()
+        try:
+            data.extend(
+                self._read_checked(namespace, node, tid, off, size)
+                for tid, off, size in ranges
+            )
+            # Bytes are returned only after the whole batch passes this check.
+            self._check_stamp(namespace, node)
+        finally:
+            self._record_batch_reads(node, ranges[: len(data)], start)
+
+    def _record_batch_reads(self, node, ranges, start):
+        if not ranges:
+            return
+        elapsed = time.monotonic() - start
+        with self.lock:
+            self.io += elapsed
+            self.reads.extend(
+                (self.cluster.rank, node, size) for _tid, _off, size in ranges
+            )
 
     def _read_batch(self, namespace, node, ranges, data):
         with self._node_lock(namespace, node):

@@ -8,9 +8,9 @@ their scope is stated explicitly below.
 ## Runtime source pins
 
 - `gdtensor/internal/api.py`
-  `sha256 42dc08299afb315de16f6eaac38d9dd12fee9f704bc4212d91421886d08ff0ee`.
+  `sha256 8bfd297961f68a6728ab097cea605d39294d2dad611db750c4f1d36d6b6282ce`.
 - `gdtensor/internal/propagation.py`
-  `sha256 db555b6f0d4333c59ba00d0bcad82414ae380c88627c45c7fcec8d1d1f8ff8ad`.
+  `sha256 8c3f0ada76107e833406c5eeef5a60bac42170f8e8d8d93e8a01aeb5534c1030`.
 
 `scripts/formal_gate.sh` fails if either pin differs from the checked-out file.
 It also records both hashes in its generated manifest. A hash match verifies
@@ -52,8 +52,8 @@ layer-0 segment.
 | segment byte size                        | `SegSize[n]`                      |
 | `ChainPlan.budget` byte bound            | `Budget[n]`                       |
 | parent edges (`Segment.parents`)         | `Edges[n]` (constant `A`)         |
-| owed rank consumers (`segment.owed()`)   | `owe[n]`                          |
-| unacked parent edges                     | `rem[n]`                          |
+| owed rank pieces (`segment.owed()`)       | `owe[n]`: exact `(consumer, offset, size)` sets |
+| unacked parent pieces                    | `rem[n]`: exact child piece sets |
 | `_NodeState.resident`                    | `res[n]`                          |
 | `_NodeState.slots[k].filled`             | `st[n]`: admitted → ready         |
 | node-wide generation error               | `nerr[n]`                         |
@@ -70,16 +70,23 @@ counterpart.
 | executor (`api.py`)                                  | model step          |
 |------------------------------------------------------|---------------------|
 | `_NodeState.admit` / `reserve` byte-budget admission | `Admit(n)`          |
-| `_RankRun._fill` marks a slot filled                 | `Fill(n,TRUE)`      |
-| `_adopt` / `_seal_one` accept valid presence         | `Fill(n,TRUE)`      |
-| `_RankRun._drain` / `_NodeState.ack` rank piece      | `RankAck(n)`        |
+| `_RankRun._fill` marks a slot filled                 | `Fill(n,rank,TRUE)`  |
+| `_adopt` / `_seal_one` accept valid presence         | `Fill(n,rank,TRUE)`  |
+| `_RankRun._drain` / `_NodeState.ack` rank piece      | `RankAck(n,piece)`    |
 | `_NodeState.ack` releases when `owed` is empty       | `ReleaseTerminal(n)`|
-| `_RankRun._ack_parent` child ACK of a parent piece   | `AckEdge(n)`        |
+| `_RankRun._ack_parent` child ACK of a parent piece   | `AckEdge(n,piece)`    |
 | parent released after every child ACK                | `ReleaseParent`     |
 | `_RankRun._fail` / `_NodeState.fail` node error      | `Fill(n,FALSE)`     |
 
-The model's `owe` and `rem` sets are bounded projections of exact runtime ACK
-pieces. The model does not represent batched reads, presence probes, in-flight
+The model's `owe` and `rem` sets represent exact runtime ACK pieces. Both ACK
+orders, duplicate pieces and unknown pieces are enabled. Only removing the last
+known piece permits release. `tests/io/test_cache_mutation_detectors.py`
+differentially checks `_NodeState.ack` against the same set-transition contract.
+Cold all-fit execution uses `_run_all_fit_cold`, which fills owned nodes in
+layer order and waits only for actual parent dependencies. It then drains rank
+reads through the existing `_drain_hot` path instead of a layer-wide barrier.
+
+The model does not represent batched reads, presence probes, in-flight
 owner accounting, file locks or fingerprint sharing. Those paths require the
 runtime tests; the formal gate does not claim to verify them.
 
@@ -135,6 +142,7 @@ queues, multiple ranks per node and separate processes are checked by tests.
 | `early_parent`    | release the parent before all child acks         | `NoEarlyParentRelease`     |
 | `no_parent_order` | admit a child before the parent is ready         | `ParentReadyBeforeChild`   |
 | `silent_error`    | a failed fill is not recorded node-wide          | `ErrorRecorded`            |
+| `remote_fill`     | a non-local rank fills the segment               | `FillOnDN`                 |
 
 ## Bounded liveness (not unconditional)
 
