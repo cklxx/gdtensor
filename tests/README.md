@@ -93,7 +93,7 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 - 存储只由第一层 DN 节点读取，每字节每代一次；
 - 统计入站、出站流量等于模拟 NIC 字节加存储读取字节。
 
-每代开始前清空缓存字节和全部计数器，每代单独检查，因此跨代 2+0 的填充分布会失败。
+每代开始前清空缓存字节和全部计数器，每代单独检查，因此跨代 2+0 的填充分布会失败。独立的 `A→A→B→B` 用例只重置输出和计数器：同身份第二轮必须零源读、零新增 fill；换源后第一轮必须重新 fill，第二轮再次全热。每轮继续检查输出、CRC、guard、drain 位置、NIC 账本和结束后零 resident。
 
 默认 128 个 seed。`GDTENSOR_STRESS_SEEDS` 设置 seed 数，`GDTENSOR_STRESS_BASE` 设置起始 seed。五个变异接入 `mutation_check.py`，分别破坏填充节点、helper 节点、存储偏移、代际重填和统计流量。
 
@@ -115,13 +115,15 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 
 ## 进程退出与重启
 
+部署、升级、错误处理、新目录恢复和清理步骤见 `docs/cache-runbook.md`。
+
 文件协调器为每次缓存加载持有一个生命周期文件锁。进程退出时内核释放锁；其他调用检测到未完成调用的锁已释放后，返回 `cache_peer_down`。健康的慢 IO 没有租约到期时间。
 
 失败状态保留在同一 chain 的协调状态文件中。同目录重试明确报错，不自动复用可能不完整的缓存。所有旧调用停止后，使用新 `GDTENSOR_CACHE_DIR` 重新加载；同进程切换目录也会创建新协调表。不要在旧调用运行时删除或替换锁文件。
 
-状态协议升级为 v4。旧协议或损坏状态返回 `cache_state`；升级时全部参与进程必须使用同一版本和新协调目录，不支持混合版本运行。跨主机还要求共享文件系统提供可靠的跨客户端 `flock` 和原子替换。主机断联、文件系统阻塞及活进程永久阻塞不在本次进程退出检测的保证范围内。
+状态协议升级为 v5。旧协议或损坏状态返回 `cache_state`；升级时全部参与进程必须使用同一版本和新协调目录，不支持混合版本运行。节点记录各 rank 的调用序号；当前代内的重复调用或更高的新调用序号在空闲时开启新代，同轮和落后的晚到调用加入当前代，避免父子节点代次错位。完成记录带协调表版本；父段只抵扣本代开启后完成的子段，不能抵扣上一代子段。非 owner 可以收养已验证的热段，冷填充仍只允许计划指定的 owner；串行部分 cohort 不会等待已退出 owner 重新填充热字节。隐式对象本地 namespace 包含进程身份，fork 后的 COW 副本不会共享协调状态；显式 namespace 保持不变。`DiskNodeCache` 的字节、validity 和 integrity 仅限进程内使用。跨主机还要求共享文件系统提供可靠的跨客户端 `flock` 和原子替换。主机断联、文件系统阻塞及活进程永久阻塞不在本次进程退出检测的保证范围内。
 
-`io/test_colocated_cluster_sim.py` 检查源读取中途杀进程、健康慢读取、同目录失败和新目录恢复。`io/test_cache_owner_lifecycle.py` 检查 fork 后锁隔离、状态提交失败和同进程切换目录。`io/test_random_cache_stress.py` 增加第二代更换源数据与末层旧数据负对照；`io/test_cache_reuse_layout.py` 检查两层缓存实际删除和复用文件、慢消费者、二维 F32 非均匀列分片。后两项分别覆盖 file/thread 协调器，不等同于跨机器验证。
+`io/test_colocated_cluster_sim.py` 检查源读取中途杀进程、健康慢读取、同目录失败和新目录恢复。`io/test_cache_owner_lifecycle.py` 检查 fork 后锁隔离、状态提交失败和同进程切换目录；其真实文件进程矩阵让每个进程独立构建缓存对象，只通过文件、原子发布和 `flock` 计数共享状态，验证 fork/spawn 下隐式 namespace 不命中、显式 namespace 热轮零源读和零新增写。`io/test_random_cache_stress.py` 增加第二代更换源数据与末层旧数据负对照；`io/test_cache_reuse_layout.py` 检查两层缓存实际删除和复用文件、慢消费者、二维 F32 非均匀列分片。后两项分别覆盖 file/thread 协调器，不等同于跨机器验证。
 
 ## 本轮实际结果
 
@@ -157,7 +159,9 @@ PYTHONPATH=. uv run --locked --extra torch-cpu python log/golden_chain.py
 
 执行器准入峰值按节点检查 budget。持久文件有效字节单独记录。前者不包含 callback 暂存与 RSS；后者跨轮保留，可以大于 active budget。
 
-双机入口 `log/p2p_verify.py` 固定执行 digest/v100 的 0/1/2 层、8 MiB 往返及损坏拒绝。0 层本机直读；1 层通过 SSH 读写 v100；2 层执行本机 cache→v100 cache→rank。它使用一个逻辑 rank 和本机协调器。测试清理远端 helper 和专用数据目录。SSH 仅作为受控测试后端，不提供生产 peer 发现或跨机协调。
+双机入口 `log/p2p_verify.py` 固定执行 digest/v100 的 0/1/2 层、8 MiB 往返及损坏拒绝。0 层本机直读；1 层通过 SSH 读写 v100；2 层执行本机 cache→v100 cache→rank。它使用一个逻辑 rank 和本机协调器。测试清理远端 helper 和专用数据目录。SSH 响应采用声明长度的限长帧；单个 payload 或批量响应上限为 64 MiB。`close()` 只清本地记录，专用数据目录由 `cleanup()` 显式删除。SSH 仅作为受控测试后端，不提供生产 peer 发现或跨机协调。
+
+共享文件系统部署前，在每个客户端执行 `scripts/cache_fs_preflight.py`。所有客户端使用相同的 `--root`、`--job`、`--chain`、`--namespace` 和 `--clients`，`--client` 从 0 开始且不重复；`--job` 必须是新的运行标识。脚本检查协议、chain fingerprint、namespace、协调目录和客户端数量。client 0 持锁时，其他客户端必须无法取得非阻塞 `flock`。并发读写还检查原子替换不会暴露部分 JSON。任一检查失败即返回非零，该共享文件系统不得用于多客户端协调。
 
 ## 证明边界
 

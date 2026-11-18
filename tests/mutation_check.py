@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "42dc08299afb315de16f6eaac38d9dd12fee9f704bc4212d91421886d08ff0ee"
+FROZEN_API_SHA256 = "8bfd297961f68a6728ab097cea605d39294d2dad611db750c4f1d36d6b6282ce"
 
 
 def _production_manifest(root=ROOT):
@@ -61,6 +61,13 @@ MUTATIONS = [
         "return replace(view, data_accessor=must_ok(session.init_data_accessor()))",
         "return view",
         "tests/io/test_io_contract.py::test_custom_sessions_and_accessors",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "self._run_all_fit_cold(pending)",
+        "self._loop(pending)",
+        "tests/io/test_cache_thread_coordination.py::test_all_fit_cold_uses_static_layer_loop",
         "notorch",
     ),
     (
@@ -152,6 +159,13 @@ MUTATIONS = [
     ),
     (
         "gdtensor/internal/api.py",
+        '        if piece not in slot["owed"]:\n            return False',
+        "        if False:\n            return False",
+        "tests/io/test_cache_mutation_detectors.py::test_unknown_ack_does_not_release_consumer_free_slot",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
         "        return self.rank in self.plan.fill_ranks[(layer, node, key)]",
         "        return True",
         "tests/io/test_colocated_cluster_sim.py::test_missing_local_filler_returns_error_without_remote_write",
@@ -162,8 +176,8 @@ MUTATIONS = [
     # The detector is the first seed that exposes the mutant on digest.
     (
         "gdtensor/internal/propagation.py",
-        "eligible = [r for r in local if r in consumers]",
-        "eligible = list(consumers)",
+        "eligible = [r for r in local if r in ranks]",
+        "eligible = list(ranks)",
         "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
         "notorch",
     ),
@@ -178,14 +192,14 @@ MUTATIONS = [
         "gdtensor/internal/plan.py",
         "RangeFromStorageView(path, cpo + int(l) * isz, int(b - a) * isz)",
         "RangeFromStorageView(path, cpo + int(a) * isz, int(b - a) * isz)",
-        "tests/io/test_random_cache_stress.py::test_random_cache_strategy_is_correct[0]",
+        "tests/io/test_plan_behavior.py::test_packed_storage_offsets_differ_from_global_offsets",
         "notorch",
     ),
     (
         "gdtensor/internal/api.py",
         "if any(s.key in self.slots or s.key in self.completed for s in segs):",
         "if any(s.key in self.slots for s in segs):",
-        "tests/io/test_random_cache_stress.py",
+        "tests/io/test_cache_mutation_detectors.py::test_completed_segment_cannot_be_reserved_again",
         "notorch",
     ),
     (
@@ -365,7 +379,7 @@ MUTATIONS = [
     ),
     (
         "gdtensor_conn/file_cache.py",
-        "namespace = ga._content_digest(identity)[:20]",
+        "namespace = (digest or ga._content_digest(identity))[:20]",
         'namespace = "all-sources"',
         "tests/io/test_file_cache_correctness.py::test_source_file_identity_prevents_stale_hit[same_path]",
         "notorch",
@@ -374,14 +388,14 @@ MUTATIONS = [
         "gdtensor/internal/api.py",
         "hot = len(self._classify_drains(owned, layer, seal=False)) == len(owned)",
         "hot = True",
-        "tests/io/test_cache_thread_coordination.py::test_all_fit_hot_owner_adopts_parent_for_cold_peer",
+        "tests/io/test_cache_thread_coordination.py::test_all_fit_cold_uses_static_layer_loop",
         "notorch",
     ),
     (
         "gdtensor/internal/api.py",
-        "if completed != seen:",
-        "if False:",
-        "tests/io/test_cache_thread_coordination.py::test_all_fit_wait_deadline_tracks_any_completed_segment",
+        "if self._adopt(layer, node, key):\n            return None\n        if not self._can_fill(layer, node, key):",
+        "if not self._can_fill(layer, node, key):\n            return None\n        if self._adopt(layer, node, key):",
+        "tests/io/test_cache_thread_coordination.py::test_non_owner_hot_adoption_precedes_fill_ownership",
         "notorch",
     ),
     (
@@ -417,7 +431,7 @@ MUTATIONS = [
         "gdtensor/internal/api.py",
         "sealed = self._seal_drains(segs, layer, reserve=seal)",
         "sealed = self._seal_drains(segs, layer, reserve=True)",
-        "tests/io/test_cache_thread_coordination.py::test_all_fit_hot_generation_never_reads_parent",
+        "tests/io/test_cache_thread_coordination.py::test_all_fit_probe_stays_inflight_until_completion_is_published",
         "notorch",
     ),
     (
@@ -459,9 +473,59 @@ MUTATIONS = [
     ),
     (
         "gdtensor/internal/api.py",
-        'namespaces.append(("object", id(accessor)) if namespace is None else namespace)',
-        "namespaces.append(namespace)",
+        "        namespaces.append(\n"
+        '            ("object", os.getpid(), id(accessor)) if namespace is None else namespace\n'
+        "        )",
+        "        namespaces.append(namespace)",
         "tests/io/test_cache_thread_coordination.py::test_independent_memory_caches_do_not_share_coordination",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        '("object", os.getpid(), id(accessor))',
+        '("object", id(accessor))',
+        "tests/io/test_cache_owner_lifecycle.py::test_cache_namespace_process_scope_after_fork[implicit]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "    identity = (\n"
+        "        source_identity\n"
+        "        if source_identity is not None\n"
+        "        else chain.src.data_accessor.cache_identity()\n"
+        "    )",
+        '    identity = "mutated-source"',
+        "tests/io/test_cache_thread_coordination.py::test_slots_fallback_identity_changes_coordination_table",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "        if reserve and layer > 0:\n"
+        "            self._ack_parents_locked(layer, seg.node, seg)",
+        "        if False and layer > 0:\n"
+        "            self._ack_parents_locked(layer, seg.node, seg)",
+        "tests/io/test_random_cache_stress.py::test_warm_identity_reuses_then_replaces_payload[thread-two-layers]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "        if seg.key not in state.slots:\n            return",
+        "        if True:\n            return",
+        "tests/io/test_random_cache_stress.py::test_warm_identity_reuses_then_replaces_payload[thread-two-layers]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "rank in self.joined or call > self.call",
+        "rank in self.joined or self.cohort <= self.joined",
+        "tests/io/test_cache_thread_coordination.py::test_node_generation_advances_for_a_rank_with_newer_calls",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/api.py",
+        "if child.completed_at.get(child_key, state.started) < state.started:",
+        "if False:",
+        "tests/io/test_cache_mutation_detectors.py::test_previous_generation_child_does_not_ack_current_parent",
         "notorch",
     ),
     (
@@ -501,7 +565,7 @@ MUTATIONS = [
     ),
     (
         "gdtensor_conn/file_cache.py",
-        "namespace = ga._content_digest(identity)[:20]",
+        "namespace = (digest or ga._content_digest(identity))[:20]",
         "namespace = repr(identity)",
         "tests/io/test_file_cache_correctness.py::test_cache_identity_content_prevents_repr_collision",
         "notorch",
@@ -532,7 +596,7 @@ MUTATIONS = [
     ),
     (
         "gdtensor_conn/ssh_cache.py",
-        'namespace = ga._content_digest(getattr(rng, "source_identity", None))',
+        'namespace = getattr(rng, "source_digest", None) or ga._content_digest(identity)',
         'namespace = repr(getattr(rng, "source_identity", None))',
         "tests/io/test_ssh_cache.py::test_source_keys_use_identity_content_not_repr",
         "notorch",

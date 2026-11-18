@@ -13,8 +13,9 @@
 
    Segment state: "gone" | "admitted" | "ready" | "error".
    res[n] = bytes of admitted and ready segments on node n.
-   owe[n]  = remaining rank acks on the terminal segment of node n.
-   rem[n]  = unacked parent edges on the segment of node n (subset of Edges).
+   owe[n]  = exact remaining (consumer, offset, size) rank ACK pieces.
+   rem[n]  = exact remaining child-to-parent ACK pieces (subset of EdgePieces).
+   Duplicate and unknown pieces are explicit actions; they cannot release a slot.
 
    MUTANT is the only constant, assigned by the cfg:
      none / no_budget / early_rank / early_parent / no_parent_order /
@@ -30,6 +31,10 @@ Terminal == {1, 2}
 A == <<0, "a">>
 Edges == [n \in Nodes |-> IF n = 0 THEN {} ELSE {A}]
 SegSize == [n \in Nodes |-> IF n = 0 THEN 8 ELSE 4]
+RankPiece(n) == <<"rank", n, 0, SegSize[n]>>
+RankAckPieces(n) == {RankPiece(n), <<"rank", n + 10, 99, 99>>}
+EdgePieces == [n \in Nodes |-> IF n = 0 THEN {} ELSE {<<n, 0, SegSize[n]>>}]
+EdgeAckPieces(n) == EdgePieces[n] \cup {<<n + 10, 99, 99>>}
 (* The no_budget injection shrinks every budget below the segment size: a
    correct executor must block; the mutant admits and exceeds the budget. *)
 Budget ==
@@ -40,8 +45,8 @@ VARIABLES st, res, owe, rem, nerr, seen0, seen, p0ready, filler
 Init ==
   /\ st  = [n \in Nodes |-> "gone"]
   /\ res = [n \in Nodes |-> 0]
-  /\ owe = [n \in Nodes |-> IF n = 0 THEN 0 ELSE 1]
-  /\ rem = Edges
+  /\ owe = [n \in Nodes |-> IF n = 0 THEN {} ELSE {RankPiece(n)}]
+  /\ rem = EdgePieces
   /\ nerr = [n \in Nodes |-> "none"]
   /\ seen0 = FALSE
   /\ seen = [n \in Nodes |-> FALSE]
@@ -83,31 +88,31 @@ Fill(n, rank, ok) ==
 
 (* ---- terminal rank drain and release ------------------------------------ *)
 
-RankAck(n) ==
-  /\ n \in Terminal /\ st[n] = "ready" /\ owe[n] > 0
-  /\ (MUTANT # "peer_down" \/ n # 2)
-  /\ owe' = [owe EXCEPT ![n] = @ - 1]
+RankAck(n, piece) ==
+  /\ n \in Terminal /\ st[n] = "ready" /\ piece \in RankAckPieces(n)
+  /\ (piece # RankPiece(n) \/ MUTANT # "peer_down" \/ n # 2)
+  /\ owe' = [owe EXCEPT ![n] = @ \ {piece}]
   /\ UNCHANGED <<seen0, seen, p0ready, st, res, rem, nerr, filler>>
 
 ReleaseTerminal(n) ==
   /\ n \in Terminal /\ st[n] = "ready"
   /\ rem[n] = {}
-  /\ (MUTANT = "early_rank" \/ owe[n] = 0)
+  /\ (MUTANT = "early_rank" \/ owe[n] = {})
   /\ st' = [st EXCEPT ![n] = "gone"]
   /\ res' = [res EXCEPT ![n] = @ - SegSize[n]]
   /\ UNCHANGED <<seen0, seen, p0ready, owe, rem, nerr, filler>>
 
 (* ---- child ack of a parent edge and parent release ---------------------- *)
 
-AckEdge(n) ==
+AckEdge(n, piece) ==
   /\ n \in Terminal
-  /\ st[n] = "ready"
-  /\ A \in rem[n] /\ st[0] = "ready"
-  /\ rem' = [rem EXCEPT ![n] = @ \ {A}]
+  /\ st[n] = "ready" /\ st[0] = "ready"
+  /\ piece \in EdgeAckPieces(n)
+  /\ rem' = [rem EXCEPT ![n] = @ \ {piece}]
   /\ UNCHANGED <<seen0, seen, p0ready, st, res, owe, nerr, filler>>
 
 ChildrenStillOwing ==
-  {n \in Terminal : A \in rem[n]}
+  {n \in Terminal : rem[n] # {}}
 
 ReleaseParent ==
   /\ st[0] = "ready"
@@ -119,9 +124,9 @@ ReleaseParent ==
 Next ==
   \/ \E n \in Nodes : Admit(n)
   \/ \E n \in Nodes, rank \in Nodes, ok \in BOOLEAN : Fill(n, rank, ok)
-  \/ \E n \in Terminal : RankAck(n)
+  \/ \E n \in Terminal : \E piece \in RankAckPieces(n) : RankAck(n, piece)
   \/ \E n \in Terminal : ReleaseTerminal(n)
-  \/ \E n \in Terminal : AckEdge(n)
+  \/ \E n \in Terminal : \E piece \in EdgeAckPieces(n) : AckEdge(n, piece)
   \/ ReleaseParent
 
 vars == <<st, res, owe, rem, nerr, seen0, seen, p0ready, filler>>
@@ -142,7 +147,7 @@ ResidentExact ==
 (* A terminal segment becomes gone only after every rank acked. *)
 NoEarlyRankRelease ==
   \A n \in Terminal :
-    seen[n] /\ st[n] = "gone" => owe[n] = 0
+    seen[n] /\ st[n] = "gone" => owe[n] = {}
 
 (* The layer-0 parent becomes gone only after every child acked its edge.
    seen0 excludes the pre-pass state, where the parent has never been
@@ -159,7 +164,7 @@ ParentReadyBeforeChild ==
 
 (* A remaining child edge always references the plan edge. *)
 EdgesArePlanEdges ==
-  \A n \in Terminal : rem[n] \subseteq Edges[n]
+  \A n \in Terminal : rem[n] \subseteq EdgePieces[n]
 
 (* A fill failure must be recorded on the node that failed. *)
 ErrorRecorded ==
@@ -189,9 +194,9 @@ FairSpec ==
   Spec
   /\ (\A n1 \in Nodes : WF_vars(Admit(n1)))
   /\ (\A n2 \in Nodes : WF_vars(Fill(n2, n2, TRUE)))
-  /\ (\A n3 \in Terminal : WF_vars(RankAck(n3)))
+  /\ (\A n3 \in Terminal : WF_vars(RankAck(n3, RankPiece(n3))))
   /\ (\A n4 \in Terminal : WF_vars(ReleaseTerminal(n4)))
-  /\ (\A n5 \in Terminal : WF_vars(AckEdge(n5)))
+  /\ (\A n5 \in Terminal : \A piece \in EdgePieces[n5] : WF_vars(AckEdge(n5, piece)))
   /\ WF_vars(ReleaseParent)
 
 LiveGoal ==

@@ -1,6 +1,8 @@
 """Concrete file accessor for the simulation storage sessions."""
 
 import ctypes
+from bisect import bisect_right
+
 import numpy as np
 from gdtensor.access import DTensorDataAccessor
 from ._layout import PayloadIndex
@@ -52,11 +54,8 @@ class StorageDataAccessor(DTensorDataAccessor):
         fp = self.index.files.get(rng.file_path)
         if fp is None:
             raise invalid("global_range", f"unknown file {rng.file_path}")
-        starts = [x.contiguous_payload_offset for x in fp.slots]
-        k = (
-            int(np.searchsorted(starts, rng.contiguous_payload_offset, side="right"))
-            - 1
-        )
+        starts = fp.starts
+        k = bisect_right(starts, rng.contiguous_payload_offset) - 1
         if k < 0:
             raise invalid(
                 "global_range",

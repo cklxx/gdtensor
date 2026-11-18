@@ -35,6 +35,7 @@ line with the observed values next to the oracle values.
 
 import json
 import os
+import sys
 import threading
 import time
 
@@ -203,13 +204,17 @@ def _check_outputs(case, built) -> None:
             np.testing.assert_array_equal(got, want, err_msg=f"{rank} {tid} {case}")
 
 
-def _check_cache_fills(case, built, demand) -> None:
+def _check_drains(case, built) -> None:
     serve = built["targets"][-1]
     drains = [(r, t) for r, t, _s in built["caches"][-1].reads if t != serve(r)]
     assert not drains, ("drain off serve node", drains[:4], case)
     got = _drain_bytes(built)
     want = [_bytes(_rank_mask(case, built, r)) for r in range(built["world"])]
     assert got == want, ("drain bytes", got, want, case)
+
+
+def _check_cache_fills(case, built, demand) -> None:
+    _check_drains(case, built)
     for layer, cache in enumerate(built["caches"]):
         assert cache.wrong_node == 0, (layer, case)
         remote = [f for f in cache.fills if f[0] != f[1]]
@@ -306,6 +311,37 @@ def _check_traffic(case, built) -> None:
     assert stat_in == observed_in, (stat_in, observed_in, case)
 
 
+def _check_hot_round(case, built) -> None:
+    _check_outputs(case, built)
+    _check_drains(case, built)
+    assert not built["src"].reads, ("hot storage read", case)
+    assert all(not cache.fills for cache in built["caches"]), ("hot fill", case)
+    assert all(not cache.reads for cache in built["caches"][:-1]), case
+    cluster = built["cluster"]
+    expected_rx = [0] * len(cluster.nics)
+    expected_tx = [0] * len(cluster.nics)
+    for rank, target, size in built["caches"][-1].reads:
+        rank_node = cluster.node_of_rank(rank)
+        if target != rank_node:
+            expected_tx[target] += size
+            expected_rx[rank_node] += size
+    rx, tx = cluster.nic_bytes()
+    assert rx == expected_rx and tx == expected_tx, (rx, tx, expected_rx, expected_tx)
+    assert all(cache.wrong_node == 0 for cache in built["caches"]), case
+
+
+def _check_released(case, built, generation) -> None:
+    internal_api = sys.modules[gio.chain_load.__module__]
+    table = internal_api._slots(built["chain"])
+    with table.cond:
+        left = {
+            ln: (state.resident, state.owed_to())
+            for ln, state in table.nodes.items()
+            if state.slots or state.resident
+        }
+    assert not left, ("resident after round", generation, case, left)
+
+
 def _drain_bytes(built) -> list:
     out = [0] * built["world"]
     for rank, _target, size in built["caches"][-1].reads:
@@ -341,13 +377,14 @@ def _report(case, built, demand, gen) -> None:
         fh.write(json.dumps(row) + "\n")
 
 
-def _reset_generation(built) -> None:
-    """Clear outputs, cache bytes and counters, so each generation must refill."""
+def _reset_outputs(built) -> None:
     for tensors in built["dst"].buffers.values():
         for buf in tensors.values():
             buf[:] = GUARD
+
+
+def _reset_counters(built) -> None:
     for cache in built["caches"]:
-        cache.mem.clear()
         cache.fills.clear()
         cache.reads.clear()
     built["src"].reads.clear()
@@ -356,6 +393,14 @@ def _reset_generation(built) -> None:
         nic.rx = nic.tx = 0
     for node in cluster.storage_in:
         cluster.storage_in[node] = 0
+
+
+def _reset_generation(built) -> None:
+    """Clear outputs, cache bytes and counters, so each generation must refill."""
+    _reset_outputs(built)
+    for cache in built["caches"]:
+        cache.mem.clear()
+    _reset_counters(built)
 
 
 @pytest.mark.parametrize("seed", range(SEED_BASE, SEED_BASE + SEEDS))
@@ -401,6 +446,58 @@ def _verify_case(case, tmp_path, monkeypatch):
         _check_storage(case, built, demand)
         _check_traffic(case, built)
         _report(case, built, demand, gen)
+
+
+@pytest.mark.parametrize(
+    "coordinator,layers",
+    [
+        pytest.param("file", [[0, 2]], id="file-one-layer"),
+        pytest.param("thread", [[0, 2]], id="thread-one-layer"),
+        pytest.param("file", [[0], [0, 2]], id="file-two-layers"),
+        pytest.param("thread", [[0], [0, 2]], id="thread-two-layers"),
+    ],
+)
+def test_warm_identity_reuses_then_replaces_payload(
+    coordinator, layers, tmp_path, monkeypatch
+):
+    case = dict(
+        seed=0,
+        k=2,
+        nodes=3,
+        layers=layers,
+        steps=[3] * len(layers),
+        width=[2] * len(layers),
+        sizes=[17, 9],
+        replicate=[False, True],
+        coordinator=coordinator,
+        bandwidth=0.0,
+        repeat=4,
+    )
+    monkeypatch.setenv("GDTENSOR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "10")
+    monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", coordinator)
+    built = _build(case)
+    demand = _demand(case, built)
+    for generation in range(4):
+        if generation == 2:
+            built["src"].payload ^= np.uint8(0xFF)
+            built["data"] = {
+                tid: value ^ np.uint8(0xFF) for tid, value in built["data"].items()
+            }
+        if generation == 0:
+            _reset_generation(built)
+        else:
+            _reset_outputs(built)
+            _reset_counters(built)
+        _run(case, built)
+        _check_released(case, built, generation)
+        if generation % 2:
+            _check_hot_round(case, built)
+        else:
+            _check_outputs(case, built)
+            _check_cache_fills(case, built, demand)
+            _check_storage(case, built, demand)
+            _check_traffic(case, built)
 
 
 @pytest.fixture(
