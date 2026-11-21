@@ -71,7 +71,7 @@ load 只从 storage session 读取并写 compute view，结束后调用 `finish`
 
 ### DCP 路径
 
-`make_storage_view(..., container_format="distcp")` 分派到 `DcpSaveSession` / `DcpLoadSession`（`gdtensor_conn/formats.py:508`）。connector 先按 CopyPlan 暂存 slot，rank 0 组装完整 tensor 后调用真实 `torch.distributed.checkpoint.save`（`gdtensor_conn/dcp_backend.py:181`、`gdtensor_conn/dcp_backend.py:477`）。load 要求 `.metadata` 存在，并可从真实 DCP archive 解析 payload 偏移（`gdtensor_conn/dcp_backend.py:523`）。
+`make_storage_view` 根据 `layout.container_format` 选择格式；该值为 `"distcp"` 时分派到 `DcpSaveSession` / `DcpLoadSession`（`gdtensor_conn/formats.py:465`、`gdtensor_conn/formats.py:508`）。connector 先按 CopyPlan 暂存 slot，rank 0 组装完整 tensor 后调用真实 `torch.distributed.checkpoint.save`（`gdtensor_conn/dcp_backend.py:181`、`gdtensor_conn/dcp_backend.py:477`）。load 要求 `.metadata` 存在，并可从真实 DCP archive 解析 payload 偏移（`gdtensor_conn/dcp_backend.py:523`）。
 
 另有 F2 测试直接通过 2-rank collective DCP 保存 k 版、由调用方平均、再写回真实 DCP（`tests/torch/test_real_dcp_lawa.py:40`）。该测试证明真实 DCP 数值链路，不等于生产规模 connector 验证。
 
