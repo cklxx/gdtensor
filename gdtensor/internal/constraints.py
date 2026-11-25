@@ -498,6 +498,23 @@ def _two_layer_chain(o):
     return _cache_subset(o, o.big_cache, o.dst, o.num_ranks_per_node)
 
 
+def _one_layer_write_chain(o):
+    ids = [list(v.tensor_ids) for v in (o.src, o.cache, o.dst)]
+    if any(ids[0] != x for x in ids[1:]):
+        return _err(o, "tensor_ids_match", "src/cache/dst tensor_ids differ")
+    return _cache_subset(o, o.cache, o.src, o.num_ranks_per_node)
+
+
+def _two_layer_write_chain(o):
+    ids = [list(v.tensor_ids) for v in (o.src, o.big_cache, o.small_cache, o.dst)]
+    if any(ids[0] != x for x in ids[1:]):
+        return _err(o, "tensor_ids_match", "all legs tensor_ids differ")
+    r1 = _cache_subset(o, o.small_cache, o.big_cache, o.num_ranks_per_node)
+    if r1 is not None:
+        return r1
+    return _cache_subset(o, o.big_cache, o.src, o.num_ranks_per_node)
+
+
 def _cache_subset(o, cache, dst, num_ranks_per_node: int):
     from .mesh import is_cache_mesh_subset_of_mesh
 
@@ -519,10 +536,29 @@ def _mixed_chain(o):
     return None
 
 
+def _mixed_write_chain(o):
+    ids = [
+        x for seg in o.disjoint_tensor_ids_and_write_chain_list for x in seg.tensor_ids
+    ]
+    if len(ids) != len(set(ids)):
+        return _err(o, "tensor_ids_disjoint", "segment tensor_ids overlap")
+    return None
+
+
 def _disjoint_chain(o):
     from .chain import get_tensor_ids_of_read_chain
 
     if list(o.tensor_ids) != list(get_tensor_ids_of_read_chain(o.read_chain)):
+        return _err(
+            o, "tensor_ids_match_chain", "tensor_ids must equal chain tensor ids"
+        )
+    return None
+
+
+def _disjoint_write_chain(o):
+    from .chain import get_tensor_ids_of_write_chain
+
+    if list(o.tensor_ids) != list(get_tensor_ids_of_write_chain(o.write_chain)):
         return _err(
             o, "tensor_ids_match_chain", "tensor_ids must equal chain tensor ids"
         )
@@ -536,6 +572,11 @@ _EXTRA["OneLayerCachedDTensorsReadChain"] = _one_layer_chain
 _EXTRA["TwoLayerCachedDTensorsReadChain"] = _two_layer_chain
 _EXTRA["MixedDTensorsReadChain"] = _mixed_chain
 _EXTRA["DisjointTensorIdsAndReadChain"] = _disjoint_chain
+_EXTRA["DirectDTensorsWriteChain"] = _direct_chain
+_EXTRA["OneLayerCachedDTensorsWriteChain"] = _one_layer_write_chain
+_EXTRA["TwoLayerCachedDTensorsWriteChain"] = _two_layer_write_chain
+_EXTRA["MixedDTensorsWriteChain"] = _mixed_write_chain
+_EXTRA["DisjointTensorIdsAndWriteChain"] = _disjoint_write_chain
 _DATA_TYPES.update(
     {
         "CacheDTensorsView",
@@ -548,5 +589,10 @@ _DATA_TYPES.update(
         "TwoLayerCachedDTensorsReadChain",
         "MixedDTensorsReadChain",
         "DisjointTensorIdsAndReadChain",
+        "DirectDTensorsWriteChain",
+        "OneLayerCachedDTensorsWriteChain",
+        "TwoLayerCachedDTensorsWriteChain",
+        "MixedDTensorsWriteChain",
+        "DisjointTensorIdsAndWriteChain",
     }
 )

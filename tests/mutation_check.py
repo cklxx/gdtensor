@@ -635,6 +635,34 @@ MUTATIONS = [
         "tests/io/test_cache_owner_lifecycle.py::test_drain_entry_commit_failure_publishes_error",
         "notorch",
     ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "        return self.resident + size <= self.budget",
+        "        return False",
+        "tests/io/test_write_chain.py::test_bounded_budget_resident_never_exceeds_stat",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        '        if not slot["owed"]:\n            slot["ready"] = True\n            return True',
+        '        if True:\n            slot["ready"] = True\n            return True',
+        "tests/io/test_write_chain.py::test_slot_flushes_only_after_all_producers_stage",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_propagation.py",
+        "        if not is_designated_writer(nd, rank, order_of(table, tid)):\n            continue",
+        "        if False:\n            continue",
+        "tests/io/test_write_chain.py::test_replicate_write_chain_deduplicates_storage_writes",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        '    except BaseException:\n        _cleanup(session, "abort")\n        raise',
+        "    except BaseException:\n        raise",
+        "tests/io/test_write_chain.py::test_cached_write_failure_aborts_session",
+        "notorch",
+    ),
 ]
 
 

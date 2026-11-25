@@ -168,19 +168,20 @@ def test_products_mixins_and_factories(name, fields):
         ("gdtensor.io.rank_save", ["rank", "compute_view", "storage_view"]),
         ("gdtensor.io.rank_load", ["rank", "compute_view", "storage_view"]),
         ("gdtensor.io.chain_load", ["rank", "read_chain"]),
+        ("gdtensor.io.chain_save", ["rank", "write_chain"]),
         (
             "gdtensor.io.chain_stat_mem_overhead",
-            ["read_chain"],
+            ["chain"],
         ),
         (
             "gdtensor.io.chain_stat_outbound_traffic",
-            ["read_chain"],
+            ["chain"],
         ),
         (
             "gdtensor.io.chain_stat_inbound_traffic",
-            ["read_chain"],
+            ["chain"],
         ),
-        ("gdtensor.get_chain_tensor_ids", ["read_chain"]),
+        ("gdtensor.get_chain_tensor_ids", ["chain"]),
         ("gdtensor.builder.d_tensors_view_map", ["origin", "map_core"]),
         ("gdtensor.builder.global_tensor_meta_of", ["named_d_tensor"]),
         ("gdtensor.builder.tensor_order_value_of", ["d_tensor_table", "tensor_id"]),
@@ -223,7 +224,7 @@ def test_internal_plan_and_check_declarations_match_design_without_importing_the
                 and node.name.startswith(("d_tensors_view_rank_plan_", "check_"))
             }
         )
-    assert len(expected) == 10 and functions.keys() == expected.keys()
+    assert len(expected) == 11 and functions.keys() == expected.keys()
     for name, node in functions.items():
         parameters, result = expected[name]
         assert [arg.arg for arg in node.args.args] == parameters
@@ -258,6 +259,8 @@ def test_type_aliases_and_namespace_separation():
         "ContentSlotsMesh",
         "CacheMesh",
         "ConcreteDTensorsReadChain",
+        "DTensorsWriteChain",
+        "ConcreteDTensorsWriteChain",
     ):
         assert isinstance(getattr(builder, name), types.UnionType)
         assert not hasattr(builder, name + "BuilderMixin")

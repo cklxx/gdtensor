@@ -50,12 +50,19 @@ from .internal.layout import (
 )
 from .internal.chain import (
     ConcreteDTensorsReadChain,
+    ConcreteDTensorsWriteChain,
     DTensorsReadChain,
+    DTensorsWriteChain,
     DirectDTensorsReadChain,
+    DirectDTensorsWriteChain,
     DisjointTensorIdsAndReadChain,
+    DisjointTensorIdsAndWriteChain,
     MixedDTensorsReadChain,
+    MixedDTensorsWriteChain,
     OneLayerCachedDTensorsReadChain,
+    OneLayerCachedDTensorsWriteChain,
     TwoLayerCachedDTensorsReadChain,
+    TwoLayerCachedDTensorsWriteChain,
     legs_of,
 )
 from .internal.mesh import (
@@ -282,6 +289,13 @@ __all__ = [
     "TwoLayerCachedDTensorsReadChain",
     "MixedDTensorsReadChain",
     "DisjointTensorIdsAndReadChain",
+    "DTensorsWriteChain",
+    "ConcreteDTensorsWriteChain",
+    "DirectDTensorsWriteChain",
+    "OneLayerCachedDTensorsWriteChain",
+    "TwoLayerCachedDTensorsWriteChain",
+    "MixedDTensorsWriteChain",
+    "DisjointTensorIdsAndWriteChain",
     "is_cache_mesh_subset_of_mesh",
     "legs_of",
     "LiteralMesh",

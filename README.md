@@ -5,7 +5,7 @@
 | namespace | 导出范围 |
 |---|---|
 | `gdtensor` | `get_tensor_ids`、`get_gd_tensor`、`make_gd_tensor`、`get_d_tensor`、`reset_d_tensor`、`Result`、`Error` |
-| `gdtensor.io` | `rank_load`、`rank_save`、`chain_load`、`chain_stat_mem_overhead`、`chain_stat_outbound_traffic`、`chain_stat_inbound_traffic` |
+| `gdtensor.io` | `rank_load`、`rank_save`、`chain_load`、`chain_save`、`chain_stat_mem_overhead`、`chain_stat_outbound_traffic`、`chain_stat_inbound_traffic` |
 | `gdtensor.builder` | C.3 产品类型、BuilderMixin、`new_*`、view map，以及 C.4 的四个 helper |
 | `gdtensor.session` | `StorageSaveSession`、`StorageLoadSession` |
 | `gdtensor.access` | `DTensorDataAccessor` |
