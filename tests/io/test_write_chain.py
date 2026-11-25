@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -754,3 +755,64 @@ def test_write_chain_constraint_validation_and_error_cases():
     )
     res_rank = gio.chain_save(99, cached_ok)
     assert type(res_rank) is gb.Err and type(res_rank.value) is gb.InvalidArgumentError
+
+
+class _OffsetFailReadAccessor(ga.DTensorDataAccessor):
+    def __init__(self, data: np.ndarray, bad_mod: int, error: gb.GDTensorIOError):
+        self.data = data
+        self.bad_mod = bad_mod
+        self.error = error
+
+    def read_to_buffer(self, global_range, read_to_buffer):
+        off, sz = global_range.global_tensor_offset, global_range.size
+        if off % 4 >= self.bad_mod:
+            return gb.Err(self.error)
+        return read_to_buffer(self.data[off : off + sz].ctypes.data, sz)
+
+    def write_from_buffer(self, global_range, write_from_buffer):
+        raise AssertionError("src is read-only")
+
+
+def test_two_layer_stage_failure_propagates_downstream_without_waiting(monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "thread")
+    monkeypatch.setenv("GDTENSOR_CACHE_WAIT_SECONDS", "10")
+    world, k = 4, 2
+    cluster = Cluster(num_nodes=2, k=k)
+    sizes = {"w": 16}
+    src_data = np.arange(16, dtype=np.uint8)
+    boom = gb.GDTensorIOError(operation="read", msg="node1-stage-boom")
+    src_acc = _OffsetFailReadAccessor(src_data, bad_mod=2, error=boom)
+    dst_acc = TraceMemory(np.zeros(16, dtype=np.uint8))
+    big_acc = NodeCache(cluster, sizes, parent_of([0, 1], [0]).get)
+    small_acc = NodeCache(cluster, sizes, lambda _r: 0)
+    sessions: list = []
+    cv = _compute_view(src_acc, "w", [4, 4], world, placements=[gb.Shard(1)])
+    big_cv = _cache_view(big_acc, "w", [4, 4], steps=2, nodes=[0, 1], width=1)
+    small_cv = _cache_view(small_acc, "w", [4, 4], steps=2, nodes=[0], width=1)
+    sv = _hf_single_slot_storage(
+        dst_acc, "w", [4, 4], world, sessions=sessions, vote=_SessionVote(world)
+    )
+    chain = gb.TwoLayerCachedDTensorsWriteChain(
+        src=cv, big_cache=big_cv, small_cache=small_cv, dst=sv, num_ranks_per_node=k
+    )
+    results = {}
+
+    def run(rank: int):
+        cluster.rank = rank
+        results[rank] = gio.chain_save(rank, chain)
+
+    t0 = time.monotonic()
+    threads = [threading.Thread(target=run, args=(r,)) for r in range(world)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+        assert not t.is_alive()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 5.0
+    assert type(results[0]) is gb.Err and "node1-stage-boom" in results[0].value.msg
+    assert any(
+        type(results[r]) is gb.Err and "node1-stage-boom" in results[r].value.msg
+        for r in (2, 3)
+    )
+    assert all(s.committed == 0 for s in sessions), sessions

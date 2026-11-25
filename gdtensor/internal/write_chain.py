@@ -649,6 +649,8 @@ class _WriteRankRun:
 
     def _cohort_round(self, deadline: float) -> bool:
         with self.t.cond:
+            self.t.check_alive()
+            _ = [self.t.node(*ln).check(gen) for ln, gen in self.gens.items()]
             gaps = [(lay, n) for lay, n in self.gens if self._cohort_needs_wait(lay, n)]
         if not gaps:
             return True
@@ -1034,16 +1036,30 @@ class _WriteRankRun:
             self.t.bump()
 
     def _fail(self, layer: int, node: int, exc: BaseException, key) -> None:
+        downstream = self._fail_targets(layer, node)
         with self.t.cond:
-            self.t.node(layer, node).fail(exc, key)
-            self.t.mark_touched((layer, node))
+            self._fail_node(layer, node, exc, key)
+            _ = [self._fail_node(lay, n, exc, None) for lay, n in downstream]
             self.t.bump()
+
+    def _fail_targets(self, layer: int, node: int) -> list:
+        out, cur = [], node
+        for lay in range(layer + 1, self.last + 1):
+            cur = self.plan.target[lay - 1][cur]
+            out.append((lay, cur))
+        return out
+
+    def _fail_node(self, layer: int, node: int, exc: BaseException, key) -> None:
+        state = self.t.nodes.get((layer, node))
+        if state is None:
+            return
+        state.fail(exc, key)
+        self.t.mark_touched((layer, node))
 
     def _fail_pair(
         self, l0: int, n0: int, l1: int, n1: int, exc: BaseException
     ) -> None:
         self._fail(l0, n0, exc, None)
-        self._fail(l1, n1, exc, None)
 
     def _flush_failed(self, layer: int, node: int, exc: BaseException) -> None:
         self._fail(layer, node, exc, None)

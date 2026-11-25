@@ -462,6 +462,8 @@ def _flush_pairs(plan: WriteChainPlan, layer: int, seg: WriteSegment) -> list:
 
 def rank_write_copy_plans(plan: WriteChainPlan, rank: int) -> list:
     """One CopyPlan per leg in data-flow order: compute -> cache -> ... -> storage."""
+    if rank not in plan.ranks:
+        raise invalid("rank", f"rank {rank} not in write-chain ranks {plan.ranks}")
     legs: list = [[] for _ in range(len(plan.tids) + 1)]
     legs[0] = [
         (_crange(key[0], off, size), _crange(key[0], off, size))
