@@ -6,6 +6,7 @@ forked/spawned CPU ranks on one host. It does NOT claim multi-machine.
 
 import multiprocessing as mp
 import os
+import tempfile
 from datetime import timedelta
 from pathlib import Path
 
@@ -44,18 +45,19 @@ def _worker(rank, init_file, root, op):
 
 
 def _spawn(root, op):
-    init_file = Path(root) / "init"
-    init_file.touch()
-    ctx = mp.get_context("spawn")
-    procs = [
-        ctx.Process(target=_worker, args=(r, str(init_file), str(root), op))
-        for r in range(2)
-    ]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join(180)
-    assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
+    with tempfile.TemporaryDirectory() as tmp:
+        init_file = Path(tmp) / "init"
+        init_file.touch()
+        ctx = mp.get_context("spawn")
+        procs = [
+            ctx.Process(target=_worker, args=(r, str(init_file), str(root), op))
+            for r in range(2)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(180)
+        assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
 
 
 @pytest.mark.skipif(
