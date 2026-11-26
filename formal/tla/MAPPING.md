@@ -11,6 +11,10 @@ their scope is stated explicitly below.
   `sha256 8bfd297961f68a6728ab097cea605d39294d2dad611db750c4f1d36d6b6282ce`.
 - `gdtensor/internal/propagation.py`
   `sha256 8c3f0ada76107e833406c5eeef5a60bac42170f8e8d8d93e8a01aeb5534c1030`.
+- `gdtensor/internal/write_chain.py`
+  `sha256 591251d084369f8ba82086a535ac2aad443232e23f9a6a2aff1e4fa426eb6032`.
+- `gdtensor/internal/write_propagation.py`
+  `sha256 49b53a56446fc92fa54cc953229f3b7dd2d5c5d860572a53bbf25e0ff64d1ce8`.
 
 `scripts/formal_gate.sh` fails if either pin differs from the checked-out file.
 It also records both hashes in its generated manifest. A hash match verifies
@@ -173,3 +177,60 @@ locking. Related runtime constraints are:
 - `check_constraints` rejects mixed node sets and out-of-range ranks up front
   (`ConstraintViolationError` / `InvalidArgumentError`); `CacheDTensorsView` is
   registered with the constraint checker (construction-time, outside the model).
+
+---
+
+# WriteChainPropagation.tla — current runtime mapping
+
+The fixed instance is the dual two-layer write fan-in: layer 0 (`big_cache`) has
+nodes 1 and 2, each holding one 4-byte segment staged by its local compute rank;
+layer 1 (`small_cache`) is convergence node 0 with one 8-byte segment consuming
+edge pieces `<<1, 0, 4>>` and `<<2, 4, 4>>` before flushing to storage.
+
+## Plan field map (`internal/write_propagation.py`)
+
+| plan / executor concept                      | model element                                |
+|----------------------------------------------|----------------------------------------------|
+| `WriteChainPlan.layer_nodes`                 | `Nodes`, `L0 == {1, 2}`, `L1 == {0}`         |
+| `WriteSegment.size`                          | `SegSize[n]`                                 |
+| `WriteChainPlan.budget` byte bound           | `Budget[n]`                                  |
+| owed producer pieces (`seg.expected()`)      | `owe[n]`: exact `(producer, offset, size)` sets |
+| `_WriteNodeState.resident`                   | `res[n]`                                     |
+| `_WriteNodeState.slots[k]` lifecycle         | `st[n]`: admitted -> ready -> flushing -> done |
+| node-wide generation error                   | `nerr[n]`                                    |
+| flush admission (`state.resident+size<=budget`) | `AdmitL0(u)` / `ClaimInterlayer(u, rank)`  |
+
+History latch `ready0[u]` is model-only bookkeeping recording whether layer-0
+node `u` finished staging all local rank pieces before downstream layer-1 flush.
+
+## Transition map
+
+| executor (`write_chain.py`)                                    | model step              |
+|----------------------------------------------------------------|-------------------------|
+| `_WriteNodeState.admit` + `_reserve_l1_for_stage` (joint L1)    | `AdmitL0(u)`            |
+| `_WriteRankRun._run_stage` -> `_WriteNodeState.record_stage`   | `RankStage(u, piece)`   |
+| `_WriteNodeState.record_stage` empties `owed` -> `ready=True`  | `SealL0(u)`             |
+| `_WriteRankRun._claim_interlayer_locked` -> `reserve_new`      | `ClaimInterlayer(u, r)` |
+| `_WriteRankRun._finish_interlayer_flush` -> L1 `record_stage`  | `FinishInterlayer(u)`   |
+| `_WriteRankRun._try_storage_item` terminal flush to storage    | `FlushL1(rank)`         |
+| `_WriteRankRun._fail` downstream propagation across layers     | `FailL0(u)`             |
+
+## Safety invariants and negative mutants
+
+| `MUTANT`             | models bug                                          | caught by                  |
+|----------------------|-----------------------------------------------------|----------------------------|
+| `no_budget`          | admission skips `resident + size <= budget` guard   | `ByteBudget`               |
+| `early_stage_flush`  | L0 marks ready/flushable while `owe[u]` is nonempty | `NoEarlyStageFlush`        |
+| `early_parent_flush` | L1 flushes to storage before all L0 edges arrive    | `NoEarlyParentFlush`       |
+| `no_upstream_order`  | L1 flushes before L0 producers reach ready          | `UpstreamReadyBeforeFlush` |
+| `silent_error`       | L0 failure is not propagated downstream to L1       | `ErrorPropagated`          |
+| `remote_flush`       | non-DN rank claims/flushes segment                  | `FlushOnDN`                |
+
+## Bounded liveness and scope
+
+Under `FairSpec` with `ALLOW_FAIL = FALSE`, `LiveGoal == \A n \in Nodes : <>(st[n] = "done")`
+holds: every admitted write segment stages, converges onto L1, and flushes to storage.
+With `MUTANT = "peer_down"` (node 2 rank stage disabled), TLC produces the expected
+counterexample (exit 13), matching runtime `cache_wait` after `GDTENSOR_CACHE_WAIT_SECONDS`.
+File-level `_FileWriteSlotTable` locking, `DiskNodeCache` SHA-256 verification,
+`SaveSessionBase.ensure_staging`, and `Safetensors`/`DCP` publication are verified by runtime tests.

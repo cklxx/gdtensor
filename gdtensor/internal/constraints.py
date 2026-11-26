@@ -515,14 +515,31 @@ def _two_layer_write_chain(o):
     return _cache_subset(o, o.big_cache, o.src, o.num_ranks_per_node)
 
 
-def _cache_subset(o, cache, dst, num_ranks_per_node: int):
-    from .mesh import is_cache_mesh_subset_of_mesh
+def _view_ranks(view, num_ranks_per_node: int) -> set:
+    from .dtensor import naive_of, participants_of
+    from .mesh import _cache_base, cache_node_ranks
+    from .mesh import PermutedMesh, StCacheOuterProductMesh
 
+    nds = view.d_tensor_table.named_d_tensors
+    first = naive_of(nds[0]).mesh
+    is_cache = type(_cache_base(first)) is StCacheOuterProductMesh or (
+        type(first) is PermutedMesh
+    )
+    ranks: set = set()
+    for nd in nds:
+        if is_cache:
+            ranks.update(cache_node_ranks(naive_of(nd).mesh, num_ranks_per_node))
+        else:
+            ranks.update(participants_of(nd, "compute"))
+    return ranks
+
+
+def _cache_subset(o, cache, dst, num_ranks_per_node: int):
     if num_ranks_per_node <= 0:
         return _err(o, "num_ranks_per_node_positive", "must be positive")
-    cache_mesh = cache.d_tensor_table.named_d_tensors[0].d_tensor.mesh
-    dst_mesh = dst.d_tensor_table.named_d_tensors[0].d_tensor.mesh
-    if not is_cache_mesh_subset_of_mesh(cache_mesh, dst_mesh, num_ranks_per_node):
+    lhs = _view_ranks(cache, num_ranks_per_node)
+    rhs = _view_ranks(dst, num_ranks_per_node)
+    if not (lhs <= rhs):
         return _err(o, "cache_subset", "cache ranks are not a subset of dst ranks")
     return None
 

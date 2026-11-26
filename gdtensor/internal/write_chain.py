@@ -931,20 +931,46 @@ class _WriteRankRun:
         return key in state.slots
 
     def _admit_cold_stage(self, pending: list):
+        passes = (True, False) if self.last > 0 else (False,)
         with self.t.cond:
             return next(
-                (p for p in pending if self._try_admit_piece_locked(p)),
+                (hit for h in passes if (hit := self._pick_cold_locked(pending, h))),
                 None,
             )
 
-    def _try_admit_piece_locked(self, piece) -> bool:
+    def _pick_cold_locked(self, pending: list, hot_l1: bool):
+        return next(
+            (p for p in pending if self._try_admit_piece_locked(p, hot_l1)),
+            None,
+        )
+
+    def _try_admit_piece_locked(self, piece, hot_l1: bool) -> bool:
         node, key, _off, _size = piece
         state = self.t.node(0, node)
         state.check(self.gens[(0, node)])
-        if not state.admit(self.plan.segments[0][node][key]):
+        if key in state.slots:
+            return True
+        seg = self.plan.segments[0][node][key]
+        if key in state.completed or not state.fits(seg.size):
+            return False
+        if self.last > 0 and not self._reserve_l1_for_stage(node, seg, hot_l1):
+            return False
+        if not state.admit(seg):
             return False
         self.t.mark_touched((0, node))
         self.t.bump()
+        return True
+
+    def _reserve_l1_for_stage(self, node: int, seg: WriteSegment, hot_l1: bool) -> bool:
+        tnode = self.plan.target[0][node]
+        tstate = self.t.node(1, tnode)
+        tstate.check(self.gens[(1, tnode)])
+        tsegs = [self.plan.segments[1][tnode][tk] for tk, _o, _s in seg.children]
+        if hot_l1 and not any(ts.key in tstate.slots for ts in tsegs):
+            return False
+        if not tstate.reserve_new(tsegs):
+            return False
+        self.t.mark_touched((1, tnode))
         return True
 
     def _run_stage(self, pending: list, piece) -> None:

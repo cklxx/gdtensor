@@ -90,6 +90,9 @@ class StorageDataAccessor(DTensorDataAccessor):
     @catch
     def write_from_buffer(self, global_range, write_from_buffer) -> None:
         s, path, off = self._file_offset(global_range)
+        ensure = getattr(s, "ensure_staging", None)
+        if ensure is not None:
+            ensure(global_range.file_path)
         buf = bytearray(global_range.size)
         call_buffer_callback(write_from_buffer, buf)
         try:

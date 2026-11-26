@@ -162,6 +162,7 @@ class SaveSessionBase(_Base, StorageSaveSession):
         self.coord = coord  # barrier + vote across ranks; None = single rank
         self.state = "open"  # open -> committing -> committed | unknown | aborted
         self.data_start: Dict[str, int] = {}
+        self._staged: set[str] = set()
 
     def abspath(self, rel: str) -> str:  # writes go to the temp path
         return os.path.join(self.root, rel + self.tmp_suffix)
@@ -178,8 +179,15 @@ class SaveSessionBase(_Base, StorageSaveSession):
         header = self._header(path)
         self.data_start[path] = len(header)
         self.io.create_staging(full, len(header) + self.index.files[path].payload_size)
+        self._staged.add(path)
         if header and self.index.files[path].leader.rank == self.rank:
             self.io.pwrite(self.rank, full, 0, header)
+
+    def ensure_staging(self, path: str) -> None:
+        if self.state != "open":
+            raise invalid("session", f"write on {self.state} session")
+        if path not in self._staged:
+            self._open_file(path)
 
     def _leader_files(self):
         return [

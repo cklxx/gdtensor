@@ -663,6 +663,74 @@ MUTATIONS = [
         "tests/io/test_write_chain.py::test_cached_write_failure_aborts_session",
         "notorch",
     ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "    def _step(self, predicate, deadline):\n        self.t.check_alive()",
+        "    def _step(self, predicate, deadline):\n        if False:\n            self.t.check_alive()",
+        "tests/io/test_write_chain_lifecycle.py::test_peer_crash_during_stage_raises_cache_peer_down",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "    _WRITE_FINGERPRINTS.clear()",
+        "    _WRITE_FINGERPRINTS.copy()",
+        "tests/io/test_write_chain_lifecycle.py::test_fork_safety_with_held_locks_and_pending_fingerprint",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        '("object", os.getpid(), id(acc))',
+        '("object", id(acc))',
+        "tests/io/test_write_chain_lifecycle.py::test_implicit_vs_explicit_namespace_across_fork[implicit]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "        except BaseException as exc:\n"
+        "            _error_cleanup(exc, self._flush_failed, 0, node, exc)\n"
+        "            raise",
+        "        except BaseException as exc:\n"
+        "            self._inflight(-1)\n"
+        "            self._fail(0, node, exc, None)\n"
+        "            raise",
+        "tests/io/test_write_chain_lifecycle.py::test_interrupted_error_commit_keeps_owner_and_peer_gets_peer_down",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "            _ = [self._fail_node(lay, n, exc, None) for lay, n in downstream]",
+        "            _ = []",
+        "tests/io/test_write_chain_lifecycle.py::test_two_layer_upstream_failure_propagates_to_downstream_waiter",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_propagation.py",
+        "        cells[key] = cells.get(key, 0) + seg.size",
+        "        cells[key] = max(cells.get(key, 0), seg.size)",
+        "tests/io/test_write_chain_lifecycle.py::test_multi_tensor_cell_budget_aggregation_and_weakref_cleanup",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_propagation.py",
+        "            outbound[actor] += seg.size",
+        "            outbound[actor] += 0",
+        "tests/io/test_random_write_chain_stress.py::test_random_write_chain_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor_conn/access.py",
+        "        if ensure is not None:\n            ensure(global_range.file_path)",
+        "        if False and ensure is not None:\n            ensure(global_range.file_path)",
+        "tests/io/test_write_chain_lifecycle.py::test_sdk_delayed_leader_cross_rank_staging_notorch",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "        if self.last > 0 and not self._reserve_l1_for_stage(node, seg, hot_l1):",
+        "        if False and not self._reserve_l1_for_stage(node, seg, hot_l1):",
+        "tests/io/test_write_chain_lifecycle.py::test_two_layer_tight_budget_no_circular_deadlock",
+        "notorch",
+    ),
 ]
 
 
