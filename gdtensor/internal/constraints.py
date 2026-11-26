@@ -11,6 +11,7 @@ Sessions and accessors are abstract interfaces and have no check_constraints.
 from __future__ import annotations
 
 import dataclasses
+import numbers
 from typing import Any
 
 from .result import ConstraintViolationError, ERROR_TYPES, Fail
@@ -152,28 +153,15 @@ def _named(o):
 
 
 def _naive(o):
-    from .mesh import (
-        StCacheOuterProductMesh,
-        cache_concurrency_width,
-        cache_num_nodes,
-        cache_num_steps,
-        mesh_shape,
-    )
+    from .mesh import cache_mesh_shape, is_cache_mesh, mesh_shape
     from .products import Shard
 
-    if type(o.mesh) is StCacheOuterProductMesh:
-        # Cache mesh participants are (num_steps x num_nodes x concurrency_width);
-        # only the spatial node dimension expands to ranks.
+    try:
         shape = (
-            cache_num_steps(o.mesh),
-            cache_num_nodes(o.mesh),
-            cache_concurrency_width(o.mesh),
+            cache_mesh_shape(o.mesh) if is_cache_mesh(o.mesh) else mesh_shape(o.mesh)
         )
-    else:
-        try:
-            shape = mesh_shape(o.mesh)
-        except Exception as exc:  # noqa: BLE001
-            return _err(o, "mesh_valid", str(exc))
+    except Exception as exc:  # noqa: BLE001
+        return _err(o, "mesh_valid", str(exc))
     if len(o.placements) != len(shape):
         return _err(
             o,
@@ -398,6 +386,37 @@ _DATA_TYPES = set(_EXTRA) | {
 # ---------------------------------------------------------------- B.2.3 / B.3.2
 
 
+def _check_roles_placements(o, roles, placements):
+    from .products import Replicate, Shard
+
+    if len(placements) != 3:
+        return _err(o, "cache_placements", "cache placements must have 3 dimensions")
+    for role, pl in zip(roles, placements):
+        want = Replicate if role == "spatial" else Shard
+        if type(pl) is not want:
+            msg = f"cache {role} dim requires {want.__name__}, got {type(pl).__name__}"
+            return _err(o, "cache_placements", msg)
+    return None
+
+
+def _check_cache_placements(o):
+    from .dtensor import naive_of
+    from .mesh import cache_mesh_dim_roles, is_cache_mesh
+
+    for nd in o.d_tensor_table.named_d_tensors:
+        naive = naive_of(nd)
+        if not is_cache_mesh(naive.mesh):
+            return _err(o, "cache_mesh_type", "cache tensor mesh must be a CacheMesh")
+        try:
+            roles = cache_mesh_dim_roles(naive.mesh)
+        except Exception as exc:  # noqa: BLE001
+            return _err(o, "cache_mesh_valid", str(exc))
+        err = _check_roles_placements(o, roles, naive.placements)
+        if err is not None:
+            return err
+    return None
+
+
 def _cache_view(o):
     from .dtensor import naive_of, tensor_ids_of
     from .mesh import cache_concurrency_width, cache_node_set
@@ -406,6 +425,9 @@ def _cache_view(o):
         return _err(
             o, "tensor_ids_match_table", "tensor_ids order differs from d_tensor_table"
         )
+    err = _check_cache_placements(o)
+    if err is not None:
+        return err
     # The plan executor (propagation._view_nodes / _view_width) needs one node
     # set and one width per view; reject a mixed view before any plan builds.
     sets = {
@@ -498,7 +520,38 @@ def _two_layer_chain(o):
     return _cache_subset(o, o.big_cache, o.dst, o.num_ranks_per_node)
 
 
+def _check_view_types(o, pairs):
+    for name, val, expected in pairs:
+        if type(val) is not expected:
+            msg = f"{name} must be {expected.__name__}, got {type(val).__name__}"
+            return _err(o, "view_types", msg)
+    return None
+
+
+def _direct_write_chain(o):
+    from .views import ComputeDTensorsView, StorageDTensorsView
+
+    err = _check_view_types(
+        o, (("src", o.src, ComputeDTensorsView), ("dst", o.dst, StorageDTensorsView))
+    )
+    if err is not None:
+        return err
+    return _direct_chain(o)
+
+
 def _one_layer_write_chain(o):
+    from .views import CacheDTensorsView, ComputeDTensorsView, StorageDTensorsView
+
+    err = _check_view_types(
+        o,
+        (
+            ("src", o.src, ComputeDTensorsView),
+            ("cache", o.cache, CacheDTensorsView),
+            ("dst", o.dst, StorageDTensorsView),
+        ),
+    )
+    if err is not None:
+        return err
     ids = [list(v.tensor_ids) for v in (o.src, o.cache, o.dst)]
     if any(ids[0] != x for x in ids[1:]):
         return _err(o, "tensor_ids_match", "src/cache/dst tensor_ids differ")
@@ -506,6 +559,19 @@ def _one_layer_write_chain(o):
 
 
 def _two_layer_write_chain(o):
+    from .views import CacheDTensorsView, ComputeDTensorsView, StorageDTensorsView
+
+    err = _check_view_types(
+        o,
+        (
+            ("src", o.src, ComputeDTensorsView),
+            ("big_cache", o.big_cache, CacheDTensorsView),
+            ("small_cache", o.small_cache, CacheDTensorsView),
+            ("dst", o.dst, StorageDTensorsView),
+        ),
+    )
+    if err is not None:
+        return err
     ids = [list(v.tensor_ids) for v in (o.src, o.big_cache, o.small_cache, o.dst)]
     if any(ids[0] != x for x in ids[1:]):
         return _err(o, "tensor_ids_match", "all legs tensor_ids differ")
@@ -517,14 +583,12 @@ def _two_layer_write_chain(o):
 
 def _view_ranks(view, num_ranks_per_node: int) -> set:
     from .dtensor import naive_of, participants_of
-    from .mesh import _cache_base, cache_node_ranks
-    from .mesh import PermutedMesh, StCacheOuterProductMesh
+    from .mesh import cache_node_ranks, is_cache_mesh
 
     nds = view.d_tensor_table.named_d_tensors
-    first = naive_of(nds[0]).mesh
-    is_cache = type(_cache_base(first)) is StCacheOuterProductMesh or (
-        type(first) is PermutedMesh
-    )
+    if not nds:
+        return set()
+    is_cache = is_cache_mesh(naive_of(nds[0]).mesh)
     ranks: set = set()
     for nd in nds:
         if is_cache:
@@ -535,10 +599,15 @@ def _view_ranks(view, num_ranks_per_node: int) -> set:
 
 
 def _cache_subset(o, cache, dst, num_ranks_per_node: int):
-    if num_ranks_per_node <= 0:
+    if (
+        isinstance(num_ranks_per_node, bool)
+        or not isinstance(num_ranks_per_node, numbers.Integral)
+        or int(num_ranks_per_node) <= 0
+    ):
         return _err(o, "num_ranks_per_node_positive", "must be positive")
-    lhs = _view_ranks(cache, num_ranks_per_node)
-    rhs = _view_ranks(dst, num_ranks_per_node)
+    k = int(num_ranks_per_node)
+    lhs = _view_ranks(cache, k)
+    rhs = _view_ranks(dst, k)
     if not (lhs <= rhs):
         return _err(o, "cache_subset", "cache ranks are not a subset of dst ranks")
     return None
@@ -554,6 +623,14 @@ def _mixed_chain(o):
 
 
 def _mixed_write_chain(o):
+    from .chain import DisjointTensorIdsAndWriteChain
+
+    for seg in o.disjoint_tensor_ids_and_write_chain_list:
+        if type(seg) is not DisjointTensorIdsAndWriteChain:
+            msg = (
+                "MixedDTensorsWriteChain entries must be DisjointTensorIdsAndWriteChain"
+            )
+            return _err(o, "segment_type", msg)
     ids = [
         x for seg in o.disjoint_tensor_ids_and_write_chain_list for x in seg.tensor_ids
     ]
@@ -573,9 +650,25 @@ def _disjoint_chain(o):
 
 
 def _disjoint_write_chain(o):
-    from .chain import get_tensor_ids_of_write_chain
+    from .chain import (
+        DirectDTensorsWriteChain,
+        OneLayerCachedDTensorsWriteChain,
+        TwoLayerCachedDTensorsWriteChain,
+        get_tensor_ids_of_read_chain,
+    )
 
-    if list(o.tensor_ids) != list(get_tensor_ids_of_write_chain(o.write_chain)):
+    concrete = (
+        DirectDTensorsWriteChain,
+        OneLayerCachedDTensorsWriteChain,
+        TwoLayerCachedDTensorsWriteChain,
+    )
+    if type(o.write_chain) not in concrete:
+        return _err(
+            o,
+            "concrete_write_chain",
+            "write_chain must be a ConcreteDTensorsWriteChain",
+        )
+    if list(o.tensor_ids) != list(get_tensor_ids_of_read_chain(o.write_chain)):
         return _err(
             o, "tensor_ids_match_chain", "tensor_ids must equal chain tensor ids"
         )
@@ -589,7 +682,7 @@ _EXTRA["OneLayerCachedDTensorsReadChain"] = _one_layer_chain
 _EXTRA["TwoLayerCachedDTensorsReadChain"] = _two_layer_chain
 _EXTRA["MixedDTensorsReadChain"] = _mixed_chain
 _EXTRA["DisjointTensorIdsAndReadChain"] = _disjoint_chain
-_EXTRA["DirectDTensorsWriteChain"] = _direct_chain
+_EXTRA["DirectDTensorsWriteChain"] = _direct_write_chain
 _EXTRA["OneLayerCachedDTensorsWriteChain"] = _one_layer_write_chain
 _EXTRA["TwoLayerCachedDTensorsWriteChain"] = _two_layer_write_chain
 _EXTRA["MixedDTensorsWriteChain"] = _mixed_write_chain

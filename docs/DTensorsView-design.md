@@ -1400,18 +1400,18 @@ DTensorsReadChain =
   | TwoLayerCachedDTensorsReadChain
   | MixedDTensorsReadChain
 
-# Tensor ids covered by the chain: dst.tensor_ids for the concrete branches;
-# the concatenation of the segments in list order for Mixed.
+# Tensor ids covered by the chain: dst.tensor_ids / src.tensor_ids for the concrete
+# branches; the concatenation of the segments in list order for Mixed.
 get_tensor_ids_of_read_chain =
     list[str]
-  <- $read_chain DTensorsReadChain
+  <- $chain (DTensorsReadChain | DTensorsWriteChain)
 
 # Views at the two ends of each leg, in data-flow order: Direct gives one
 # pair (src, dst); OneLayerCached gives (src, cache) and (cache, dst);
 # TwoLayerCached gives three pairs; Mixed concatenates its segments' pairs.
 legs_of =
     list[($src DTensorsView, $dst DTensorsView)]
-  <- $read_chain DTensorsReadChain
+  <- $chain (DTensorsReadChain | DTensorsWriteChain)
 
 # A concrete chain has no Mixed branch, so a Mixed chain does not nest.
 ConcreteDTensorsReadChain =
@@ -1643,7 +1643,7 @@ DisjointTensorIdsAndWriteCopyPlanChain =
   * $copy_plan_chain ConcreteWriteCopyPlanChain
 ```
 
-`num_nodes` 是 cache mesh 的 `spatial` 维（节点数），`world_size` 是 `dst` 的 mesh 的参与者总数；`temporal` / `concurrency` 不加 rank，它们只是同一批 node 上的缓冲槽；`is_cache_mesh_subset_of_mesh` 见 B.2.3.3。
+`num_nodes` 是 cache mesh 的 `spatial` 维（节点数），`world_size` 是计算侧（读链 `dst` / 写链 `src`）mesh 的参与者总数；`temporal` / `concurrency` 不加 rank，它们只是同一批 node 上的缓冲槽；`is_cache_mesh_subset_of_mesh` 见 B.2.3.3。
 
 #### B.3.3 Meshes
 

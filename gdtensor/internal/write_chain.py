@@ -38,8 +38,10 @@ from .api import (
 from .chain import (
     DirectDTensorsWriteChain,
     concrete_write_chains,
+    is_write_chain,
     legs_of,
     rank_direct_write_plan,
+    validate_rank,
 )
 from .plan import _check_same_tensors
 from .ranges import RangeFromComputeView
@@ -1157,5 +1159,10 @@ def _run_one_concrete_write(rank: int, chain) -> None:
 
 @catch
 def d_tensors_view_rank_chain_save(rank: int, write_chain) -> Result[None]:
+    if not is_write_chain(write_chain):
+        raise invalid("write_chain", f"unknown chain type {type(write_chain).__name__}")
+    must_ok(write_chain.check_constraints())
+    _validate_concrete_write_legs(write_chain)
+    rank = validate_rank(rank)
     for chain in concrete_write_chains(write_chain):
         _run_one_concrete_write(rank, chain)

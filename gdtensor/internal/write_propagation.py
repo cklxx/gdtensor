@@ -10,16 +10,26 @@ share one plan definition.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 
 from .dtensor import (
+    box_of,
+    box_to_intervals,
     global_tensor_meta_of,
     is_designated_writer,
+    iv_intersect,
+    naive_of,
     named_of,
     order_of,
     owned_intervals,
+)
+from .mesh import (
+    cache_concurrency_width,
+    cache_mesh_permutation,
+    cache_num_nodes,
+    cache_num_steps,
 )
 from .plan import (
     CHECK,
@@ -35,7 +45,6 @@ from .propagation import (
     _hop,
     _merge_pending,
     _split,
-    _tensor_segments,
     _view_nodes,
     _view_width,
     parent_map,
@@ -237,6 +246,44 @@ def _add_storage_cuts(side, tid: str, cuts: Dict[str, set]) -> None:
         points.update(int(x) * isz for x in iv.ravel())
 
 
+def _cell_segments(
+    naive,
+    tid: str,
+    p_shape: tuple,
+    perm: tuple,
+    s: int,
+    n_index: int,
+    c: int,
+    supply_iv,
+) -> List[Tuple[int, int, tuple]]:
+    meta = naive.global_tensor_meta
+    p_coord = tuple((s, n_index, c)[i] for i in perm)
+    lo, hi = box_of(naive, p_shape, p_coord)
+    box = box_to_intervals(meta.global_shape, lo, hi)
+    return [
+        (int(a) * meta.itemsize, int(b - a) * meta.itemsize, (tid, s, c))
+        for a, b in iv_intersect(box, supply_iv)
+    ]
+
+
+def _write_tensor_segments(
+    view, n_index: int, tid: str, supply_iv
+) -> Iterable[Tuple[int, int, tuple]]:
+    naive = naive_of(named_of(view.d_tensor_table, tid))
+    perm = cache_mesh_permutation(naive.mesh)
+    base_shape = (
+        cache_num_steps(naive.mesh),
+        cache_num_nodes(naive.mesh),
+        cache_concurrency_width(naive.mesh),
+    )
+    p_shape = tuple(base_shape[i] for i in perm)
+    for s in range(base_shape[0]):
+        for c in range(base_shape[2]):
+            yield from _cell_segments(
+                naive, tid, p_shape, perm, s, n_index, c, supply_iv
+            )
+
+
 def _layer_write_segments(
     view, layer: int, node: int, have, cuts
 ) -> Dict[WriteSegKey, WriteSegment]:
@@ -249,7 +296,7 @@ def _layer_write_segments(
         points = cuts.get(tid, ())
         segs.update(
             (seg.key, seg)
-            for off, size, cell in _tensor_segments(view, n_index, tid, supply_iv)
+            for off, size, cell in _write_tensor_segments(view, n_index, tid, supply_iv)
             for a, b in _split(off, off + size, points)
             for seg in (WriteSegment(layer, node, tid, a, b - a, cell),)
         )

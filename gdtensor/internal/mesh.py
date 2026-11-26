@@ -340,6 +340,52 @@ def _cache_base(mesh):
     return mesh
 
 
+def is_cache_mesh(mesh) -> bool:
+    return type(_cache_base(mesh)) is StCacheOuterProductMesh
+
+
+def _valid_cache_perm(raw) -> Tuple[int, int, int]:
+    if not isinstance(raw, (list, tuple)) or any(
+        isinstance(x, bool) or not isinstance(x, int) for x in raw
+    ):
+        raise invalid("mesh", f"bad cache mesh permutation {raw!r}")
+    perm = tuple(raw)
+    if sorted(perm) != [0, 1, 2]:
+        raise invalid("mesh", f"bad cache mesh permutation {perm}")
+    return perm
+
+
+def cache_mesh_permutation(mesh) -> Tuple[int, int, int]:
+    """Axis order of a CacheMesh over (temporal, spatial, concurrency)."""
+    perms: List[Tuple[int, int, int]] = []
+    cur = mesh
+    while type(cur) is PermutedMesh:
+        perms.append(_valid_cache_perm(cur.permutation))
+        cur = cur.underlying_mesh
+    if type(cur) is not StCacheOuterProductMesh:
+        raise invalid("mesh", f"{type(mesh).__name__} is not a CacheMesh branch")
+    order = (0, 1, 2)
+    for perm in reversed(perms):
+        order = (order[perm[0]], order[perm[1]], order[perm[2]])
+    return order
+
+
+def cache_mesh_dim_roles(mesh) -> Tuple[str, str, str]:
+    roles = ("temporal", "spatial", "concurrency")
+    perm = cache_mesh_permutation(mesh)
+    return (roles[perm[0]], roles[perm[1]], roles[perm[2]])
+
+
+def cache_mesh_shape(mesh) -> Tuple[int, int, int]:
+    base = (
+        cache_num_steps(mesh),
+        cache_num_nodes(mesh),
+        cache_concurrency_width(mesh),
+    )
+    perm = cache_mesh_permutation(mesh)
+    return (base[perm[0]], base[perm[1]], base[perm[2]])
+
+
 def cache_num_steps(mesh) -> int:
     """Temporal step count: the arranged num_steps, or the spatial node count
     when temporal is a reshape of the spatial branch (element count preserved)."""
@@ -429,8 +475,10 @@ def is_cache_mesh_subset_of_mesh(lhs, rhs, num_ranks_per_node: int) -> bool:
     ranks. rhs is expanded the same way when it is a cache mesh, and is already
     in ranks when it is a compute mesh.
     """
+    if not is_cache_mesh(lhs):
+        raise invalid("lhs", f"{type(lhs).__name__} is not a CacheMesh")
     lhs_ranks = cache_node_ranks(lhs, num_ranks_per_node)
-    if type(_cache_base(rhs)) is StCacheOuterProductMesh or type(rhs) is PermutedMesh:
+    if is_cache_mesh(rhs):
         rhs_ranks = cache_node_ranks(rhs, num_ranks_per_node)
     else:
         rhs_ranks = set(resolve_compute_mesh(rhs).ravel().tolist())

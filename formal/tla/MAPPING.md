@@ -12,9 +12,9 @@ their scope is stated explicitly below.
 - `gdtensor/internal/propagation.py`
   `sha256 8c3f0ada76107e833406c5eeef5a60bac42170f8e8d8d93e8a01aeb5534c1030`.
 - `gdtensor/internal/write_chain.py`
-  `sha256 591251d084369f8ba82086a535ac2aad443232e23f9a6a2aff1e4fa426eb6032`.
+  `sha256 220c8fd98d1e0c019268a6f936ccdd18597abf5a72403aa0f533fd5041e57cc2`.
 - `gdtensor/internal/write_propagation.py`
-  `sha256 49b53a56446fc92fa54cc953229f3b7dd2d5c5d860572a53bbf25e0ff64d1ce8`.
+  `sha256 c28d5ff99edaa1136b66e48d83fde91bdd5b9a756b8f1b9842b9efa1a8cd0df0`.
 
 `scripts/formal_gate.sh` fails if either pin differs from the checked-out file.
 It also records both hashes in its generated manifest. A hash match verifies
@@ -233,4 +233,6 @@ holds: every admitted write segment stages, converges onto L1, and flushes to st
 With `MUTANT = "peer_down"` (node 2 rank stage disabled), TLC produces the expected
 counterexample (exit 13), matching runtime `cache_wait` after `GDTENSOR_CACHE_WAIT_SECONDS`.
 File-level `_FileWriteSlotTable` locking, `DiskNodeCache` SHA-256 verification,
-`SaveSessionBase.ensure_staging`, and `Safetensors`/`DCP` publication are verified by runtime tests.
+`SaveSessionBase.ensure_staging`, `Safetensors`/`DCP` publication, and
+pre-execution validation (`check_constraints`, leg meta checks, `validate_rank`,
+and `PermutedMesh[CacheMesh]` segment mapping) are verified by runtime tests.

@@ -9,6 +9,7 @@ gdtensor.builder namespace exposes user-visible chain products and helpers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import numbers
 from typing import List, cast
 
 from .builder_mixin import field_hash, make_builder_mixin
@@ -540,6 +541,16 @@ def _plan_concrete(rank: int, chain) -> ConcreteCopyPlanChain:
     return TwoLayerCachedCopyPlanChain(legs[0], legs[1], legs[2])
 
 
+def validate_rank(rank: int) -> int:
+    if (
+        isinstance(rank, bool)
+        or not isinstance(rank, numbers.Integral)
+        or int(rank) < 0
+    ):
+        raise invalid("rank", f"rank must be non-negative, got {rank!r}")
+    return int(rank)
+
+
 @catch
 def d_tensors_view_rank_plan_chain_save(
     rank: int, write_chain: DTensorsWriteChain
@@ -548,8 +559,10 @@ def d_tensors_view_rank_plan_chain_save(
 
     if not is_write_chain(write_chain):
         raise invalid("write_chain", f"unknown chain type {type(write_chain).__name__}")
+    must_ok(write_chain.check_constraints())
     for src, dst in legs_of(write_chain):
         _check_same_tensors(src, dst)
+    rank = validate_rank(rank)
     if type(write_chain) is MixedDTensorsWriteChain:
         return Ok(
             MixedWriteCopyPlanChain(
@@ -570,6 +583,7 @@ def _plan_concrete_write(rank: int, chain) -> ConcreteWriteCopyPlanChain:
     """Per-rank copy plans derived from the node-level write-aggregation plan."""
     from .write_propagation import build_write_chain_plan, rank_write_copy_plans
 
+    rank = validate_rank(rank)
     if type(chain) is DirectDTensorsWriteChain:
         return DirectCopyPlanChain(rank_direct_write_plan(rank, chain))
     legs = rank_write_copy_plans(build_write_chain_plan(chain), rank)
