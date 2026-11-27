@@ -98,10 +98,12 @@ def test_shared_save_session_uses_wronly_across_ranks(tmp_path, monkeypatch):
         pos = index.files["shared.safetensors"].slots[rank].pos
         offset_res = session.get_file_offset(pos)
         assert type(offset_res) is Ok, offset_res
+        offset = offset_res.value
+        assert isinstance(offset, int)
         io.pwrite(
             rank,
             session.abspath("shared.safetensors"),
-            offset_res.value,
+            offset,
             bytes([rank]) * 16,
         )
         res = session.commit()

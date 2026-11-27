@@ -64,15 +64,8 @@ class FdPool:
     def _close(self, keys):
         err: Optional[BaseException] = None
         for key in keys:
-            fd = self._fds.pop(key)
-            try:
-                if key[2] == "w":
-                    os.fsync(fd)
-            except BaseException as exc:
-                if err is None:
-                    err = exc
-            finally:
-                os.close(fd)
+            exc = _close_fd(self._fds.pop(key), key[2])
+            err = exc if err is None else err
         if err is not None:
             raise err
 
@@ -88,6 +81,24 @@ class FdPool:
     def close_path(self, path: str) -> None:
         with self._lock:
             self._close([k for k in self._fds if k[1] == path])
+
+
+def _close_fd(fd: int, mode: str) -> Optional[BaseException]:
+    err: Optional[BaseException] = None
+    try:
+        if mode == "w":
+            os.fsync(fd)
+    except BaseException as exc:
+        err = exc
+    finally:
+        os.close(fd)
+    return err
+
+
+def _ensure_staging_size(fd: int, size: int) -> None:
+    if os.fstat(fd).st_size != size:
+        os.ftruncate(fd, size)
+        os.fsync(fd)
 
 
 def _open_fd(path, mode):
@@ -168,9 +179,7 @@ class FileIO:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
         try:
-            if os.fstat(fd).st_size != size:
-                os.ftruncate(fd, size)
-                os.fsync(fd)
+            _ensure_staging_size(fd, size)
         finally:
             os.close(fd)
 
