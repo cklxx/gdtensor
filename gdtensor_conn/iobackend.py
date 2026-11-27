@@ -62,8 +62,19 @@ class FdPool:
         return fd
 
     def _close(self, keys):
+        err: Optional[BaseException] = None
         for key in keys:
-            os.close(self._fds.pop(key))
+            fd = self._fds.pop(key)
+            try:
+                if key[2] == "w":
+                    os.fsync(fd)
+            except BaseException as exc:
+                if err is None:
+                    err = exc
+            finally:
+                os.close(fd)
+        if err is not None:
+            raise err
 
     def close_rank(self, rank: int, prefix: Optional[str] = None) -> None:
         with self._lock:
@@ -82,7 +93,9 @@ class FdPool:
 def _open_fd(path, mode):
     if mode == "w":
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        # Use O_WRONLY (not O_RDWR) so Linux NFSv4.1 clients never perform
+        # 4 KiB read-modify-write page flushes that clobber sibling hosts.
+        return os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
     return os.open(path, os.O_RDONLY)
 
 
@@ -153,9 +166,11 @@ class FileIO:
 
     def create_staging(self, path: str, size: int) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
         try:
-            os.ftruncate(fd, size)
+            if os.fstat(fd).st_size != size:
+                os.ftruncate(fd, size)
+                os.fsync(fd)
         finally:
             os.close(fd)
 
