@@ -224,7 +224,7 @@ def test_safetensors_memory_strategy(tmp_path, steps, width):
     dst_mem, cv = _compute_dst()
     cache_mem = ResidentCache([], K)
     cvt = _cache_view(cache_mem, steps, width)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=K
     )
     assert type(chain.check_constraints()) is gb.Ok
@@ -241,7 +241,7 @@ def test_dcp_memory_strategy(tmp_path, steps, width):
     dst_mem, cv = _compute_dst()
     cache_mem = ResidentCache([], K)
     cvt = _cache_view(cache_mem, steps, width)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=K
     )
     assert type(chain.check_constraints()) is gb.Ok
@@ -263,7 +263,7 @@ def test_safetensors_direct_vs_cached_source_reads(tmp_path):
     # Direct: each rank reads the full tensor from the file.
     sv_direct, io_direct = _load_view(tmp_path, st, layout, "safetensors")
     dst_direct, cv_direct = _compute_dst()
-    direct = gb.DirectDTensorsReadChain(src=sv_direct, dst=cv_direct)
+    direct = gb.DirectDTensorsRWChain(src=sv_direct, dst=cv_direct)
     assert type(direct.check_constraints()) is gb.Ok
     _run_concurrent(direct, dst_direct, None)
     direct_bytes = _payload_pread(io_direct, path, data_start)
@@ -274,7 +274,7 @@ def test_safetensors_direct_vs_cached_source_reads(tmp_path):
     dst_cached, cv_cached = _compute_dst()
     cache_mem = ResidentCache([], K)
     cvt = _cache_view(cache_mem, 1, 1)
-    cached = gb.OneLayerCachedDTensorsReadChain(
+    cached = gb.OneLayerCachedDTensorsRWChain(
         src=sv_cached, cache=cvt, dst=cv_cached, num_ranks_per_node=K
     )
     assert type(cached.check_constraints()) is gb.Ok
@@ -290,7 +290,7 @@ def test_dcp_only_filler_sessions_load_full_source(tmp_path, monkeypatch):
     dst_mem, cv = _compute_dst()
     cache_mem = ResidentCache([], K)
     cvt = _cache_view(cache_mem, 1, 1)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=K
     )
 
@@ -329,7 +329,7 @@ def test_safetensors_atomic_replacement_after_open_is_rejected(tmp_path, cached)
     dst_mem, cv = _compute_dst(world=1)
     cache_mem = ResidentCache([], 1)
     if cached:
-        chain = gb.OneLayerCachedDTensorsReadChain(
+        chain = gb.OneLayerCachedDTensorsRWChain(
             src=sv,
             cache=_cache_view(cache_mem, 1, 1, nodes=[0]),
             dst=cv,
@@ -337,7 +337,7 @@ def test_safetensors_atomic_replacement_after_open_is_rejected(tmp_path, cached)
         )
         result = gio.chain_load(0, chain)
     else:
-        result = gio.chain_load(0, gb.DirectDTensorsReadChain(src=sv, dst=cv))
+        result = gio.chain_load(0, gb.DirectDTensorsRWChain(src=sv, dst=cv))
     assert type(result) is gb.Err
     assert not cache_mem.data
     np.testing.assert_array_equal(dst_mem.buffers[0], np.zeros(SIZE, np.uint8))
@@ -361,7 +361,7 @@ def test_dcp_metadata_only_payload_change_refreshes_cached_bytes(tmp_path, monke
     dst_mem, cv = _compute_dst()
     cluster = Cluster(len(NODES), K)
     cache_mem = NodeCache(cluster, {"w": SIZE}, lambda rank: rank // K)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=_cache_view(cache_mem, 1, 1), dst=cv, num_ranks_per_node=K
     )
 

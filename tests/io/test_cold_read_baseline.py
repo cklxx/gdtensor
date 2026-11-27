@@ -85,7 +85,7 @@ def _build_direct(case) -> dict:
     built = _tables(case)
     src = FileStorage(built["cluster"], built["data"])
     dst = RankBuffers(built["cluster"], built["sizes"], built["world"])
-    chain = gb.DirectDTensorsReadChain(
+    chain = gb.DirectDTensorsRWChain(
         src=_storage_view(src, built["tids"], built["sizes"], built["world"]),
         dst=_compute_view(
             dst, built["tids"], built["sizes"], built["world"], built["replicate"]

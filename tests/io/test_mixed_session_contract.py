@@ -97,12 +97,12 @@ def test_mixed_two_segments_each_own_session_bytes_and_finish():
     cv_a = _compute_view(dst_a, "a", world)
     cv_b = _compute_view(dst_b, "b", world)
 
-    seg_a = gb.DirectDTensorsReadChain(src=sv_a, dst=cv_a)
-    seg_b = gb.DirectDTensorsReadChain(src=sv_b, dst=cv_b)
-    chain = gb.MixedDTensorsReadChain(
-        disjoint_tensor_ids_and_read_chain_list=[
-            gb.DisjointTensorIdsAndReadChain(tensor_ids=["a"], read_chain=seg_a),
-            gb.DisjointTensorIdsAndReadChain(tensor_ids=["b"], read_chain=seg_b),
+    seg_a = gb.DirectDTensorsRWChain(src=sv_a, dst=cv_a)
+    seg_b = gb.DirectDTensorsRWChain(src=sv_b, dst=cv_b)
+    chain = gb.MixedDTensorsRWChain(
+        disjoint_tensor_ids_and_rw_chain_list=[
+            gb.DisjointTensorIdsAndRWChain(tensor_ids=["a"], rw_chain=seg_a),
+            gb.DisjointTensorIdsAndRWChain(tensor_ids=["b"], rw_chain=seg_b),
         ]
     )
     res = gio.chain_load(0, chain)
@@ -138,12 +138,12 @@ def test_mixed_segment_b_fails_a_bytes_kept_both_finish():
     cv_a = _compute_view(dst_a, "a", world)
     cv_b = _compute_view(dst_b, "b", world)
 
-    seg_a = gb.DirectDTensorsReadChain(src=sv_a, dst=cv_a)
-    seg_b = gb.DirectDTensorsReadChain(src=sv_b, dst=cv_b)
-    chain = gb.MixedDTensorsReadChain(
-        disjoint_tensor_ids_and_read_chain_list=[
-            gb.DisjointTensorIdsAndReadChain(tensor_ids=["a"], read_chain=seg_a),
-            gb.DisjointTensorIdsAndReadChain(tensor_ids=["b"], read_chain=seg_b),
+    seg_a = gb.DirectDTensorsRWChain(src=sv_a, dst=cv_a)
+    seg_b = gb.DirectDTensorsRWChain(src=sv_b, dst=cv_b)
+    chain = gb.MixedDTensorsRWChain(
+        disjoint_tensor_ids_and_rw_chain_list=[
+            gb.DisjointTensorIdsAndRWChain(tensor_ids=["a"], rw_chain=seg_a),
+            gb.DisjointTensorIdsAndRWChain(tensor_ids=["b"], rw_chain=seg_b),
         ]
     )
     res = gio.chain_load(0, chain)

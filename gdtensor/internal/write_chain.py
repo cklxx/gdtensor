@@ -36,9 +36,10 @@ from .api import (
     fcntl,
 )
 from .chain import (
-    DirectDTensorsWriteChain,
-    concrete_write_chains,
-    is_write_chain,
+    DirectDTensorsRWChain,
+    concrete_chains,
+    concrete_direction,
+    is_rw_chain,
     legs_of,
     rank_direct_write_plan,
     validate_rank,
@@ -112,13 +113,16 @@ class _WriteNodeState:
         self.resident += seg.size
         return True
 
-    def reserve_new(self, segs: list) -> bool:
+    def can_reserve_new(self, segs: list) -> bool:
         fresh = [s for s in segs if s.key not in self.slots]
         if any(s.key in self.completed for s in fresh):
             return False
-        if not self.fits(sum(s.size for s in fresh)):
+        return self.fits(sum(s.size for s in fresh))
+
+    def reserve_new(self, segs: list) -> bool:
+        if not self.can_reserve_new(segs):
             return False
-        _ = [self.admit(s) for s in fresh]
+        _ = [self.admit(s) for s in segs if s.key not in self.slots]
         return True
 
     def record_stage(self, key, piece) -> bool:
@@ -822,68 +826,84 @@ class _WriteRankRun:
             for node, key in ready
         )
 
+    def _child_groups(self, layer: int, seg: WriteSegment) -> dict:
+        pairs = {(tn, tk): None for tn, tk, _o, _s in seg.children}
+        groups: dict = {}
+        for tn, tk in pairs:
+            groups.setdefault(tn, []).append(self.plan.segments[layer + 1][tn][tk])
+        return groups
+
     def _try_interlayer_item(self, layer: int, node: int, key, hot_first: bool) -> bool:
-        tnode = self.plan.target[layer][node]
         seg = self.plan.segments[layer][node][key]
-        tsegs = [
-            self.plan.segments[layer + 1][tnode][tk] for tk, _o, _s in seg.children
-        ]
-        if not self._claim_interlayer(layer, node, seg, tnode, tsegs, hot_first):
+        groups = self._child_groups(layer, seg)
+        if not self._claim_interlayer(layer, node, seg, groups, hot_first):
             return False
-        self._execute_interlayer_flush(layer, node, seg, tnode)
+        self._execute_interlayer_flush(layer, node, seg, groups)
         return True
 
     def _claim_interlayer(
-        self, layer: int, node: int, seg, tnode: int, tsegs: list, hot_first: bool
+        self, layer: int, node: int, seg, groups: dict, hot_first: bool
     ) -> bool:
         with self.t.cond:
-            return self._claim_interlayer_locked(
-                layer, node, seg, tnode, tsegs, hot_first
-            )
+            return self._claim_interlayer_locked(layer, node, seg, groups, hot_first)
+
+    def _tstate_ready(self, tlayer: int, tnode: int, tsegs: list) -> bool:
+        tstate = self.t.node(tlayer, tnode)
+        tstate.check(self.gens[(tlayer, tnode)])
+        return tstate.can_reserve_new(tsegs)
+
+    def _all_tstates_ready(self, tlayer: int, groups: dict, hot_first: bool) -> bool:
+        if not all(
+            self._tstate_ready(tlayer, tn, tsegs) for tn, tsegs in groups.items()
+        ):
+            return False
+        if not hot_first:
+            return True
+        return any(
+            ts.key in self.t.node(tlayer, tn).slots
+            for tn, tsegs in groups.items()
+            for ts in tsegs
+        )
 
     def _claim_interlayer_locked(
-        self, layer: int, node: int, seg, tnode: int, tsegs: list, hot_first: bool
+        self, layer: int, node: int, seg, groups: dict, hot_first: bool
     ) -> bool:
         state = self.t.node(layer, node)
-        tstate = self.t.node(layer + 1, tnode)
         state.check(self.gens[(layer, node)])
-        tstate.check(self.gens[(layer + 1, tnode)])
-        if hot_first and not any(ts.key in tstate.slots for ts in tsegs):
-            return False
         if not self._is_flushable(state, seg.key, layer, node):
             return False
-        if not tstate.reserve_new(tsegs):
+        if not self._all_tstates_ready(layer + 1, groups, hot_first):
             return False
+        for tnode, tsegs in groups.items():
+            self.t.node(layer + 1, tnode).reserve_new(tsegs)
+            self.t.mark_touched((layer + 1, tnode))
         state.slots[seg.key]["flushing"] = True
-        self.t.mark_touched((layer + 1, tnode))
         self.t.mark_touched((layer, node))
         self.t.bump()
         return True
 
     def _execute_interlayer_flush(
-        self, layer: int, node: int, seg: WriteSegment, tnode: int
+        self, layer: int, node: int, seg: WriteSegment, groups: dict
     ) -> None:
         try:
             self._inflight(1)
         except BaseException as exc:
-            _error_cleanup(exc, self._fail_pair, layer, node, layer + 1, tnode, exc)
+            _error_cleanup(exc, self._fail, layer, node, exc, None)
             raise
         try:
-            self._copy_interlayer(layer, node, seg, tnode)
+            self._copy_interlayer(layer, node, seg)
         except BaseException as exc:
-            _error_cleanup(exc, self._interlayer_failed, layer, node, tnode, exc)
+            _error_cleanup(exc, self._flush_failed, layer, node, exc)
             raise
-        self._finish_interlayer_flush(layer, node, seg, tnode)
+        self._finish_interlayer_flush(layer, node, seg, groups)
 
-    def _copy_interlayer(
-        self, layer: int, node: int, seg: WriteSegment, tnode: int
-    ) -> None:
+    def _copy_interlayer(self, layer: int, node: int, seg: WriteSegment) -> None:
         data = _read(
             self.caches[layer].data_accessor,
             self._range(layer, node, seg.tid, seg.off, seg.size),
         )
         t_acc = self.caches[layer + 1].data_accessor
-        for _tkey, off, size in seg.children:
+        for tnode, _tkey, off, size in seg.children:
             _write(
                 t_acc,
                 self._range(layer + 1, tnode, seg.tid, off, size),
@@ -891,20 +911,23 @@ class _WriteRankRun:
             )
 
     def _finish_interlayer_flush(
-        self, layer: int, node: int, seg: WriteSegment, tnode: int
+        self, layer: int, node: int, seg: WriteSegment, groups: dict
     ) -> None:
         producer = ("seg", layer, node, seg.key)
         with self.t.cond:
-            tstate = self.t.node(layer + 1, tnode)
-            _ = [
-                tstate.record_stage(tk, (producer, off, size))
-                for tk, off, size in seg.children
-            ]
-            self.t.node(layer, node).complete_flush(seg.key)
-            self.t.activity(self.owner, -1)
+            self._record_children_and_release(layer, node, seg, groups, producer)
+
+    def _record_children_and_release(
+        self, layer: int, node: int, seg: WriteSegment, groups: dict, producer
+    ) -> None:
+        for tnode, tk, off, size in seg.children:
+            self.t.node(layer + 1, tnode).record_stage(tk, (producer, off, size))
+        self.t.node(layer, node).complete_flush(seg.key)
+        self.t.activity(self.owner, -1)
+        for tnode in groups:
             self.t.mark_touched((layer + 1, tnode))
-            self.t.mark_touched((layer, node))
-            self.t.bump()
+        self.t.mark_touched((layer, node))
+        self.t.bump()
 
     def _stage_step(self, pending: list) -> bool:
         if not pending:
@@ -964,15 +987,12 @@ class _WriteRankRun:
         return True
 
     def _reserve_l1_for_stage(self, node: int, seg: WriteSegment, hot_l1: bool) -> bool:
-        tnode = self.plan.target[0][node]
-        tstate = self.t.node(1, tnode)
-        tstate.check(self.gens[(1, tnode)])
-        tsegs = [self.plan.segments[1][tnode][tk] for tk, _o, _s in seg.children]
-        if hot_l1 and not any(ts.key in tstate.slots for ts in tsegs):
+        groups = self._child_groups(0, seg)
+        if not self._all_tstates_ready(1, groups, hot_l1):
             return False
-        if not tstate.reserve_new(tsegs):
-            return False
-        self.t.mark_touched((1, tnode))
+        for tnode, tsegs in groups.items():
+            self.t.node(1, tnode).reserve_new(tsegs)
+            self.t.mark_touched((1, tnode))
         return True
 
     def _run_stage(self, pending: list, piece) -> None:
@@ -1071,10 +1091,11 @@ class _WriteRankRun:
             self.t.bump()
 
     def _fail_targets(self, layer: int, node: int) -> list:
-        out, cur = [], node
-        for lay in range(layer + 1, self.last + 1):
-            cur = self.plan.target[lay - 1][cur]
-            out.append((lay, cur))
+        out, queue, seen = [], [(layer, node)], {(layer, node)}
+        while queue:
+            lay, cur = queue.pop(0)
+            targets = self.plan.targets[lay].get(cur, ()) if lay < self.last else ()
+            _enqueue_targets(lay, targets, queue, seen, out)
         return out
 
     def _fail_node(self, layer: int, node: int, exc: BaseException, key) -> None:
@@ -1084,20 +1105,21 @@ class _WriteRankRun:
         state.fail(exc, key)
         self.t.mark_touched((layer, node))
 
-    def _fail_pair(
-        self, l0: int, n0: int, l1: int, n1: int, exc: BaseException
-    ) -> None:
-        self._fail(l0, n0, exc, None)
-
     def _flush_failed(self, layer: int, node: int, exc: BaseException) -> None:
         self._fail(layer, node, exc, None)
         self._inflight(-1)
 
-    def _interlayer_failed(
-        self, layer: int, node: int, tnode: int, exc: BaseException
-    ) -> None:
-        self._fail_pair(layer, node, layer + 1, tnode, exc)
-        self._inflight(-1)
+
+def _enqueue_targets(
+    lay: int, targets: tuple, queue: list, seen: set, out: list
+) -> None:
+    for tn in targets:
+        pair = (lay + 1, tn)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+        queue.append(pair)
 
 
 def _validate_concrete_write_legs(chain) -> None:
@@ -1148,7 +1170,7 @@ def _run_one_concrete_write(rank: int, chain) -> None:
             "chain must connect ComputeDTensorsView to StorageDTensorsView",
         )
     _validate_concrete_write_legs(chain)
-    if type(chain) is DirectDTensorsWriteChain:
+    if type(chain) is DirectDTensorsRWChain:
         plan = rank_direct_write_plan(rank, chain)
         _run_save_session(
             chain.dst, rank, "direct", lambda view: _copy(plan, chain.src, view)
@@ -1158,11 +1180,16 @@ def _run_one_concrete_write(rank: int, chain) -> None:
 
 
 @catch
-def d_tensors_view_rank_chain_save(rank: int, write_chain) -> Result[None]:
-    if not is_write_chain(write_chain):
-        raise invalid("write_chain", f"unknown chain type {type(write_chain).__name__}")
-    must_ok(write_chain.check_constraints())
-    _validate_concrete_write_legs(write_chain)
+def d_tensors_view_rank_chain_save(rank: int, rw_chain) -> Result[None]:
+    if not is_rw_chain(rw_chain):
+        raise invalid("rw_chain", f"unknown chain type {type(rw_chain).__name__}")
+    must_ok(rw_chain.check_constraints())
+    for c in concrete_chains(rw_chain):
+        if concrete_direction(c) != "write":
+            raise invalid(
+                "rw_chain", "chain_save requires a write-direction DTensorsRWChain"
+            )
+    _validate_concrete_write_legs(rw_chain)
     rank = validate_rank(rank)
-    for chain in concrete_write_chains(write_chain):
+    for chain in concrete_chains(rw_chain):
         _run_one_concrete_write(rank, chain)

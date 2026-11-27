@@ -8,13 +8,13 @@ their scope is stated explicitly below.
 ## Runtime source pins
 
 - `gdtensor/internal/api.py`
-  `sha256 8bfd297961f68a6728ab097cea605d39294d2dad611db750c4f1d36d6b6282ce`.
+  `sha256 d238a31602c069fc070c9581fec9fc5271805dbe9cf902a809731f6a249cd9fa`.
 - `gdtensor/internal/propagation.py`
-  `sha256 8c3f0ada76107e833406c5eeef5a60bac42170f8e8d8d93e8a01aeb5534c1030`.
+  `sha256 2f25d40fb34c2e7f791b42f1fc113f86bb14463eac3293784f727490052dd65a`.
 - `gdtensor/internal/write_chain.py`
-  `sha256 220c8fd98d1e0c019268a6f936ccdd18597abf5a72403aa0f533fd5041e57cc2`.
+  `sha256 4c7d4aac5535d7a6043c4d61379d01b336bb52cf0b723fce2ba14f9dd8d2c6a6`.
 - `gdtensor/internal/write_propagation.py`
-  `sha256 c28d5ff99edaa1136b66e48d83fde91bdd5b9a756b8f1b9842b9efa1a8cd0df0`.
+  `sha256 67d5467a25369a1be9e496b1ff59c5cfaaf0a744fd6469c1282425a2f0cb9b4d`.
 
 `scripts/formal_gate.sh` fails if either pin differs from the checked-out file.
 It also records both hashes in its generated manifest. A hash match verifies
@@ -182,10 +182,7 @@ locking. Related runtime constraints are:
 
 # WriteChainPropagation.tla — current runtime mapping
 
-The fixed instance is the dual two-layer write fan-in: layer 0 (`big_cache`) has
-nodes 1 and 2, each holding one 4-byte segment staged by its local compute rank;
-layer 1 (`small_cache`) is convergence node 0 with one 8-byte segment consuming
-edge pieces `<<1, 0, 4>>` and `<<2, 4, 4>>` before flushing to storage.
+The fixed instance is the dual two-layer write fan-in (`DTensorsRWChain` write direction with `CacheMesh.spatial: Shard`): layer 0 (`first_cache`) has nodes 1 and 2, each holding one 4-byte segment staged by its local compute rank; layer 1 (`second_cache`) is convergence node 0 with one 8-byte segment consuming edge pieces `<<1, 0, 4>>` and `<<2, 4, 4>>` before flushing to storage.
 
 ## Plan field map (`internal/write_propagation.py`)
 

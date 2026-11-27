@@ -44,7 +44,7 @@ storage_view = make_storage_view(
 
 rank_load(rank, compute_view, storage_view)
 rank_save(rank, compute_view, storage_view)
-chain_load(rank, read_chain)  # read_chain 的 source 使用上述 storage_view
+chain_load(rank, rw_chain)  # rw_chain 的 source 使用上述 storage_view
 ```
 
 client 采用 `gdtensor_conn.iobackend.FileSystemClient` 的结构化协议，不需要继承基类：

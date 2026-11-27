@@ -252,7 +252,13 @@ def _compute_view(
 
 
 def _cache_view(
-    accessor, tensor_id: str, shape: list[int], steps: int, nodes: list[int], width: int
+    accessor,
+    tensor_id: str,
+    shape: list[int],
+    steps: int,
+    nodes: list[int],
+    width: int,
+    spatial=None,
 ):
     mesh = gb.StCacheOuterProductMesh(
         temporal=gb.ArrangedMesh(gt.NumSteps(steps)),
@@ -261,7 +267,7 @@ def _cache_view(
     )
     dt = gb.NaiveDTensor(
         gb.GlobalTensorMeta(shape, "U8", 1),
-        [gb.Shard(0), gb.Replicate(), gb.Shard(0)],
+        [gb.Shard(0), gb.Shard(0) if spatial is None else spatial, gb.Shard(0)],
         mesh,
     )
     return gb.CacheDTensorsView(
@@ -301,7 +307,7 @@ def test_direct_write_chain_delivers_every_rank_shard_bytes():
     dst = TraceMemory(np.zeros(8, dtype=np.uint8))
     cv = _compute_view(src, "w", [8], world)
     sv = _sharded_storage(dst, "w", [8], world)
-    chain = gb.DirectDTensorsWriteChain(src=cv, dst=sv)
+    chain = gb.DirectDTensorsRWChain(src=cv, dst=sv)
     assert type(chain.check_constraints()) is gb.Ok
     assert gdtensor.get_chain_tensor_ids(chain) == ["w"]
     assert len(gb.legs_of(chain)) == 1
@@ -325,7 +331,7 @@ def test_cached_write_failure_aborts_session(monkeypatch):
     sv = _hf_single_slot_storage(
         dst, "w", [8], world, sessions=sessions, vote=_SessionVote(world)
     )
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=cv, cache=cvt, dst=sv, num_ranks_per_node=2
     )
     results = _save_all(chain, world, threaded=True)
@@ -344,7 +350,7 @@ def test_commit_failure_does_not_abort_direct_write_chain():
     sv = _hf_single_slot_storage(
         dst, "w", [4], world, sessions=sessions, commit_error=boom
     )
-    chain = gb.DirectDTensorsWriteChain(src=cv, dst=sv)
+    chain = gb.DirectDTensorsRWChain(src=cv, dst=sv)
     res = gio.chain_save(0, chain)
     assert type(res) is gb.Err and res.value.msg == "disk-full"
     assert sessions[0].committed == 1 and sessions[0].aborted == 0
@@ -365,14 +371,14 @@ def test_one_layer_col_sharded_coalesces_writes_to_hf_storage(monkeypatch):
     assert len(direct_dst.ops("write")) == 8
     assert bytes(direct_dst.data) == bytes(expected)
 
-    # OneLayerCachedDTensorsWriteChain coalesces all 8 fragments into 1 write.
+    # OneLayerCachedDTensorsRWChain coalesces all 8 fragments into 1 write.
     cached_src = TraceMemory(expected)
     cache_mem = TraceMemory(np.zeros(16, dtype=np.uint8))
     cached_dst = TraceMemory(np.zeros(16, dtype=np.uint8))
     cv = _compute_view(cached_src, "w", shape, world, placements=[gb.Shard(1)])
     cvt = _cache_view(cache_mem, "w", shape, steps=1, nodes=[0], width=1)
     sv = _hf_single_slot_storage(cached_dst, "w", shape, world)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=cv, cache=cvt, dst=sv, num_ranks_per_node=2
     )
     assert type(chain.check_constraints()) is gb.Ok
@@ -392,7 +398,7 @@ def test_bounded_budget_resident_never_exceeds_stat(monkeypatch, steps):
     cv = _compute_view(src, "w", shape, world, placements=[gb.Shard(1)])
     cvt = _cache_view(cache, "w", shape, steps=steps, nodes=[0], width=1)
     sv = _hf_single_slot_storage(dst, "w", shape, world)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=cv, cache=cvt, dst=sv, num_ranks_per_node=2
     )
     budget = gio.chain_stat_mem_overhead(chain)
@@ -428,7 +434,7 @@ def test_slot_flushes_only_after_all_producers_stage(monkeypatch):
     cv = _compute_view(src, "w", [4, 4], world, placements=[gb.Shard(1)])
     cvt = _cache_view(cache, "w", [4, 4], steps=1, nodes=[0], width=1)
     sv = _hf_single_slot_storage(dst, "w", [4, 4], world)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=cv, cache=cvt, dst=sv, num_ranks_per_node=2
     )
     results = {}
@@ -478,7 +484,7 @@ def test_replicate_write_chain_deduplicates_storage_writes(monkeypatch):
     cv = _compute_view(src, "w", [8], world, placements=[gb.Replicate()])
     cvt = _cache_view(cache, "w", [8], steps=1, nodes=[0, 1], width=1)
     sv = _hf_single_slot_storage(dst, "w", [8], world)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=cv, cache=cvt, dst=sv, num_ranks_per_node=2
     )
     _assert_all_ok(_save_all(chain, world, threaded=True))
@@ -509,15 +515,16 @@ def test_two_layer_fan_in_converges_and_matches_traffic_stats(monkeypatch):
     big_cv = _cache_view(big_acc, "w", [4, 4], steps=2, nodes=[0, 1], width=1)
     small_cv = _cache_view(small_acc, "w", [4, 4], steps=2, nodes=[0], width=1)
     sv = _hf_single_slot_storage(dst_acc, "w", [4, 4], world)
-    chain = gb.TwoLayerCachedDTensorsWriteChain(
-        src=cv, big_cache=big_cv, small_cache=small_cv, dst=sv, num_ranks_per_node=k
+    chain = gb.TwoLayerCachedDTensorsRWChain(
+        src=cv, first_cache=big_cv, second_cache=small_cv, dst=sv, num_ranks_per_node=k
     )
     assert type(chain.check_constraints()) is gb.Ok
-    # Oracle: 2 steps -> 4B/step on each big cache; node 0 holds big@0 (4B) + small@0 (8B) = 12B; node 1 holds big@1 (4B).
+    # Under spatial=Shard(0): 2 steps -> first_cache@0 holds rows {0,1} (4B/step),
+    # first_cache@1 holds rows {2,3} (4B/step), second_cache@0 holds all 4 rows (8B/step).
     assert gio.chain_stat_mem_overhead(chain) == [12, 4]
-    # Node 1 forwards all 8B to small@0; node 0 writes 16B out to storage -> [16, 8].
-    assert gio.chain_stat_outbound_traffic(chain) == [16, 8]
-    assert gio.chain_stat_inbound_traffic(chain) == [8, 0]
+    # Compute sends 4B each way across nodes; first_cache@1 forwards 8B to second_cache@0; node 0 writes 16B to storage.
+    assert gio.chain_stat_outbound_traffic(chain) == [20, 12]
+    assert gio.chain_stat_inbound_traffic(chain) == [12, 4]
 
     results = {}
 
@@ -543,7 +550,7 @@ def test_mixed_write_chain_runs_independent_sessions(monkeypatch):
     src_a = TraceMemory(np.arange(4, dtype=np.uint8))
     dst_a = TraceMemory(np.zeros(4, dtype=np.uint8))
     sess_a: list = []
-    seg_a = gb.DirectDTensorsWriteChain(
+    seg_a = gb.DirectDTensorsRWChain(
         src=_compute_view(src_a, "a", [4], world),
         dst=_sharded_storage(dst_a, "a", [4], world, sessions=sess_a),
     )
@@ -552,16 +559,16 @@ def test_mixed_write_chain_runs_independent_sessions(monkeypatch):
     cache_b = TraceMemory(np.zeros(8, dtype=np.uint8))
     dst_b = TraceMemory(np.zeros(8, dtype=np.uint8))
     sess_b: list = []
-    seg_b = gb.OneLayerCachedDTensorsWriteChain(
+    seg_b = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(src_b, "b", [4, 2], world, placements=[gb.Shard(1)]),
         cache=_cache_view(cache_b, "b", [4, 2], steps=1, nodes=[0], width=1),
         dst=_hf_single_slot_storage(dst_b, "b", [4, 2], world, sessions=sess_b),
         num_ranks_per_node=2,
     )
-    mixed = gb.MixedDTensorsWriteChain(
+    mixed = gb.MixedDTensorsRWChain(
         [
-            gb.DisjointTensorIdsAndWriteChain(["a"], seg_a),
-            gb.DisjointTensorIdsAndWriteChain(["b"], seg_b),
+            gb.DisjointTensorIdsAndRWChain(["a"], seg_a),
+            gb.DisjointTensorIdsAndRWChain(["b"], seg_b),
         ]
     )
     assert type(mixed.check_constraints()) is gb.Ok
@@ -683,7 +690,7 @@ def test_real_safetensors_and_disk_node_cache_multi_generation(
         _GenMem(cluster, active_data), "w", shape, world, placements=[gb.Shard(1)]
     )
     cvt = _cache_view(cache_acc, "w", shape, steps=1, nodes=[0], width=1)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=cv, cache=cvt, dst=sv, num_ranks_per_node=k
     )
 
@@ -707,7 +714,7 @@ def test_missing_producer_rank_times_out_with_cache_wait(monkeypatch):
     cv = _compute_view(src, "w", [8, 2], world, placements=[gb.Shard(1)])
     cvt = _cache_view(cache, "w", [8, 2], steps=2, nodes=[0], width=1)
     sv = _hf_single_slot_storage(dst, "w", [8, 2], world)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=cv, cache=cvt, dst=sv, num_ranks_per_node=2
     )
     res = gio.chain_save(0, chain)
@@ -719,7 +726,7 @@ def test_missing_producer_rank_times_out_with_cache_wait(monkeypatch):
 def test_write_chain_constraint_validation_and_error_cases():
     sv = _hf_single_slot_storage(Memory([0] * 8), "w", [2, 4], 4)
     cv_bad = _compute_view(Memory([0] * 8), "other", [2, 4], 4)
-    bad_direct = gb.DirectDTensorsWriteChain(src=cv_bad, dst=sv)
+    bad_direct = gb.DirectDTensorsRWChain(src=cv_bad, dst=sv)
     res = bad_direct.check_constraints()
     assert type(res) is gb.Err and res.value.constraint_name == "tensor_ids_match"
 
@@ -728,7 +735,7 @@ def test_write_chain_constraint_validation_and_error_cases():
     cvt_too_big = _cache_view(
         Memory([0] * 8), "w", [2, 4], steps=1, nodes=[0, 1], width=1
     )
-    bad_one = gb.OneLayerCachedDTensorsWriteChain(
+    bad_one = gb.OneLayerCachedDTensorsRWChain(
         src=cv_ok, cache=cvt_too_big, dst=sv, num_ranks_per_node=2
     )
     res1 = bad_one.check_constraints()
@@ -736,11 +743,11 @@ def test_write_chain_constraint_validation_and_error_cases():
 
     # Disjoint tensor_ids check in Mixed
     cv2 = _compute_view(Memory([0] * 8), "w", [2, 4], 4)
-    d = gb.DirectDTensorsWriteChain(src=cv2, dst=sv)
-    bad_mix = gb.MixedDTensorsWriteChain(
+    d = gb.DirectDTensorsRWChain(src=cv2, dst=sv)
+    bad_mix = gb.MixedDTensorsRWChain(
         [
-            gb.DisjointTensorIdsAndWriteChain(["w"], d),
-            gb.DisjointTensorIdsAndWriteChain(["w"], d),
+            gb.DisjointTensorIdsAndRWChain(["w"], d),
+            gb.DisjointTensorIdsAndRWChain(["w"], d),
         ]
     )
     res_mix = bad_mix.check_constraints()
@@ -751,7 +758,7 @@ def test_write_chain_constraint_validation_and_error_cases():
 
     # Out-of-range rank on a cached chain returns InvalidArgumentError
     cvt_ok = _cache_view(Memory([0] * 8), "w", [2, 4], steps=1, nodes=[0], width=1)
-    cached_ok = gb.OneLayerCachedDTensorsWriteChain(
+    cached_ok = gb.OneLayerCachedDTensorsRWChain(
         src=cv2, cache=cvt_ok, dst=sv, num_ranks_per_node=2
     )
     res_rank = gio.chain_save(99, cached_ok)
@@ -793,8 +800,8 @@ def test_two_layer_stage_failure_propagates_downstream_without_waiting(monkeypat
     sv = _hf_single_slot_storage(
         dst_acc, "w", [4, 4], world, sessions=sessions, vote=_SessionVote(world)
     )
-    chain = gb.TwoLayerCachedDTensorsWriteChain(
-        src=cv, big_cache=big_cv, small_cache=small_cv, dst=sv, num_ranks_per_node=k
+    chain = gb.TwoLayerCachedDTensorsRWChain(
+        src=cv, first_cache=big_cv, second_cache=small_cv, dst=sv, num_ranks_per_node=k
     )
     results = {}
 
@@ -837,13 +844,13 @@ def test_cache_view_enforces_dimension_placements_and_permuted_mesh(monkeypatch)
     monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "thread")
     acc = TraceMemory(np.zeros(16, dtype=np.uint8))
     bad_spatial = _permuted_cache_view(
-        acc, "w", [4, 4], [0, 1, 2], [gb.Shard(0), gb.Shard(1), gb.Shard(0)]
+        acc, "w", [4, 4], [0, 1, 2], [gb.Shard(0), gb.Partial(), gb.Shard(0)]
     )
     res_sp = bad_spatial.check_constraints()
     assert type(res_sp) is gb.Err and res_sp.value.constraint_name == "cache_placements"
 
     bad_temp = _permuted_cache_view(
-        acc, "w", [4, 4], [0, 1, 2], [gb.Replicate(), gb.Replicate(), gb.Shard(0)]
+        acc, "w", [4, 4], [0, 1, 2], [gb.Replicate(), gb.Shard(0), gb.Shard(0)]
     )
     res_tp = bad_temp.check_constraints()
     assert type(res_tp) is gb.Err and res_tp.value.constraint_name == "cache_placements"
@@ -857,13 +864,25 @@ def test_cache_view_enforces_dimension_placements_and_permuted_mesh(monkeypatch)
     world, k = 4, 2
     src = TraceMemory(np.arange(16, dtype=np.uint8))
     dst = TraceMemory(np.zeros(16, dtype=np.uint8))
-    good_perm = _permuted_cache_view(
-        acc, "w", [4, 4], [2, 0, 1], [gb.Shard(0), gb.Shard(0), gb.Replicate()]
-    )
-    assert type(good_perm.check_constraints()) is gb.Ok
     cv = _compute_view(src, "w", [4, 4], world, placements=[gb.Shard(1)])
     sv = _hf_single_slot_storage(dst, "w", [4, 4], world)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    # Standalone CacheDTensorsView allows Replicate on spatial, which read chains use and write chains reject.
+    read_perm = _permuted_cache_view(
+        acc, "w", [4, 4], [2, 0, 1], [gb.Shard(0), gb.Shard(0), gb.Replicate()]
+    )
+    assert type(read_perm.check_constraints()) is gb.Ok
+    res_dir = gb.OneLayerCachedDTensorsRWChain(
+        src=cv, cache=read_perm, dst=sv, num_ranks_per_node=k
+    ).check_constraints()
+    assert (
+        type(res_dir) is gb.Err and res_dir.value.constraint_name == "cache_placements"
+    )
+
+    good_perm = _permuted_cache_view(
+        acc, "w", [4, 4], [2, 0, 1], [gb.Shard(0), gb.Shard(0), gb.Shard(0)]
+    )
+    assert type(good_perm.check_constraints()) is gb.Ok
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=cv, cache=good_perm, dst=sv, num_ranks_per_node=k
     )
     assert type(chain.check_constraints()) is gb.Ok
@@ -899,7 +918,7 @@ def test_permuted_compute_mesh_subset_and_write_chain(monkeypatch):
     cv = gb.ComputeDTensorsView(["w"], gb.DTensorTable([gb.NamedDTensor("w", dt)]), src)
     cvt = _cache_view(cache_mem, "w", [4, 4], steps=2, nodes=[0, 1], width=1)
     sv = _hf_single_slot_storage(dst, "w", [4, 4], world)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=cv, cache=cvt, dst=sv, num_ranks_per_node=k
     )
     assert type(chain.check_constraints()) is gb.Ok
@@ -917,22 +936,19 @@ def test_write_chain_rejects_nesting_wrong_views_and_opens_zero_sessions():
     cvt = _cache_view(TraceMemory(np.zeros(8, dtype=np.uint8)), "w", [2, 4], 1, [0], 1)
     sv = _hf_single_slot_storage(dst, "w", [2, 4], world, sessions=sessions_direct)
 
-    # Nested Mixed inside DisjointTensorIdsAndWriteChain is rejected
-    direct_w = gb.DirectDTensorsWriteChain(src=cv, dst=sv)
-    inner_mix = gb.MixedDTensorsWriteChain(
-        [gb.DisjointTensorIdsAndWriteChain(["w"], direct_w)]
+    # Nested Mixed inside DisjointTensorIdsAndRWChain is rejected
+    direct_w = gb.DirectDTensorsRWChain(src=cv, dst=sv)
+    inner_mix = gb.MixedDTensorsRWChain(
+        [gb.DisjointTensorIdsAndRWChain(["w"], direct_w)]
     )
-    nested = gb.MixedDTensorsWriteChain(
-        [gb.DisjointTensorIdsAndWriteChain(["w"], inner_mix)]
-    )
+    nested = gb.MixedDTensorsRWChain([gb.DisjointTensorIdsAndRWChain(["w"], inner_mix)])
     r_nest = nested.check_constraints()
     assert (
-        type(r_nest) is gb.Err
-        and r_nest.value.constraint_name == "concrete_write_chain"
+        type(r_nest) is gb.Err and r_nest.value.constraint_name == "concrete_rw_chain"
     )
 
     # Wrong view types are rejected
-    bad_views = gb.DirectDTensorsWriteChain(src=cvt, dst=sv)
+    bad_views = gb.DirectDTensorsRWChain(src=cvt, dst=sv)
     r_vt = bad_views.check_constraints()
     assert type(r_vt) is gb.Err and r_vt.value.constraint_name == "view_types"
 
@@ -945,7 +961,7 @@ def test_write_chain_rejects_nesting_wrong_views_and_opens_zero_sessions():
     )
     small_dt = gb.NaiveDTensor(
         gb.GlobalTensorMeta([2, 4], "U8", 1),
-        [gb.Shard(0), gb.Replicate(), gb.Shard(0)],
+        [gb.Shard(0), gb.Shard(0), gb.Shard(0)],
         small_mesh,
     )
     small_bad = gb.CacheDTensorsView(
@@ -954,8 +970,12 @@ def test_write_chain_rejects_nesting_wrong_views_and_opens_zero_sessions():
         TraceMemory(np.zeros(8, dtype=np.uint8)),
     )
     sv_two = _hf_single_slot_storage(dst, "w", [2, 4], world, sessions=sessions_cached)
-    two_bad = gb.TwoLayerCachedDTensorsWriteChain(
-        src=cv, big_cache=big, small_cache=small_bad, dst=sv_two, num_ranks_per_node=2
+    two_bad = gb.TwoLayerCachedDTensorsRWChain(
+        src=cv,
+        first_cache=big,
+        second_cache=small_bad,
+        dst=sv_two,
+        num_ranks_per_node=2,
     )
     r_two = two_bad.check_constraints()
     assert type(r_two) is gb.Err and r_two.value.constraint_name == "cache_subset"
@@ -963,17 +983,17 @@ def test_write_chain_rejects_nesting_wrong_views_and_opens_zero_sessions():
     assert type(r_save) is gb.Err and type(r_save.value) is gb.ConstraintViolationError
     assert not sessions_cached
 
-    # Invalid cache placements opens zero sessions on chain_save
+    # Write chain with spatial=Replicate() opens zero sessions on chain_save
     bad_cache = _permuted_cache_view(
         TraceMemory(np.zeros(8, dtype=np.uint8)),
         "w",
         [2, 4],
         [0, 1, 2],
-        [gb.Shard(0), gb.Shard(0), gb.Shard(0)],
+        [gb.Shard(0), gb.Replicate(), gb.Shard(0)],
     )
     r_pl = gio.chain_save(
         0,
-        gb.OneLayerCachedDTensorsWriteChain(
+        gb.OneLayerCachedDTensorsRWChain(
             src=cv, cache=bad_cache, dst=sv_two, num_ranks_per_node=2
         ),
     )
@@ -983,11 +1003,11 @@ def test_write_chain_rejects_nesting_wrong_views_and_opens_zero_sessions():
     # Mixed where segment 2 has mismatched GlobalTensorMeta prevents segment 1 from opening sessions
     cv_b_bad = _compute_view(src, "b", [4, 2], world)
     sv_b = _hf_single_slot_storage(dst, "b", [2, 4], world, sessions=sessions_direct)
-    mix_meta = gb.MixedDTensorsWriteChain(
+    mix_meta = gb.MixedDTensorsRWChain(
         [
-            gb.DisjointTensorIdsAndWriteChain(["w"], direct_w),
-            gb.DisjointTensorIdsAndWriteChain(
-                ["b"], gb.DirectDTensorsWriteChain(src=cv_b_bad, dst=sv_b)
+            gb.DisjointTensorIdsAndRWChain(["w"], direct_w),
+            gb.DisjointTensorIdsAndRWChain(
+                ["b"], gb.DirectDTensorsRWChain(src=cv_b_bad, dst=sv_b)
             ),
         ]
     )
@@ -1047,12 +1067,12 @@ def test_write_chain_stats_are_pure_and_touch_no_session_or_accessor():
     cv = _compute_view(no_io, "w", [4, 4], world, placements=[gb.Shard(1)])
     big = _cache_view(no_io, "w", [4, 4], steps=2, nodes=[0, 1], width=1)
     small = _cache_view(no_io, "w", [4, 4], steps=2, nodes=[0], width=1)
-    chain = gb.TwoLayerCachedDTensorsWriteChain(
-        src=cv, big_cache=big, small_cache=small, dst=sv, num_ranks_per_node=k
+    chain = gb.TwoLayerCachedDTensorsRWChain(
+        src=cv, first_cache=big, second_cache=small, dst=sv, num_ranks_per_node=k
     )
     assert gio.chain_stat_mem_overhead(chain) == [12, 4]
-    assert gio.chain_stat_inbound_traffic(chain) == [8, 0]
-    assert gio.chain_stat_outbound_traffic(chain) == [16, 8]
+    assert gio.chain_stat_inbound_traffic(chain) == [12, 4]
+    assert gio.chain_stat_outbound_traffic(chain) == [20, 12]
 
 
 class _StrictFourMethodSaveSession(gs.StorageSaveSession):
@@ -1130,7 +1150,7 @@ def test_minimal_four_method_save_session_works_with_write_chain(monkeypatch, la
     cv = _compute_view(src_acc, "w", [4, 4], world, placements=[gb.Shard(1)])
     if layers == 1:
         cache_acc = NodeCache(cluster, {"w": 16}, lambda _r: 0)
-        chain = gb.OneLayerCachedDTensorsWriteChain(
+        chain = gb.OneLayerCachedDTensorsRWChain(
             src=cv,
             cache=_cache_view(cache_acc, "w", [4, 4], steps=2, nodes=[0], width=1),
             dst=sv,
@@ -1139,10 +1159,12 @@ def test_minimal_four_method_save_session_works_with_write_chain(monkeypatch, la
     else:
         big_acc = NodeCache(cluster, {"w": 16}, parent_of([0, 1], [0]).get)
         small_acc = NodeCache(cluster, {"w": 16}, lambda _r: 0)
-        chain = gb.TwoLayerCachedDTensorsWriteChain(
+        chain = gb.TwoLayerCachedDTensorsRWChain(
             src=cv,
-            big_cache=_cache_view(big_acc, "w", [4, 4], steps=2, nodes=[0, 1], width=1),
-            small_cache=_cache_view(
+            first_cache=_cache_view(
+                big_acc, "w", [4, 4], steps=2, nodes=[0, 1], width=1
+            ),
+            second_cache=_cache_view(
                 small_acc, "w", [4, 4], steps=2, nodes=[0], width=1
             ),
             dst=sv,
@@ -1165,3 +1187,79 @@ def test_minimal_four_method_save_session_works_with_write_chain(monkeypatch, la
     assert bytes(dst_acc.data) == bytes(np.arange(16, dtype=np.uint8))
     assert len(sessions) == world and all(s.committed == 1 for s in sessions)
     assert all(not hasattr(s, "ensure_staging") for s in sessions)
+
+
+def test_write_cache_spatial_shard1_coalesces_2d_cols(monkeypatch):
+    monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "thread")
+    world, k = 4, 2
+    cluster = Cluster(num_nodes=2, k=k)
+    sizes = {"w": 16}
+    src_data = np.arange(16, dtype=np.uint8)
+    dst_acc = TraceMemory(np.zeros(16, dtype=np.uint8))
+    cache_acc = NodeCache(cluster, sizes, lambda r: r // k)
+
+    class RankReadMem(ga.DTensorDataAccessor):
+        def read_to_buffer(self, global_range, read_to_buffer):
+            off, sz = global_range.global_tensor_offset, global_range.size
+            return read_to_buffer(src_data[off : off + sz].ctypes.data, sz)
+
+        def write_from_buffer(self, global_range, write_from_buffer):
+            raise AssertionError("src is read-only")
+
+    cv = _compute_view(RankReadMem(), "w", [4, 4], world, placements=[gb.Shard(0)])
+    cvt = _cache_view(
+        cache_acc, "w", [4, 4], steps=2, nodes=[0, 1], width=1, spatial=gb.Shard(1)
+    )
+    sv = _hf_single_slot_storage(dst_acc, "w", [4, 4], world)
+    chain = gb.OneLayerCachedDTensorsRWChain(
+        src=cv, cache=cvt, dst=sv, num_ranks_per_node=k
+    )
+    assert type(chain.check_constraints()) is gb.Ok
+    # 2 steps -> each node owns 2 cols (8B total), 4B per step per node.
+    assert gio.chain_stat_mem_overhead(chain) == [4, 4]
+    results = {}
+
+    def run(rank: int):
+        cluster.rank = rank
+        results[rank] = gio.chain_save(rank, chain)
+
+    threads = [threading.Thread(target=run, args=(r,)) for r in range(world)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+        assert not t.is_alive()
+    _assert_all_ok(results)
+    assert cache_acc.wrong_node == 0
+    assert bytes(dst_acc.data) == bytes(src_data)
+
+
+def test_direction_mismatch_and_mixed_direction_are_rejected():
+    world = 2
+    sessions_read: list = []
+    sessions_write: list = []
+    src = TraceMemory(np.arange(8, dtype=np.uint8))
+    dst = TraceMemory(np.zeros(8, dtype=np.uint8))
+    cv_a = _compute_view(src, "a", [2, 4], world)
+    sv_a = _hf_single_slot_storage(dst, "a", [2, 4], world, sessions=sessions_write)
+    cv_b = _compute_view(dst, "b", [2, 4], world)
+    sv_b = _hf_single_slot_storage(src, "b", [2, 4], world, sessions=sessions_read)
+
+    write_chain = gb.DirectDTensorsRWChain(src=cv_a, dst=sv_a)
+    read_chain = gb.DirectDTensorsRWChain(src=sv_b, dst=cv_b)
+    r_load = gio.chain_load(0, write_chain)
+    r_save = gio.chain_save(0, read_chain)
+    assert type(r_load) is gb.Err and type(r_load.value) is gb.InvalidArgumentError
+    assert type(r_save) is gb.Err and type(r_save.value) is gb.InvalidArgumentError
+    assert not sessions_write and not sessions_read
+
+    mixed = gb.MixedDTensorsRWChain(
+        [
+            gb.DisjointTensorIdsAndRWChain(["a"], write_chain),
+            gb.DisjointTensorIdsAndRWChain(["b"], read_chain),
+        ]
+    )
+    r_mix = mixed.check_constraints()
+    assert (
+        type(r_mix) is gb.Err and r_mix.value.constraint_name == "direction_consistent"
+    )

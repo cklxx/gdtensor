@@ -185,7 +185,7 @@ def test_direct_chain_load_ok_under_cache_fault(cache_fault):
     src = Buf(np.arange(G, dtype=np.uint8))
     dsts = [Buf(np.zeros(G, np.uint8)) for _ in range(WORLD)]
     for rank in range(WORLD):
-        chain = gb.DirectDTensorsReadChain(
+        chain = gb.DirectDTensorsRWChain(
             src=_storage_view(src), dst=_compute_view(dsts[rank])
         )
         res = gio.chain_load(rank, chain)
@@ -201,9 +201,7 @@ def test_direct_chain_never_touches_cache_globals():
     src = Buf(np.arange(G, dtype=np.uint8))
     for rank in range(WORLD):
         dst = Buf(np.zeros(G, np.uint8))
-        chain = gb.DirectDTensorsReadChain(
-            src=_storage_view(src), dst=_compute_view(dst)
-        )
+        chain = gb.DirectDTensorsRWChain(src=_storage_view(src), dst=_compute_view(dst))
         res = gio.chain_load(rank, chain)
         assert type(res) is gb.Ok, res
     assert len(api._view_slots) == before, "direct chain created a cache table"
@@ -231,7 +229,7 @@ def test_concurrent_ranks_independent_under_fault(cache_fault):
 
     def worker(rank):
         try:
-            chain = gb.DirectDTensorsReadChain(
+            chain = gb.DirectDTensorsRWChain(
                 src=_storage_view(src), dst=_compute_view(dsts[rank])
             )
             res = gio.chain_load(rank, chain)
@@ -291,7 +289,7 @@ def test_direct_path_does_not_import_torch():
         "cdt=gb.NaiveDTensor(gb.GlobalTensorMeta([G],'U8',1),[gb.Shard(0)],"
         "gb.ArrangedMesh(gt.WorldSize(W)))\n"
         "cv=gb.ComputeDTensorsView([TID],gb.DTensorTable([gb.NamedDTensor(TID,cdt)]),dst)\n"
-        "ch=gb.DirectDTensorsReadChain(src=sv,dst=cv)\n"
+        "ch=gb.DirectDTensorsRWChain(src=sv,dst=cv)\n"
         "assert type(gio.chain_load(0,ch)) is gb.Ok\n"
         "assert bytes(dst.data[0:4])==bytes(np.arange(4,dtype=np.uint8))\n"
         "assert 'torch' not in sys.modules\n"

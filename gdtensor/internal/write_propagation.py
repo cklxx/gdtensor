@@ -1,14 +1,15 @@
-"""Node-level propagation plan for cached write chains.
+"""Node-level propagation plan for cached RW write chains (spatial: Shard).
 
-Mirrors propagation.py for compute -> cache -> storage writes: per-rank
-compute supplies coalesce along contiguous byte intervals inside node-local
-cache segments, and flush to storage (or a parent convergence cache layer) once
-every contributing producer piece has staged. Budget, traffic, and admission
-share one plan definition.
+For ``Compute -> first_cache -> second_cache -> Storage`` writes, every cache
+layer partitions tensors across its nodes via ``spatial: Shard``. Compute
+supplies from designated writers route directly to the cache nodes owning
+each byte interval, coalesce along contiguous (step, concurrency) cells, and
+converge through downstream Shard layers before flushing to storage.
 """
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Tuple
 
@@ -47,7 +48,6 @@ from .propagation import (
     _split,
     _view_nodes,
     _view_width,
-    parent_map,
 )
 from .result import check_failed, invalid
 
@@ -65,7 +65,7 @@ class WriteSegment:
     # producer -> [(global_off, size)]; producer is ("rank", r) on layer 0
     # or ("seg", layer - 1, node, key) on layer > 0
     producers: dict = field(default_factory=dict)
-    # layer < last: [(dst_key, global_off, size)] on the target layer node
+    # layer < last: [(tnode, dst_key, global_off, size)] on the target layer
     children: list = field(default_factory=list)
     # layer == last: [(storage range, byte offset inside this segment)]
     storage: list = field(default_factory=list)
@@ -88,8 +88,7 @@ class WriteChainPlan:
     tids: List[List[str]]
     k: int
     layer_nodes: List[List[int]]
-    serve: Dict[int, int]
-    target: List[Dict[int, int]]
+    targets: List[Dict[int, Tuple[int, ...]]]
     ranks: List[int]
     segments: List[Dict[int, Dict[WriteSegKey, WriteSegment]]] = field(
         default_factory=list
@@ -103,44 +102,35 @@ class WriteChainPlan:
 
 
 def write_cache_layers(chain) -> list:
-    from .chain import OneLayerCachedDTensorsWriteChain
+    from .chain import OneLayerCachedDTensorsRWChain
 
-    if type(chain) is OneLayerCachedDTensorsWriteChain:
+    if type(chain) is OneLayerCachedDTensorsRWChain:
         return [chain.cache]
-    return [chain.big_cache, chain.small_cache]
-
-
-def _target_maps(layer_nodes: List[List[int]]) -> List[Dict[int, int]]:
-    out = [
-        parent_map(layer_nodes[layer], layer_nodes[layer + 1])
-        for layer in range(len(layer_nodes) - 1)
-    ]
-    out.append({})
-    return out
+    return [chain.first_cache, chain.second_cache]
 
 
 def build_write_chain_plan(chain, with_storage: bool = True) -> WriteChainPlan:
-    """Node-level write aggregation plan."""
+    """Node-level write aggregation plan with spatial Shard ownership routing."""
     k = chain.num_ranks_per_node
     if k <= 0:
         raise invalid("num_ranks_per_node", "must be positive")
     caches = write_cache_layers(chain)
     layer_nodes = [_view_nodes(view) for view in caches]
     ranks = _dst_ranks(chain.src)
-    serve = parent_map(sorted({r // k for r in ranks}), layer_nodes[0])
-    target = _target_maps(layer_nodes)
+    targets: List[Dict[int, Tuple[int, ...]]] = [
+        {n: () for n in nodes} for nodes in layer_nodes
+    ]
     plan = WriteChainPlan(
         [list(view.tensor_ids) for view in caches],
         k,
         layer_nodes,
-        serve,
-        target,
+        targets,
         ranks,
     )
     supplies = {rank: _rank_supplies(chain.src, rank) for rank in plan.ranks}
-    supply = _coalesce_supplies(plan, supplies)
+    total_supply = _total_supply(plan, supplies)
     side = _Side(chain.dst) if with_storage else None
-    _build_write_segments(plan, caches, supply, side)
+    _build_write_segments(plan, caches, total_supply, side)
     plan.budget = [
         {n: _write_budget(view, segs) for n, segs in plan.segments[layer].items()}
         for layer, view in enumerate(caches)
@@ -156,20 +146,17 @@ def build_write_chain_plan(chain, with_storage: bool = True) -> WriteChainPlan:
     return plan
 
 
-def _build_write_segments(plan: WriteChainPlan, caches: list, supply, side) -> None:
+def _build_write_segments(
+    plan: WriteChainPlan, caches: list, total_supply: Dict[str, np.ndarray], side
+) -> None:
     last = len(caches) - 1
     plan.segments = [{} for _ in caches]
     for layer in range(last, -1, -1):
         view = caches[layer]
+        cuts = _write_cuts(plan, side, layer, last)
         plan.segments[layer] = {
-            n: _layer_write_segments(
-                view,
-                layer,
-                n,
-                supply[layer][n],
-                _write_cuts(plan, side, layer, n, last),
-            )
-            for n in supply[layer]
+            n: _layer_write_segments(view, layer, n, total_supply, cuts)
+            for n in plan.layer_nodes[layer]
         }
 
 
@@ -197,47 +184,33 @@ def _rank_supplies(src, rank: int) -> Dict[str, np.ndarray]:
     return supplies
 
 
-def _coalesce_supplies(
+def _total_supply(
     plan: WriteChainPlan, supplies: Dict[int, Dict[str, np.ndarray]]
-):
-    pending = [{n: {} for n in nodes} for nodes in plan.layer_nodes]
+) -> Dict[str, np.ndarray]:
+    pending: Dict[str, list] = {}
     for rank in plan.ranks:
-        node_pending = pending[0][plan.serve[rank // plan.k]]
         _ = [
-            node_pending.setdefault(tid, []).append(iv)
-            for tid, iv in supplies[rank].items()
+            pending.setdefault(tid, []).append(iv) for tid, iv in supplies[rank].items()
         ]
-    supply = [{} for _ in plan.tids]
-    last = len(plan.tids) - 1
-    for layer in range(len(plan.tids)):
-        supply[layer] = {
-            node: _merge_pending(node_pending)
-            for node, node_pending in pending[layer].items()
-        }
-        if layer < last:
-            _propagate_pending(plan, supply, pending, layer)
-    return supply
+    return _merge_pending(pending)
 
 
-def _propagate_pending(plan: WriteChainPlan, supply, pending, layer: int) -> None:
-    for node, have in supply[layer].items():
-        t_pending = pending[layer + 1][plan.target[layer][node]]
-        _ = [t_pending.setdefault(tid, []).append(iv) for tid, iv in have.items()]
-
-
-def _write_cuts(
-    plan: WriteChainPlan, side, layer: int, node: int, last: int
-) -> Dict[str, set]:
+def _write_cuts(plan: WriteChainPlan, side, layer: int, last: int) -> Dict[str, set]:
     cuts: Dict[str, set] = {}
     if layer < last:
-        for seg in plan.segments[layer + 1][plan.target[layer][node]].values():
-            cuts.setdefault(seg.tid, set()).update((seg.off, seg.off + seg.size))
+        for segs in plan.segments[layer + 1].values():
+            _add_segment_cuts(segs.values(), cuts)
         return cuts
     if side is None:
         return cuts
     for tid in plan.tids[last]:
         _add_storage_cuts(side, tid, cuts)
     return cuts
+
+
+def _add_segment_cuts(segs, cuts: Dict[str, set]) -> None:
+    for seg in segs:
+        cuts.setdefault(seg.tid, set()).update((seg.off, seg.off + seg.size))
 
 
 def _add_storage_cuts(side, tid: str, cuts: Dict[str, set]) -> None:
@@ -328,7 +301,7 @@ def _assign_seg_storage(side, seg: WriteSegment, by_raw: Dict[str, list]) -> Non
             )
 
 
-def _validate_write_storage(side, dst, by_raw: Dict[str, list]) -> None:
+def _validate_write_storage(side, _dst, by_raw: Dict[str, list]) -> None:
     index = side.index
     for path, pairs in by_raw.items():
         if path not in index.files:
@@ -339,20 +312,33 @@ def _validate_write_storage(side, dst, by_raw: Dict[str, list]) -> None:
         _assert_disjoint(iv, f"storage {path}", CHECK)
 
 
-def _write_cover(index, tid: str, off: int, size: int, producer) -> list:
-    from bisect import bisect_right
+def _write_by_tid_all(
+    nodes_map: Dict[int, Dict[WriteSegKey, WriteSegment]],
+) -> Dict[str, tuple]:
+    grouped: Dict[str, List[Tuple[int, WriteSegment]]] = {}
+    for node, segs in nodes_map.items():
+        for seg in segs.values():
+            grouped.setdefault(seg.tid, []).append((node, seg))
+    for items in grouped.values():
+        items.sort(key=lambda item: (item[1].off, item[0]))
+    return {
+        tid: (items, [seg.off for _node, seg in items])
+        for tid, items in grouped.items()
+    }
 
+
+def _write_cover_all(index, tid: str, off: int, size: int, producer) -> list:
     end, pieces = off + size, []
-    segments, starts = index.get(tid, ((), ()))
+    items, starts = index.get(tid, ((), ()))
     start = max(0, bisect_right(starts, off) - 1)
-    for seg in segments[start:]:
+    for node, seg in items[start:]:
         if seg.off >= end:
             break
         a, b = max(off, seg.off), min(end, seg.off + seg.size)
         if b > a:
-            pieces.append((seg.key, a, b - a))
+            pieces.append((node, seg.key, a, b - a))
             seg.producers.setdefault(producer, []).append((a, b - a))
-    if sum(p[2] for p in pieces) != size:
+    if sum(p[3] for p in pieces) != size:
         raise check_failed(CHECK, f"write_chain {tid}@{off}+{size}: downstream gap")
     return pieces
 
@@ -365,34 +351,24 @@ def _write_budget(view, segs: Dict[WriteSegKey, WriteSegment]) -> int:
     return sum(sorted(cells.values(), reverse=True)[: _view_width(view)])
 
 
-def _write_by_tid(segs: Dict[WriteSegKey, WriteSegment]) -> Dict[str, tuple]:
-    grouped: Dict[str, List[WriteSegment]] = {}
-    for seg in sorted(segs.values(), key=lambda s: s.off):
-        grouped.setdefault(seg.tid, []).append(seg)
-    return {
-        tid: (segments, [seg.off for seg in segments])
-        for tid, segments in grouped.items()
-    }
-
-
 def _link_write_children(plan: WriteChainPlan, layer: int) -> None:
+    index = _write_by_tid_all(plan.segments[layer + 1])
     for node, segs in plan.segments[layer].items():
-        index = _write_by_tid(plan.segments[layer + 1][plan.target[layer][node]])
+        tnodes: set = set()
         for seg in segs.values():
             producer = ("seg", layer, node, seg.key)
-            seg.children = _write_cover(index, seg.tid, seg.off, seg.size, producer)
+            seg.children = _write_cover_all(index, seg.tid, seg.off, seg.size, producer)
+            tnodes.update(tn for tn, _tk, _o, _sz in seg.children)
+        plan.targets[layer][node] = tuple(sorted(tnodes))
 
 
 def _link_stages(plan: WriteChainPlan, src, supplies) -> None:
-    indices = {
-        node: _write_by_tid(segments) for node, segments in plan.segments[0].items()
-    }
+    index = _write_by_tid_all(plan.segments[0])
     for rank in plan.ranks:
-        node = plan.serve[rank // plan.k]
         plan.stages[rank] = [
-            (node, key, off, size)
+            piece
             for tid, iv in supplies[rank].items()
-            for key, off, size in _rank_stage_pieces(indices[node], src, tid, iv, rank)
+            for piece in _rank_stage_pieces(index, src, tid, iv, rank)
         ]
 
 
@@ -401,7 +377,7 @@ def _rank_stage_pieces(index, src, tid: str, iv, rank: int) -> list:
     pieces = []
     for a, b in iv:
         pieces.extend(
-            _write_cover(index, tid, int(a) * isz, int(b - a) * isz, ("rank", rank))
+            _write_cover_all(index, tid, int(a) * isz, int(b - a) * isz, ("rank", rank))
         )
     return pieces
 
@@ -410,7 +386,7 @@ def _producer_ranks(plan: WriteChainPlan) -> Dict[tuple, set]:
     out: Dict[tuple, set] = {}
     for layer, nodes in enumerate(plan.segments):
         for node, segs in nodes.items():
-            _collect_layer_producers(plan, out, layer, node, segs)
+            _collect_layer_producers(out, layer, node, segs)
     return out
 
 
@@ -420,9 +396,7 @@ def _producer_rank_set(producer: tuple, out: dict, layer: int) -> set:
     return out[(layer - 1, producer[2], producer[3])]
 
 
-def _collect_layer_producers(
-    plan: WriteChainPlan, out: dict, layer: int, node: int, segs: dict
-) -> None:
+def _collect_layer_producers(out: dict, layer: int, node: int, segs: dict) -> None:
     for key, seg in segs.items():
         ranks: set = set()
         for producer in seg.producers:
@@ -441,9 +415,8 @@ def _downstream_closure(plan: WriteChainPlan, todo: list) -> set:
         layer, node, key = item
         if layer >= last:
             continue
-        tnode = plan.target[layer][node]
         seg = plan.segments[layer][node][key]
-        todo.extend((layer + 1, tnode, tkey) for tkey, _o, _s in seg.children)
+        todo.extend((layer + 1, tn, tk) for tn, tk, _o, _s in seg.children)
     return seen
 
 
@@ -503,7 +476,7 @@ def _flush_pairs(plan: WriteChainPlan, layer: int, seg: WriteSegment) -> list:
         ]
     return [
         (_crange(seg.tid, off, size), _crange(seg.tid, off, size))
-        for _tkey, off, size in seg.children
+        for _tnode, _tkey, off, size in seg.children
     ]
 
 
@@ -536,7 +509,7 @@ def plan_write_mem(plan: WriteChainPlan) -> Dict[int, int]:
 def plan_write_traffic(plan: WriteChainPlan) -> Tuple[Dict[int, int], Dict[int, int]]:
     """(inbound, outbound) bytes per node across compute->cache, cache->cache, cache->storage."""
     nodes = {n for layer in plan.layer_nodes for n in layer}
-    nodes.update(plan.serve)
+    nodes.update(r // plan.k for r in plan.ranks)
     inbound = {n: 0 for n in nodes}
     outbound = {n: 0 for n in nodes}
     for rank, pieces in plan.stages.items():
@@ -555,11 +528,17 @@ def _stage_traffic(rank_node: int, pieces, inbound, outbound) -> None:
 
 def _write_edge_traffic(plan: WriteChainPlan, layer: int, inbound, outbound) -> None:
     for node, segs in plan.segments[layer].items():
-        tnode = plan.target[layer][node]
-        for seg in segs.values():
-            actor = plan.flush_ranks[(layer, node, seg.key)][0] // plan.k
-            _hop(node, actor, seg.size, inbound, outbound)
-            _hop(actor, tnode, seg.size, inbound, outbound)
+        _node_edge_traffic(plan, layer, node, segs, inbound, outbound)
+
+
+def _node_edge_traffic(
+    plan: WriteChainPlan, layer: int, node: int, segs, inbound, outbound
+) -> None:
+    for seg in segs.values():
+        actor = plan.flush_ranks[(layer, node, seg.key)][0] // plan.k
+        for tnode, _tkey, _off, size in seg.children:
+            _hop(node, actor, size, inbound, outbound)
+            _hop(actor, tnode, size, inbound, outbound)
 
 
 def _terminal_write_traffic(plan: WriteChainPlan, last: int, inbound, outbound) -> None:

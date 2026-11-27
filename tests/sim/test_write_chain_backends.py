@@ -53,18 +53,21 @@ class _DummyDevice:
         pass
 
 
-def _cache_view_for(ct: gb.DTensorTable, acc, steps: int, nodes: list[int], width: int):
+def _cache_view_for(
+    ct: gb.DTensorTable, acc, steps: int, nodes: list[int], width: int, spatial_pl=None
+):
     mesh = gb.StCacheOuterProductMesh(
         temporal=gb.ArrangedMesh(gt.NumSteps(steps)),
         spatial=gb.LiteralMesh(list(nodes), gt.NumNodes(max(nodes) + 1)),
         concurrency=gb.ArrangedMesh(gt.ConcurrencyWidth(width)),
     )
+    spatial = gb.Shard(0) if spatial_pl is None else spatial_pl
     named = [
         gb.NamedDTensor(
             nd.global_tensor_id,
             gb.NaiveDTensor(
                 gb.global_tensor_meta_of(nd),
-                [gb.Shard(0), gb.Replicate(), gb.Shard(0)],
+                [gb.Shard(0), spatial, gb.Shard(0)],
                 mesh,
             ),
         )
@@ -324,7 +327,7 @@ def test_2d_col_sharded_chain_save_coalesces_pwrite_syscalls(
             ct,
             _ClusterRankFabric(cluster, source),
         )
-        chain = gb.OneLayerCachedDTensorsWriteChain(
+        chain = gb.OneLayerCachedDTensorsRWChain(
             src=cv,
             cache=_cache_view_for(ct, cache, steps=1, nodes=[0, 1], width=1),
             dst=cached_sv,
@@ -378,10 +381,10 @@ def test_2d_col_sharded_chain_save_coalesces_pwrite_syscalls(
             ct,
             _ClusterRankFabric(cluster2, source),
         )
-        chain2 = gb.TwoLayerCachedDTensorsWriteChain(
+        chain2 = gb.TwoLayerCachedDTensorsRWChain(
             src=cv2,
-            big_cache=_cache_view_for(ct, big_c, steps=1, nodes=[0, 1], width=1),
-            small_cache=_cache_view_for(ct, small_c, steps=1, nodes=[0], width=1),
+            first_cache=_cache_view_for(ct, big_c, steps=1, nodes=[0, 1], width=1),
+            second_cache=_cache_view_for(ct, small_c, steps=1, nodes=[0], width=1),
             dst=two_sv,
             num_ranks_per_node=k,
         )
@@ -491,7 +494,7 @@ def _run_delayed_leader_sdk_check(tmp_path: Path) -> None:
     )
     try:
         cv = gb.ComputeDTensorsView(["a"], ct, _ClusterRankFabric(cluster, source))
-        chain = gb.OneLayerCachedDTensorsWriteChain(
+        chain = gb.OneLayerCachedDTensorsRWChain(
             src=cv,
             cache=_cache_view_for(ct, cache, steps=1, nodes=[0], width=1),
             dst=sv_delayed,
@@ -525,16 +528,16 @@ class _ClusterRankFabric(ga.DTensorDataAccessor):
 
 def _make_write_chain(ct, cv, w0, w1, sv, *, layers: int, k: int):
     if layers == 1:
-        return gb.OneLayerCachedDTensorsWriteChain(
+        return gb.OneLayerCachedDTensorsRWChain(
             src=cv,
             cache=_cache_view_for(ct, w0, steps=2, nodes=[0, 1], width=1),
             dst=sv,
             num_ranks_per_node=k,
         )
-    return gb.TwoLayerCachedDTensorsWriteChain(
+    return gb.TwoLayerCachedDTensorsRWChain(
         src=cv,
-        big_cache=_cache_view_for(ct, w0, steps=2, nodes=[0, 1], width=1),
-        small_cache=_cache_view_for(ct, w1, steps=2, nodes=[0], width=1),
+        first_cache=_cache_view_for(ct, w0, steps=2, nodes=[0, 1], width=1),
+        second_cache=_cache_view_for(ct, w1, steps=2, nodes=[0], width=1),
         dst=sv,
         num_ranks_per_node=k,
     )
@@ -573,17 +576,23 @@ def _verify_chain_load_roundtrip(
     )
     try:
         if layers == 1:
-            rchain = gb.OneLayerCachedDTensorsReadChain(
+            rchain = gb.OneLayerCachedDTensorsRWChain(
                 src=reader,
-                cache=_cache_view_for(ct, r0, steps=2, nodes=[0, 1], width=1),
+                cache=_cache_view_for(
+                    ct, r0, steps=2, nodes=[0, 1], width=1, spatial_pl=gb.Replicate()
+                ),
                 dst=dst,
                 num_ranks_per_node=k,
             )
         else:
-            rchain = gb.TwoLayerCachedDTensorsReadChain(
+            rchain = gb.TwoLayerCachedDTensorsRWChain(
                 src=reader,
-                small_cache=_cache_view_for(ct, r1, steps=2, nodes=[0], width=1),
-                big_cache=_cache_view_for(ct, r0, steps=2, nodes=[0, 1], width=1),
+                first_cache=_cache_view_for(
+                    ct, r1, steps=2, nodes=[0], width=1, spatial_pl=gb.Replicate()
+                ),
+                second_cache=_cache_view_for(
+                    ct, r0, steps=2, nodes=[0, 1], width=1, spatial_pl=gb.Replicate()
+                ),
                 dst=dst,
                 num_ranks_per_node=k,
             )

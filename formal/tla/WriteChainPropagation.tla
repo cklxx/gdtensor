@@ -6,11 +6,11 @@
    Bounded projection, not a proof of the Python runtime. Dual two-layer
    fan-in instance to CachePropagation.tla:
 
-     layer 0 (big_cache)   : nodes 1 and 2, each with one 4-byte segment
-                             staged by local compute rank ("b" on 1, "c" on 2)
-     layer 1 (small_cache) : convergence node 0 with one 8-byte segment "a",
-                             consuming edge pieces <<1, 0, 4>> and <<2, 4, 4>>
-                             and flushing to storage once all producers stage.
+     layer 0 (first_cache, spatial: Shard)  : nodes 1 and 2, each with one 4-byte
+                              segment staged by local compute rank ("b" on 1, "c" on 2)
+     layer 1 (second_cache, spatial: Shard) : convergence node 0 with one 8-byte
+                              segment "a", consuming edge pieces <<1, 0, 4>> and
+                              <<2, 4, 4>> and flushing to storage once all producers stage.
 
    Segment state: "gone" | "admitted" | "ready" | "flushing" | "done" | "error".
    res[n]     = resident bytes on node n (`admitted`, `ready`, or `flushing`).

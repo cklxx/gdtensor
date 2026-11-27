@@ -265,7 +265,7 @@ def test_world4_k2_per_node_crossnode_bytes_match_stats():
         cache,
     )
 
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     assert type(chain.check_constraints()) is gb.Ok
@@ -310,7 +310,7 @@ def test_multitensor_peak_live_from_allocator_not_writes():
         ),
         cache,
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     for rank in range(world):
@@ -341,7 +341,7 @@ def test_slot_steps_not_equal_nodes():
         _cache_dt(["w"], [6], [gb.Shard(0), gb.Replicate(), gb.Shard(0)], 3, [0, 1], 1),
         cache,
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     for rank in range(world):
@@ -370,7 +370,7 @@ def test_delayed_read_callback_blocks_advance():
         _cache_dt(["w"], [8], [gb.Shard(0), gb.Replicate(), gb.Shard(0)], 2, [0, 1], 1),
         cache,
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
 
@@ -409,7 +409,7 @@ def test_mixed_a_bytes_same_error_and_lifecycle():
     events = []
     src_a = LiveMemory(np.arange(4, dtype=np.uint8), events, "src_a")
     dst_a = LiveMemory(np.zeros(4, dtype=np.uint8), events, "dst_a")
-    direct = gb.DirectDTensorsReadChain(
+    direct = gb.DirectDTensorsRWChain(
         src=_storage_view(src_a, ["a"], [4], events, world),
         dst=_compute_view(dst_a, ["a"], [4], world),
     )
@@ -418,7 +418,7 @@ def test_mixed_a_bytes_same_error_and_lifecycle():
     src_b.error_on_call = 1
     dst_b = LiveMemory(np.zeros(4, dtype=np.uint8), events, "dst_b")
     cache_b = ResidentCache(events, 1)
-    one = gb.OneLayerCachedDTensorsReadChain(
+    one = gb.OneLayerCachedDTensorsRWChain(
         src=_storage_view(src_b, ["b"], [4], events, world),
         cache=gb.CacheDTensorsView(
             ["b"],
@@ -430,10 +430,10 @@ def test_mixed_a_bytes_same_error_and_lifecycle():
         dst=_compute_view(dst_b, ["b"], [4], world),
         num_ranks_per_node=1,
     )
-    mixed = gb.MixedDTensorsReadChain(
+    mixed = gb.MixedDTensorsRWChain(
         [
-            gb.DisjointTensorIdsAndReadChain(["a"], direct),
-            gb.DisjointTensorIdsAndReadChain(["b"], one),
+            gb.DisjointTensorIdsAndRWChain(["a"], direct),
+            gb.DisjointTensorIdsAndRWChain(["b"], one),
         ]
     )
     assert type(gio.chain_load(0, mixed)) is gb.Ok
@@ -461,7 +461,7 @@ def _chain_w(world=2, k=1, events=None, src_mem=None, dst_mem=None):
         _cache_dt(["w"], [8], [gb.Shard(0), gb.Replicate(), gb.Shard(0)], 2, [0, 1], 1),
         cache,
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     return chain, src, cache, dst
@@ -515,7 +515,7 @@ def test_failure_cancel_frees_partially_written_slots():
     boom = gb.GDTensorIOError(operation="disk", msg="cancel-fault")
     dst = LiveMemory(np.zeros(8, dtype=np.uint8), events, "dst", error=boom)
     dst.write_error_on_call = 0
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_storage_view(src, ["w"], [8], events, world),
         cache=gb.CacheDTensorsView(
             ["w"],
@@ -548,7 +548,7 @@ def test_node_shared_fill_dedup_and_per_consumer_bytes():
     src = LiveMemory(np.arange(8, dtype=np.uint8), events, "src")
     cache = ResidentCache(events, k)
     dst = LiveMemory(np.zeros(8, dtype=np.uint8), events, "dst")
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_storage_view(src, ["w"], [8], events, world),
         cache=gb.CacheDTensorsView(
             ["w"],
@@ -583,7 +583,7 @@ def _chain_w_c1(events, src=None, dst=None, width=1):
     dst = LiveMemory(
         dst if dst is not None else np.zeros(8, dtype=np.uint8), events, "dst"
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_storage_view(src, ["w"], [8], events, 2),
         cache=gb.CacheDTensorsView(
             ["w"],
@@ -632,7 +632,7 @@ def test_node_isolation_same_offset_not_shared_across_nodes():
     src = LiveMemory(np.arange(4, dtype=np.uint8), events, "src")
     cache = ResidentCache(events, 2)
     dst = LiveMemory(np.zeros(4, dtype=np.uint8), events, "dst")
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_storage_view(src, ["w"], [4], events, 4),
         cache=gb.CacheDTensorsView(
             ["w"],
@@ -668,7 +668,7 @@ def test_fill_failure_notifies_all_waiters_same_error_no_retry():
     src.error_on_call = 0
     cache = ResidentCache(events, 2)
     dst = LiveMemory(np.zeros(8, dtype=np.uint8), events, "dst")
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_storage_view(src, ["w"], [8], events, 2),
         cache=gb.CacheDTensorsView(
             ["w"],
@@ -714,7 +714,7 @@ def _run_capacity_case(rows, S, C):
         ),
         cache,
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=1
     )
     for rank in range(2):
@@ -773,7 +773,7 @@ def test_replicate_two_consumers_both_must_ack_before_release():
         _cache_dt(["w"], [4], [gb.Shard(0), gb.Replicate(), gb.Shard(0)], 1, [0], 1),
         cache,
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=2
     )
     # Declared schema: both ranks must read full 4B (Replicate cohort).
@@ -825,7 +825,7 @@ def test_same_key_fill_fail_then_next_generation_succeeds():
         _cache_dt(["w"], [8], [gb.Shard(0), gb.Replicate(), gb.Shard(0)], 2, [0], 1),
         cache,
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=2
     )
     box = {}

@@ -115,11 +115,11 @@ class ChainPlan:
 
 
 def cache_layers(chain) -> list:
-    from .chain import OneLayerCachedDTensorsReadChain
+    from .chain import OneLayerCachedDTensorsRWChain
 
-    if type(chain) is OneLayerCachedDTensorsReadChain:
+    if type(chain) is OneLayerCachedDTensorsRWChain:
         return [chain.cache]
-    return [chain.small_cache, chain.big_cache]
+    return [chain.first_cache, chain.second_cache]
 
 
 def build_chain_plan(chain, with_storage: bool = True) -> ChainPlan:

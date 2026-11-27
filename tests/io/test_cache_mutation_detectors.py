@@ -73,7 +73,7 @@ def _chain(root, names, exclusive, steps=1):
     cache = FileCache(root / "cache", expected)
     dst = ArrayFabric(table, points)
     stored = make_storage_view(names, st, layout, str(root / "checkpoint"))
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         stored, cache_view(names, cache, steps=steps), dst.view(0), num_ranks_per_node=2
     )
     return chain, dst, cache, values
@@ -87,7 +87,7 @@ def _points(rank, i, exclusive):
 
 def _run(chain, dst, cache, rank):
     cache.rank = rank
-    concrete = gb.OneLayerCachedDTensorsReadChain(
+    concrete = gb.OneLayerCachedDTensorsRWChain(
         chain.src, chain.cache, dst.view(rank), num_ranks_per_node=2
     )
     return gio.chain_load(rank, concrete)

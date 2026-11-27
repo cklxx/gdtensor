@@ -1985,15 +1985,17 @@ def _run_cached(rank: int, chain, storage_session_view, identity) -> None:
 def _run_one_concrete(rank: int, chain) -> None:
     """Open and finish one load session for one concrete chain (design 5.8:
     each Mixed segment has its own source session)."""
-    from .chain import DirectDTensorsReadChain, rank_direct_plan
+    from .chain import DirectDTensorsRWChain, concrete_direction, rank_direct_plan
 
     storage = chain.src
     if type(storage) is not StorageDTensorsView or storage.begin_load is None:
         raise invalid("read_chain", "chain src must be a StorageDTensorsView")
+    if concrete_direction(chain) != "read":
+        raise invalid(
+            "rw_chain", "chain_load requires a read-direction DTensorsRWChain"
+        )
     plan = (
-        rank_direct_plan(rank, chain)
-        if type(chain) is DirectDTensorsReadChain
-        else None
+        rank_direct_plan(rank, chain) if type(chain) is DirectDTensorsRWChain else None
     )
     _LOG.info("chain_load rank=%d phase=begin concrete", rank)
     session = must_ok(storage.begin_load(storage, rank))
@@ -2018,8 +2020,15 @@ def _run_one_concrete(rank: int, chain) -> None:
 
 
 @catch
-def d_tensors_view_rank_chain_load(rank: int, read_chain) -> Result[None]:
-    from .chain import concrete_chains
+def d_tensors_view_rank_chain_load(rank: int, rw_chain) -> Result[None]:
+    from .chain import chain_direction, concrete_chains, is_rw_chain
 
-    for chain in concrete_chains(read_chain):
+    if not is_rw_chain(rw_chain):
+        raise invalid("rw_chain", f"unknown chain type {type(rw_chain).__name__}")
+    d = chain_direction(rw_chain)
+    if d == "write":
+        raise invalid(
+            "rw_chain", "chain_load requires a read-direction DTensorsRWChain"
+        )
+    for chain in concrete_chains(rw_chain):
         _run_one_concrete(rank, chain)

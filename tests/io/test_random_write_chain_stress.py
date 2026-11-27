@@ -1,7 +1,7 @@
 """Randomized stress for the co-located cache write chain (`gio.chain_save`).
 
 Each seed draws a legal compute -> cache -> storage deployment: ranks per node,
-node count, 1 or 2 cache layers (`big_cache`, then optional `small_cache`), cache
+node count, 1 or 2 cache layers (`first_cache`, then optional `second_cache`), cache
 node subsets, temporal steps, concurrency width, 1..3 tensors with non-divisible
 sizes, mixed dtypes (`U8`, `I32`), 1D and 2D compute placements (`Shard`,
 `Replicate`), `file`/`thread` coordinator, start order/delay, NIC bandwidth, and
@@ -392,7 +392,7 @@ def _cache_view(acc, tids, specs, steps, nodes, width):
                 tid,
                 gb.NaiveDTensor(
                     gb.GlobalTensorMeta(spec["shape"], spec["dtype"], spec["itemsize"]),
-                    [gb.Shard(0), gb.Replicate(), gb.Shard(0)],
+                    [gb.Shard(0), gb.Shard(0), gb.Shard(0)],
                     mesh,
                 ),
             )
@@ -446,10 +446,10 @@ def _build(case: dict[str, Any]) -> dict[str, Any]:
         num_ranks_per_node=case["k"],
     )
     chain = (
-        gb.OneLayerCachedDTensorsWriteChain(cache=views[0], **common)
+        gb.OneLayerCachedDTensorsRWChain(cache=views[0], **common)
         if len(views) == 1
-        else gb.TwoLayerCachedDTensorsWriteChain(
-            big_cache=views[0], small_cache=views[1], **common
+        else gb.TwoLayerCachedDTensorsRWChain(
+            first_cache=views[0], second_cache=views[1], **common
         )
     )
     return dict(
@@ -466,26 +466,38 @@ def _build(case: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _node_shard_mask(
+    spec: dict[str, Any], steps: int, nodes: list[int], idx: int
+) -> np.ndarray:
+    shape, itemsize = spec["shape"], spec["itemsize"]
+    nbytes = int(np.prod(shape)) * itemsize
+    mask = np.zeros(nbytes, dtype=bool)
+    view = mask.reshape(*shape, itemsize)
+    rest = (slice(None),) * len(shape)
+    for step in range(steps):
+        t_lo, t_hi = _chunk(shape[0], steps, step)
+        s_lo, s_hi = _chunk(t_hi - t_lo, len(nodes), idx)
+        view[(slice(t_lo + s_lo, t_lo + s_hi),) + rest] = True
+    return mask
+
+
 def _supply_oracle(case: dict[str, Any], built: dict[str, Any]) -> list[dict]:
-    layers, sizes = case["layers"], built["sizes"]
-    serve = parent_of(list(range(case["nodes"])), layers[0])
-    first = {
-        n: {tid: np.zeros(sz, bool) for tid, sz in sizes.items()} for n in layers[0]
-    }
-    for rank in range(built["world"]):
-        node = serve[rank // case["k"]]
-        for tid, mask in built["owned"][rank].items():
-            first[node][tid] |= mask
-    if len(layers) == 1:
-        return [first]
-    up = parent_of(layers[0], layers[1])
-    second = {
-        n: {tid: np.zeros(sz, bool) for tid, sz in sizes.items()} for n in layers[1]
-    }
-    for child, have in first.items():
-        for tid, mask in have.items():
-            second[up[child]][tid] |= mask
-    return [first, second]
+    tids = [f"t{i}" for i in range(len(case["tensors"]))]
+    total = {tid: np.zeros(sz, bool) for tid, sz in built["sizes"].items()}
+    for mask_map in built["owned"].values():
+        for tid, mask in mask_map.items():
+            total[tid] |= mask
+    out = []
+    for nodes, steps in zip(case["layers"], case["steps"]):
+        layer_supply = {
+            node: {
+                tid: total[tid] & _node_shard_mask(spec, steps, nodes, idx)
+                for tid, spec in zip(tids, case["tensors"])
+            }
+            for idx, node in enumerate(nodes)
+        }
+        out.append(layer_supply)
+    return out
 
 
 # ---------------------------------------------------------------- run + check
@@ -617,19 +629,24 @@ def _check_budget_and_released(case, built, peaks, generation) -> None:
     )
 
 
-def _check_fanin(case, built) -> None:
-    """Verify 2-layer L0 -> L1 fan-in structure from observed transfers."""
+def _check_fanin(case, built, supply) -> None:
+    """Verify 2-layer L0 -> L1 spatial-Shard fan-in structure from observed transfers."""
     l0, l1 = case["layers"]
     assert l0 == list(range(case["nodes"])) and len(l1) < len(l0)
-    targets_by_l0: dict[int, set[int]] = {}
-    for actor, target, _tid, _off, _sz in built["caches"][1].fills:
-        assert actor in l0 and target in l1, (actor, target, case)
-        targets_by_l0.setdefault(actor, set()).add(target)
-    assert set(targets_by_l0) == set(l0), (targets_by_l0, case)
-    assert all(len(ts) == 1 for ts in targets_by_l0.values()), (targets_by_l0, case)
-    by_parent: dict[int, list[int]] = {}
-    for child, ts in targets_by_l0.items():
-        by_parent.setdefault(next(iter(ts)), []).append(child)
+    want_edges = {
+        (n0, n1)
+        for n0 in l0
+        for n1 in l1
+        if any(
+            (supply[0][n0][tid] & supply[1][n1][tid]).any() for tid in built["sizes"]
+        )
+    }
+    edges = {(actor, target) for actor, target, *_ in built["caches"][1].fills}
+    assert all(actor in l0 and target in l1 for actor, target in edges), (edges, case)
+    assert edges == want_edges, (edges, want_edges, case)
+    by_parent: dict[int, set[int]] = {}
+    for child, target in edges:
+        by_parent.setdefault(target, set()).add(child)
     assert set(by_parent) == set(l1) and max(len(v) for v in by_parent.values()) >= 2
 
 
@@ -662,7 +679,7 @@ def _verify_case(case, tmp_path, monkeypatch, check_fanin: bool = False) -> None
         _check_traffic(case, built)
         _check_budget_and_released(case, built, peaks, gen)
         if check_fanin:
-            _check_fanin(case, built)
+            _check_fanin(case, built, supply)
 
 
 # ---------------------------------------------------------------- tests

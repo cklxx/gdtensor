@@ -197,7 +197,7 @@ def _cache_view(acc, tids, shapes, steps=1, nodes=None, width=1):
                 tid,
                 gb.NaiveDTensor(
                     gb.GlobalTensorMeta(shapes[tid], "U8", 1),
-                    [gb.Shard(0), gb.Replicate(), gb.Shard(0)],
+                    [gb.Shard(0), gb.Shard(0), gb.Shard(0)],
                     mesh,
                 ),
             )
@@ -347,7 +347,7 @@ def _mp_worker(
         sv = _single_file_safetensors_storage(
             ["w"], shapes, world, ckpt_dir, FileIO(), _FileVote(vote_dir, world)
         )
-        chain = gb.OneLayerCachedDTensorsWriteChain(
+        chain = gb.OneLayerCachedDTensorsRWChain(
             src=cv,
             cache=_cache_view(cache, ["w"], shapes),
             dst=sv,
@@ -421,7 +421,7 @@ def test_implicit_vs_explicit_namespace_across_fork(tmp_path: Path, explicit: bo
     cache = _ProcessWriteCache(str(tmp_path / "c"), {"w": 8}, explicit=explicit)
     src = _ArrayCompute({"w": np.arange(8, dtype=np.uint8)})
     dst = _MemStorage(8)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(src, ["w"], shapes, 2),
         cache=_cache_view(cache, ["w"], shapes),
         dst=_mem_storage_view(dst, ["w"], shapes, 2),
@@ -464,7 +464,7 @@ def test_peer_crash_during_stage_raises_cache_peer_down(tmp_path: Path, monkeypa
     shapes = {"w": [8]}
     cache = NodeCache(cluster, {"w": 8}, lambda _r: 0)
     cache.namespace = "peer-crash-stage"
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(
             _ArrayCompute({"w": np.arange(8, dtype=np.uint8)}), ["w"], shapes, 2
         ),
@@ -538,7 +538,7 @@ def test_peer_crash_during_cohort_wait_raises_cache_peer_down(monkeypatch):
     shapes = {"w": [12]}
     cache = NodeCache(cluster, {"w": 12}, lambda _r: 0)
     cache.namespace = "peer-crash-cohort"
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(
             _ArrayCompute({"w": np.arange(12, dtype=np.uint8)}), ["w"], shapes, 3
         ),
@@ -607,7 +607,7 @@ def test_fork_safety_with_held_locks_and_pending_fingerprint(
     monkeypatch.setenv("GDTENSOR_CACHE_COORDINATOR", "thread")
     shapes = {"w": [8]}
     cache = NodeCache(Cluster(1, 2), {"w": 8}, lambda _r: 0)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(
             _ArrayCompute({"w": np.arange(8, dtype=np.uint8)}), ["w"], shapes, 2
         ),
@@ -688,7 +688,7 @@ def test_corrupt_write_coordinator_state_rejected(tmp_path: Path, mode: str):
     cluster = Cluster(1, 2)
     shapes = {"w": [8]}
     cache = NodeCache(cluster, {"w": 8}, lambda _r: 0)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(
             _ArrayCompute({"w": np.arange(8, dtype=np.uint8)}), ["w"], shapes, 2
         ),
@@ -738,7 +738,7 @@ def test_interrupted_error_commit_keeps_owner_and_peer_gets_peer_down():
     def bad_src(*_args):
         raise OSError(errno.EIO, "original stage failure")
 
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(
             _ArrayCompute({"w": np.arange(8, dtype=np.uint8)}, bad_src),
             ["w"],
@@ -822,7 +822,7 @@ def test_disk_node_cache_tamper_aborts_chain_save(
         return orig_read(rng, cb)
 
     monkeypatch.setattr(cache, "read_to_buffer", tamper_once)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(
             _ArrayCompute({"w": np.arange(16, dtype=np.uint8)}),
             ["w"],
@@ -860,15 +860,15 @@ def test_two_layer_upstream_failure_propagates_to_downstream_waiter(monkeypatch)
         if cluster.rank == 0:
             raise OSError(errno.EIO, "injected L0 stage error")
 
-    chain = gb.TwoLayerCachedDTensorsWriteChain(
+    chain = gb.TwoLayerCachedDTensorsRWChain(
         src=_compute_view(
             _ArrayCompute({"w": np.arange(8, dtype=np.uint8)}, read_or_fail),
             ["w"],
             shapes,
             2,
         ),
-        big_cache=_cache_view(l0, ["w"], shapes, steps=1, nodes=[0, 1], width=1),
-        small_cache=_cache_view(l1, ["w"], shapes, steps=1, nodes=[1], width=1),
+        first_cache=_cache_view(l0, ["w"], shapes, steps=1, nodes=[0, 1], width=1),
+        second_cache=_cache_view(l1, ["w"], shapes, steps=1, nodes=[1], width=1),
         dst=_mem_storage_view(_MemStorage(8), ["w"], shapes, 2),
         num_ranks_per_node=1,
     )
@@ -917,7 +917,7 @@ def test_multi_tensor_cell_budget_aggregation_and_weakref_cleanup(monkeypatch):
     monkeypatch.setattr(cache, "write_from_buffer", track_write)
     dst = _MemStorage(12)
     cview = _cache_view(cache, ["a", "b"], shapes)
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(_ArrayCompute(data, hold_rank1), ["a", "b"], shapes, 2),
         cache=cview,
         dst=_mem_storage_view(dst, ["a", "b"], shapes, 2, single_slot=True),
@@ -976,7 +976,7 @@ def test_sdk_delayed_leader_cross_rank_staging_notorch(tmp_path: Path, monkeypat
     cache = DiskNodeCache(
         cluster, {"a": 8, "b": 8}, lambda _r: 0, str(tmp_path / "c"), _DummyDevice()
     )
-    chain = gb.OneLayerCachedDTensorsWriteChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_compute_view(
             _ArrayCompute(data),
             ["a", "b"],
@@ -1050,10 +1050,10 @@ def test_two_layer_tight_budget_no_circular_deadlock(monkeypatch):
     monkeypatch.setattr(internal_wc._WriteRankRun, "_admit_cold_stage", gate_admit)
     monkeypatch.setattr(l1, "write_from_buffer", watch_l1_write)
     dst = _MemStorage(16)
-    chain = gb.TwoLayerCachedDTensorsWriteChain(
+    chain = gb.TwoLayerCachedDTensorsRWChain(
         src=_compute_view(_ArrayCompute(data), ["w"], shapes, world),
-        big_cache=_cache_view(l0, ["w"], shapes, steps=4, nodes=[0], width=2),
-        small_cache=_cache_view(l1, ["w"], shapes, steps=2, nodes=[0], width=1),
+        first_cache=_cache_view(l0, ["w"], shapes, steps=4, nodes=[0], width=2),
+        second_cache=_cache_view(l1, ["w"], shapes, steps=2, nodes=[0], width=1),
         dst=_mem_storage_view(dst, ["w"], shapes, world, single_slot=True),
         num_ranks_per_node=world,
     )

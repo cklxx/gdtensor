@@ -11,9 +11,9 @@ from .internal.write_chain import (
     d_tensors_view_rank_chain_save as chain_save,
 )
 from .internal.chain import (
-    get_stat_inbound_traffic_of_chain_load as chain_stat_inbound_traffic,
-    get_stat_mem_overhead_of_chain_load as chain_stat_mem_overhead,
-    get_stat_outbound_traffic_of_chain_load as chain_stat_outbound_traffic,
+    get_stat_inbound_traffic_of_rw_chain as chain_stat_inbound_traffic,
+    get_stat_mem_overhead_of_rw_chain as chain_stat_mem_overhead,
+    get_stat_outbound_traffic_of_rw_chain as chain_stat_outbound_traffic,
 )
 
 __all__ = [

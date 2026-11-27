@@ -167,21 +167,21 @@ def test_products_mixins_and_factories(name, fields):
         ("gdtensor.reset_d_tensor", ["gd_tensor", "d_tensor"]),
         ("gdtensor.io.rank_save", ["rank", "compute_view", "storage_view"]),
         ("gdtensor.io.rank_load", ["rank", "compute_view", "storage_view"]),
-        ("gdtensor.io.chain_load", ["rank", "read_chain"]),
-        ("gdtensor.io.chain_save", ["rank", "write_chain"]),
+        ("gdtensor.io.chain_load", ["rank", "rw_chain"]),
+        ("gdtensor.io.chain_save", ["rank", "rw_chain"]),
         (
             "gdtensor.io.chain_stat_mem_overhead",
-            ["chain"],
+            ["rw_chain"],
         ),
         (
             "gdtensor.io.chain_stat_outbound_traffic",
-            ["chain"],
+            ["rw_chain"],
         ),
         (
             "gdtensor.io.chain_stat_inbound_traffic",
-            ["chain"],
+            ["rw_chain"],
         ),
-        ("gdtensor.get_chain_tensor_ids", ["chain"]),
+        ("gdtensor.get_chain_tensor_ids", ["rw_chain"]),
         ("gdtensor.builder.d_tensors_view_map", ["origin", "map_core"]),
         ("gdtensor.builder.global_tensor_meta_of", ["named_d_tensor"]),
         ("gdtensor.builder.tensor_order_value_of", ["d_tensor_table", "tensor_id"]),
@@ -258,9 +258,8 @@ def test_type_aliases_and_namespace_separation():
         "StorageMesh",
         "ContentSlotsMesh",
         "CacheMesh",
-        "ConcreteDTensorsReadChain",
-        "DTensorsWriteChain",
-        "ConcreteDTensorsWriteChain",
+        "DTensorsRWChain",
+        "ConcreteDTensorsRWChain",
     ):
         assert isinstance(getattr(builder, name), types.UnionType)
         assert not hasattr(builder, name + "BuilderMixin")

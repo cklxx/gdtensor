@@ -64,7 +64,7 @@ def _run(operation, rank, src, dst):
     if operation == "load":
         return gio.rank_load(rank, dst, src)
     if operation == "sc":
-        return gio.chain_load(rank, gb.DirectDTensorsReadChain(src=src, dst=dst))
+        return gio.chain_load(rank, gb.DirectDTensorsRWChain(src=src, dst=dst))
     raise ValueError(operation)
 
 

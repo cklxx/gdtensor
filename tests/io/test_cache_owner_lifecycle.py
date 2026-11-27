@@ -70,7 +70,7 @@ def _build(source=None, cache=None):
     )
     cache = _Cache(cluster, len(values)) if cache is None else cache
     dst = RankMem(cluster, len(values), 2)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=storage,
         cache=cache_view(["w"], cache, size=len(values)),
         dst=gb.ComputeDTensorsView(["w"], compute_table(["w"], size=len(values)), dst),
