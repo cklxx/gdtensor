@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from .dtensor import metadata_only_table
 from .plan import (
     d_tensors_view_rank_plan_load,
     d_tensors_view_rank_plan_save,
@@ -222,6 +223,128 @@ _WAIT_ENV = "GDTENSOR_CACHE_WAIT_SECONDS"
 _DEFAULT_WAIT_SECONDS = 60.0
 
 
+class _OwedSet:
+    """Compact owed set storing unacked actors until a partial batch splits them."""
+
+    def __init__(self, actors: dict, whole=None, partial=None) -> None:
+        self._actors: dict = actors
+        self._sets: dict = {}
+        self.whole: set = set(actors) if whole is None else set(whole)
+        self.partial: dict = {} if partial is None else dict(partial)
+
+    def __getstate__(self):
+        return (self.whole, self.partial)
+
+    def __setstate__(self, state) -> None:
+        self.whole, self.partial = state
+        self._actors = {}
+        self._sets = {}
+
+    def bind(self, actors: dict) -> None:
+        self._actors = actors
+        self._sets = {}
+
+    def _actor_pieces(self, actor) -> frozenset:
+        cached = self._sets.get(actor)
+        if cached is None:
+            cached = frozenset(self._actors.get(actor, ()))
+            self._sets[actor] = cached
+        return cached
+
+    def __bool__(self) -> bool:
+        return bool(self.whole or self.partial)
+
+    def __len__(self) -> int:
+        part = sum(len(rem) for rem in self.partial.values())
+        return part + sum(len(self._actors.get(a, ())) for a in self.whole)
+
+    def __contains__(self, piece) -> bool:
+        actor, off, size = piece
+        if actor in self.whole:
+            return (off, size) in self._actor_pieces(actor)
+        rem = self.partial.get(actor)
+        return rem is not None and (off, size) in rem
+
+    def __iter__(self):
+        whole = [(a, o, s) for a in self.whole for o, s in self._actors.get(a, ())]
+        part = [(a, o, s) for a, rem in self.partial.items() for o, s in rem]
+        return iter(whole + part)
+
+    def __eq__(self, other):
+        if isinstance(other, (set, frozenset)):
+            return set(self) == other
+        return NotImplemented
+
+    def actors(self) -> set:
+        return self.whole | self.partial.keys()
+
+    def remove(self, piece) -> None:
+        actor, off, size = piece
+        if actor in self.whole:
+            self._remove_whole(actor, (off, size))
+            return
+        self._remove_partial(actor, (off, size))
+
+    def _remove_whole(self, actor, item: tuple) -> None:
+        rem = set(self._actor_pieces(actor))
+        rem.remove(item)
+        self.whole.remove(actor)
+        if rem:
+            self.partial[actor] = rem
+
+    def _remove_partial(self, actor, item: tuple) -> None:
+        rem = self.partial[actor]
+        rem.remove(item)
+        if not rem:
+            self.partial.pop(actor)
+
+    def discard(self, piece) -> None:
+        if piece in self:
+            self.remove(piece)
+
+    def prepare_batch(self, actor, items: list):
+        """Apply all-but-one removals for `actor`; return final piece if emptied."""
+        if not items:
+            return None
+        if actor in self.whole:
+            return self._prepare_from(actor, self._actor_pieces(actor), items, True)
+        cur = self.partial.get(actor)
+        if cur:
+            return self._prepare_from(actor, cur, items, False)
+        return None
+
+    def _prepare_from(self, actor, cur, items: list, from_whole: bool):
+        if not cur:
+            return None
+        rem = set(cur) - set(items)
+        if from_whole:
+            self.whole.remove(actor)
+        if rem:
+            self.partial[actor] = rem
+            return None
+        last = next(iter(cur))
+        self.partial[actor] = {last}
+        return (actor, last[0], last[1])
+
+
+def _owed_actors(owed) -> set:
+    if isinstance(owed, _OwedSet):
+        return owed.actors()
+    return {c for c, _o, _n in owed or ()}
+
+
+def _rebind_node_owed(state, seg_map: dict, attr: str) -> None:
+    for key, slot in state.slots.items():
+        owed = slot.get("owed")
+        if isinstance(owed, _OwedSet) and key in seg_map:
+            owed.bind(getattr(seg_map[key], attr))
+
+
+def _rebind_owed(nodes: dict, segments: list, attr: str) -> None:
+    for (layer, node), state in nodes.items():
+        _rebind_node_owed(state, segments[layer][node], attr)
+
+
 class _NodeState:
     """Residency of one (cache layer, node): segments, bytes, generation."""
 
@@ -284,7 +407,10 @@ class _NodeState:
             return False
         for s in segs:
             self.admit(s.key, s.size)
-            self.slots[s.key]["owed"] = s.owed()
+            consumers = getattr(s, "consumers", None)
+            self.slots[s.key]["owed"] = (
+                _OwedSet(consumers) if consumers is not None else s.owed()
+            )
         return True
 
     def ack(self, key, piece) -> bool:
@@ -299,6 +425,16 @@ class _NodeState:
             return True
         return False
 
+    def ack_many(self, key, actor, items: list) -> bool:
+        slot = self.slots.get(key)
+        if slot is None:
+            raise check_failed("cache_ack", f"segment {key} released before {actor}")
+        owed = slot["owed"]
+        if isinstance(owed, _OwedSet):
+            last = owed.prepare_batch(actor, items)
+            return last is not None and self.ack(key, last)
+        return any(self.ack(key, (actor, off, size)) for off, size in items)
+
     def _fail_slot(self, key) -> None:
         slot = self.slots.get(key)
         if slot is not None and not slot["filled"]:
@@ -311,7 +447,7 @@ class _NodeState:
             self.error = replace(as_error(exc))
 
     def owed_to(self) -> list:
-        owed = {c for slot in self.slots.values() for c, _o, _n in slot["owed"] or ()}
+        owed = {c for slot in self.slots.values() for c in _owed_actors(slot["owed"])}
         return sorted(owed, key=str)
 
 
@@ -676,6 +812,7 @@ class _FileSlotTable:
     def _refresh(self) -> None:
         state = self._read_state()
         self.nodes = state["nodes"]
+        _rebind_owed(self.nodes, self.plan.segments, "consumers")
         self.version = state["version"]
         self.inflight = state["inflight"]
         self.runs = state["runs"]
@@ -774,8 +911,11 @@ def _chain_fingerprint(chain) -> str:
     excluded, so the key never retains them."""
     from .propagation import cache_layers
 
-    tables = [view.d_tensor_table for view in cache_layers(chain)]
-    tables += [chain.src.d_tensor_table, chain.dst.d_tensor_table]
+    tables = [metadata_only_table(view.d_tensor_table) for view in cache_layers(chain)]
+    tables += [
+        metadata_only_table(chain.src.d_tensor_table),
+        metadata_only_table(chain.dst.d_tensor_table),
+    ]
     payload = (tables, chain.src.physical_layout, chain.num_ranks_per_node)
     return _content_digest(payload)[:20]
 
@@ -1228,7 +1368,11 @@ class _RankRun:
         with self.t.cond:
             ready, probe_keys = self._drain_scan(pending, layer)
         if not probe_keys:
-            return [piece for piece in pending if piece in ready]
+            return (
+                [piece for piece in pending if (piece[0], piece[1]) in ready]
+                if ready
+                else []
+            )
         nodes = dict.fromkeys(node for node, _key in probe_keys)
         try:
             self._inflight(1)
@@ -1246,29 +1390,31 @@ class _RankRun:
     def _classify_probe(self, pending, ready, probe_keys, layer, seal):
         segs = self._probe_drain_bytes(probe_keys, layer)
         if not segs:
-            return [piece for piece in pending if piece in ready]
+            return (
+                [piece for piece in pending if (piece[0], piece[1]) in ready]
+                if ready
+                else []
+            )
         with self.t.cond:
             sealed = self._seal_drains(segs, layer, reserve=seal)
-        return [
-            piece
-            for piece in pending
-            if piece in ready or (piece[0], piece[1]) in sealed
-        ]
+        done_keys = ready | sealed
+        return [piece for piece in pending if (piece[0], piece[1]) in done_keys]
 
     def _drain_scan(self, pending, layer: int):
-        """Split pending into filled pieces and (node, key) probe candidates.
+        """Split pending into filled (node, key) pairs and probe candidates."""
+        keys = dict.fromkeys((piece[0], piece[1]) for piece in pending)
+        filled = {nk for nk in keys if self._slot_filled(layer, nk[0], nk[1])}
+        seen: set = set()
+        probe_keys: list = []
+        for node, key in keys:
+            self._probe_if_unfilled(node, key, filled, seen, probe_keys, layer)
+        return filled, probe_keys
 
-        The caller holds the table lock. Each (node, key) is probed at most
-        once per scan, and keys already known absent are not probed again.
-        """
-        ready = {
-            piece for piece in pending if self._slot_filled(layer, piece[0], piece[1])
-        }
-        seen = set()
-        probe_keys = []
-        for piece in pending:
-            self._collect_probe(piece, ready, seen, probe_keys, layer)
-        return ready, probe_keys
+    def _probe_if_unfilled(
+        self, node, key, filled, seen, probe_keys, layer: int
+    ) -> None:
+        if (node, key) not in filled:
+            self._collect_probe((node, key, 0, 0), set(), seen, probe_keys, layer)
 
     def _collect_probe(self, piece, ready, seen, probe_keys, layer: int) -> None:
         node_key = (piece[0], piece[1])
@@ -1470,6 +1616,12 @@ class _RankRun:
             # so _block cannot miss that last notification.
             self._block(version, deadline, pending) if not moved else None
 
+    def _ensure_pending(self, pending: list) -> bool:
+        items = [
+            (self.last, n, k) for n, k in dict.fromkeys((p[0], p[1]) for p in pending)
+        ]
+        return self._ensure_items(items)
+
     def _step(self, pending: list) -> bool:
         """Drain every filled piece; else fill ready segments. True on progress."""
         if self._all_fit and self._service_step():
@@ -1478,28 +1630,46 @@ class _RankRun:
             return True
         done = self._classify_drains(pending, self.last)
         self._drain_hot(done)
-        for piece in done:
-            pending.remove(piece)
-        items = [(self.last, n, k) for n, k, _o, _s in pending]
+        if done:
+            done_set = set(done)
+            pending[:] = [piece for piece in pending if piece not in done_set]
         return (
             bool(done)
             or (not self._all_fit and self._service_step())
-            or self._ensure_items(items)
+            or self._ensure_pending(pending)
         )
+
+    def _prune_in_mem_service(self) -> bool:
+        ready = next((item for item in self.services if self._completed(*item)), None)
+        if ready is None:
+            return False
+        self.services.remove(ready)
+        return True
+
+    def _prune_services(self) -> bool:
+        t = getattr(self, "t", None)
+        if not self.services:
+            return False
+        if t is None or getattr(t, "_in_mem", True):
+            return self._prune_in_mem_service()
+        with t.cond:
+            kept = [
+                item
+                for item in self.services
+                if item[2] not in t.node(item[0], item[1]).completed
+            ]
+        if len(kept) == len(self.services):
+            return False
+        self.services = kept
+        return True
 
     def _service_step(self) -> bool:
         if self._all_fit:
             return self._service_all_fit()
-        ready = next((item for item in self.services if self._completed(*item)), None)
-        moved = False if ready is not None else self._ensure_items(self.services)
-        if ready is None:
-            ready = next(
-                (item for item in self.services if self._completed(*item)), None
-            )
-        if ready is None:
-            return moved
-        self.services.remove(ready)
-        return True
+        if self._prune_services():
+            return True
+        moved = self._ensure_items(self.services)
+        return self._prune_services() or moved
 
     def _service_all_fit(self) -> bool:
         if not self.services:
@@ -1618,7 +1788,9 @@ class _RankRun:
             return key in self.t.node(layer, node).completed
 
     def _ensure_items(self, items: list) -> bool:
-        items = list(dict.fromkeys(items))
+        items = self._filter_ensure(list(dict.fromkeys(items)))
+        if not items:
+            return False
         # Service lists contain lower-layer fills followed by child fills. Do
         # not scan every child dependency before making immediately available
         # lower-layer progress; large fan-outs can otherwise exceed cache_wait
@@ -1626,6 +1798,51 @@ class _RankRun:
         batched = []
         moved = any(self._ensure_or_batch(item, batched) for item in items)
         return moved or self._ensure_parent_batches(batched)
+
+    def _filter_ensure(self, items: list) -> list:
+        t = getattr(self, "t", None)
+        if not items or t is None or getattr(t, "_in_mem", True):
+            return items
+        with t.cond:
+            return [item for item in items if self._ensure_candidate_locked(*item)]
+
+    def _ensure_candidate_locked(self, layer: int, node: int, key) -> bool:
+        state = self.t.node(layer, node)
+        state.check(self.gens[(layer, node)])
+        seg = self.plan.segments[layer][node][key]
+        if key in state.completed or key in state.slots or not state.fits(seg.size):
+            return False
+        no_adopt = self.source_identity is None or (layer, node, key) in self._absent
+        if no_adopt and not self._can_fill(layer, node, key):
+            return False
+        if layer > 0 and no_adopt and self._parents_blocked_locked(layer, node, seg):
+            return False
+        return True
+
+    def _parents_blocked_locked(self, layer: int, node: int, seg) -> bool:
+        pnode = self.plan.parent[layer][node]
+        pstate = self.t.node(layer - 1, pnode)
+        psegs = self.plan.segments[layer - 1][pnode]
+        return any(
+            self._parent_unready_locked(layer - 1, pnode, pstate, psegs, pkey)
+            for pkey, _o, _n in seg.parents
+        )
+
+    def _parent_unready_locked(
+        self, player: int, pnode: int, pstate, psegs: dict, pkey
+    ) -> bool:
+        if self._slot_filled(player, pnode, pkey):
+            return False
+        if (
+            self.source_identity is not None
+            and (player, pnode, pkey) not in self._absent
+        ):
+            return False
+        return (
+            not self._can_fill(player, pnode, pkey)
+            or pkey in pstate.slots
+            or not pstate.fits(psegs[pkey].size)
+        )
 
     def _ensure_or_batch(self, item, batched) -> bool:
         if not self._has_parent_batch(item[0]):
@@ -1824,8 +2041,7 @@ class _RankRun:
             return
         if child.completed_at.get(child_key, state.started) < state.started:
             return
-        for off, size in pieces:
-            state.ack(key, (consumer, off, size))
+        state.ack_many(key, consumer, pieces)
 
     def _ack_parents_locked(self, layer: int, node: int, seg) -> None:
         """ACK this fill's parent pieces; the caller holds the table lock."""
@@ -1859,8 +2075,7 @@ class _RankRun:
             self._drain_hot_batch(batch, batch_read)
 
     def _drain_hot_scalar(self, pending) -> None:
-        for piece in pending:
-            self._drain(piece)
+        self._drain_grouped([(piece, None) for piece in pending])
 
     def _drain_hot_batch(self, batch, batch_read) -> None:
         ranges = [
@@ -1885,27 +2100,48 @@ class _RankRun:
             len(raw) != piece[3] for raw, piece in zip(data, batch)
         ):
             raise invalid("buffer_len", "cache batch returned wrong byte counts")
-        for piece, raw in zip(batch, data):
-            self._drain(piece, raw)
+        self._drain_grouped(list(zip(batch, data)))
+
+    def _drain_grouped(self, pairs: list) -> None:
+        grouped: dict = {}
+        for piece, raw in pairs:
+            grouped.setdefault((piece[0], piece[1]), []).append((piece, raw))
+        for (node, _key), group in grouped.items():
+            self._drain_one_group(node, group)
+
+    def _drain_one_group(self, node: int, group: list) -> None:
+        if len(group) == 1:
+            self._drain(group[0][0], group[0][1])
+            return
+        self._drain_group(node, group)
 
     def _drain(self, piece, data=None) -> None:
-        node, key, off, size = piece
-        rng = RangeFromComputeView(key[0], off, size)
+        self._drain_group(piece[0], [(piece, data)])
+
+    def _write_drain_group(self, pairs: list) -> None:
+        for piece, data in pairs:
+            self._write_drain(piece, data)
+
+    def _drain_group(self, node: int, pairs: list) -> None:
         try:
             self._inflight(1)
         except BaseException as exc:
             _error_cleanup(exc, self._fail, self.last, node, exc, None)
             raise
         try:
-            self._write_drain(piece, rng, data)
+            self._write_drain_group(pairs)
         except BaseException as exc:
             _error_cleanup(exc, self._drain_failed, node, exc)
             raise
+        self._ack_drained(node, pairs)
+
+    def _ack_drained(self, node: int, pairs: list) -> None:
+        _node, key, _off, _size = pairs[0][0]
+        items = [(piece[2], piece[3]) for piece, _data in pairs]
+        actor = ("rank", self.rank)
         with self.t.cond:
             self.t.activity(self.owner, -1)
-            released = self.t.node(self.last, node).ack(
-                key, (("rank", self.rank), off, size)
-            )
+            released = self.t.node(self.last, node).ack_many(key, actor, items)
             self.t.mark_touched((self.last, node))
             # Capacity-limited waits can depend on a slot release or the last
             # in-flight unit. All-fit readiness ignores ACK releases and uses
@@ -1919,8 +2155,9 @@ class _RankRun:
         self._fail(self.last, node, exc, None)
         self._inflight(-1)
 
-    def _write_drain(self, piece, rng, data) -> None:
+    def _write_drain(self, piece, data) -> None:
         node, key, off, size = piece
+        rng = RangeFromComputeView(key[0], off, size)
         if data is None:
             data = _read(
                 self.caches[self.last].data_accessor,

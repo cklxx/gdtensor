@@ -8,11 +8,11 @@ their scope is stated explicitly below.
 ## Runtime source pins
 
 - `gdtensor/internal/api.py`
-  `sha256 d238a31602c069fc070c9581fec9fc5271805dbe9cf902a809731f6a249cd9fa`.
+  `sha256 8073f8c01a638a8304202203cca8a6a6076124dfe48999c76457c017f04dae35`.
 - `gdtensor/internal/propagation.py`
   `sha256 2f25d40fb34c2e7f791b42f1fc113f86bb14463eac3293784f727490052dd65a`.
 - `gdtensor/internal/write_chain.py`
-  `sha256 4c7d4aac5535d7a6043c4d61379d01b336bb52cf0b723fce2ba14f9dd8d2c6a6`.
+  `sha256 c49335179b28b357a7fd8e45b93fc6ca418bb53dc2f007e915d977ddf0baf4ed`.
 - `gdtensor/internal/write_propagation.py`
   `sha256 67d5467a25369a1be9e496b1ff59c5cfaaf0a744fd6469c1282425a2f0cb9b4d`.
 

@@ -187,6 +187,31 @@ def tensor_ids_of(table: DTensorTable) -> List[str]:
     return [nd.global_tensor_id for nd in table.named_d_tensors]
 
 
+def _metadata_only_dt(dt):
+    if type(dt) is NaiveDTensor:
+        if dt.torch_d_tensor is None:
+            return dt
+        return NaiveDTensor(dt.global_tensor_meta, list(dt.placements), dt.mesh)
+    if type(dt) is ReshapedDTensor:
+        inner = _metadata_only_dt(dt.underlying_d_tensor)
+        if inner is dt.underlying_d_tensor:
+            return dt
+        return ReshapedDTensor(inner, list(dt.shape))
+    return dt
+
+
+def metadata_only_table(table: DTensorTable) -> DTensorTable:
+    """Strip live torch_d_tensor handles so chain fingerprints are serializable."""
+    return DTensorTable(
+        [
+            NamedDTensor(
+                nd.global_tensor_id, _metadata_only_dt(nd.d_tensor), list(nd.alias)
+            )
+            for nd in table.named_d_tensors
+        ]
+    )
+
+
 # ---------------------------------------------------------------- B.2.3.9 / B.2.3.10
 
 

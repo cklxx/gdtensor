@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import fcntl
 import gc
@@ -1060,6 +1061,161 @@ def test_two_layer_tight_budget_no_circular_deadlock(monkeypatch):
     out = _run_threads(world, cluster, chain)
     assert all(type(v) is gb.Ok for v in out.values()), out
     np.testing.assert_array_equal(dst.buf, data["w"])
+
+
+class _BatchWriteReadCache(NodeCache):
+    """NodeCache with batch stage/drain hooks and non-empty source identity."""
+
+    def __init__(self, cluster: Cluster, sizes: dict, node_fn) -> None:
+        super().__init__(cluster, sizes, node_fn)
+        self.write_batches: list[int] = []
+        self.read_batches: list[int] = []
+
+    def write_bytes_batch(self, ranges, payloads) -> None:
+        self.write_batches.append(len(ranges))
+        for rng, data in zip(ranges, payloads):
+            arr = np.frombuffer(data, dtype=np.uint8)
+            must = self.write_from_buffer(
+                rng, lambda ptr, n, a=arr: _copy_into(ptr, n, a)
+            )
+            assert type(must) is gb.Ok, must
+
+    def read_bytes_batch(self, ranges) -> list[bytes]:
+        self.read_batches.append(len(ranges))
+        out = []
+        for rng in ranges:
+            buf = bytearray(rng.size)
+            res = self.read_to_buffer(
+                rng, lambda ptr, n, b=buf: _capture_from(ptr, n, b)
+            )
+            assert type(res) is gb.Ok, res
+            out.append(bytes(buf))
+        return out
+
+
+def _copy_into(ptr: int, n: int, arr: np.ndarray):
+    ctypes.memmove(ptr, arr.ctypes.data, n)
+    return gb.Ok(None)
+
+
+def _capture_from(ptr: int, n: int, buf: bytearray):
+    buf[:] = ctypes.string_at(ptr, n)
+    return gb.Ok(None)
+
+
+class _MutableCompute(ga.DTensorDataAccessor):
+    def __init__(self, size: int) -> None:
+        self.buf = np.zeros(size, dtype=np.uint8)
+
+    def read_to_buffer(self, global_range, read_to_buffer):
+        return gb.Err(gb.GDTensorIOError(operation="read", msg="write-only"))
+
+    def write_from_buffer(self, global_range, write_from_buffer):
+        off, size = global_range.global_tensor_offset, global_range.size
+        tmp = np.empty(size, dtype=np.uint8)
+        res = write_from_buffer(tmp.ctypes.data, size)
+        if type(res) is gb.Ok:
+            self.buf[off : off + size] = tmp
+        return res
+
+
+def test_owed_set_partial_batch_roundtrip():
+    internal_api = sys.modules[gio.chain_load.__module__]
+    actors = {("rank", 0): [(0, 4), (4, 4), (8, 4)], ("rank", 1): [(12, 4)]}
+    owed = internal_api._OwedSet(actors)
+    assert len(owed) == 4 and owed == {
+        (("rank", 0), 0, 4),
+        (("rank", 0), 4, 4),
+        (("rank", 0), 8, 4),
+        (("rank", 1), 12, 4),
+    }
+    assert owed.prepare_batch(("rank", 0), [(0, 4)]) is None
+    restored = pickle.loads(pickle.dumps(owed))
+    restored.bind(actors)
+    last0 = restored.prepare_batch(("rank", 0), [(4, 4), (8, 4)])
+    assert last0 is not None
+    restored.remove(last0)
+    assert restored.actors() == {("rank", 1)}
+    last1 = restored.prepare_batch(("rank", 1), [(12, 4)])
+    assert last1 == (("rank", 1), 12, 4)
+    restored.remove(last1)
+    assert not restored
+
+
+def test_high_row_count_shard1_file_coordinator_stays_compact_and_batches(
+    tmp_path: Path, monkeypatch
+):
+    internal_api = sys.modules[gio.chain_load.__module__]
+    rows, cols, world = 2048, 4, 2
+    shapes = {"w": [rows, cols]}
+    flat = np.arange(rows * cols, dtype=np.uint8)
+    cluster = Cluster(1, world)
+    cache = _BatchWriteReadCache(cluster, {"w": rows * cols}, lambda _r: 0)
+    ckpt_dir = tmp_path / "ckpt"
+    w_sizes, r_sizes = [], []
+    orig_w = internal_wc._FileWriteSlotTable._write_state
+    orig_r = internal_api._FileSlotTable._write_state
+
+    def track_w(table, state):
+        w_sizes.append(len(pickle.dumps(state, protocol=5)))
+        return orig_w(table, state)
+
+    def track_r(table, state):
+        r_sizes.append(len(pickle.dumps(state, protocol=5)))
+        return orig_r(table, state)
+
+    monkeypatch.setattr(internal_wc._FileWriteSlotTable, "_write_state", track_w)
+    monkeypatch.setattr(internal_api._FileSlotTable, "_write_state", track_r)
+    save_chain = gb.OneLayerCachedDTensorsRWChain(
+        src=_compute_view(
+            _ArrayCompute({"w": flat}), ["w"], shapes, world, [gb.Shard(1)]
+        ),
+        cache=_cache_view(cache, ["w"], shapes),
+        dst=_single_file_safetensors_storage(
+            ["w"], shapes, world, str(ckpt_dir), FileIO(), _CoordVote(world)
+        ),
+        num_ranks_per_node=world,
+    )
+    res_save = _run_threads(world, cluster, save_chain)
+    assert all(type(v) is gb.Ok for v in res_save.values()), res_save
+    assert sum(cache.write_batches) == 2 * rows
+    assert max(w_sizes) < 16384 and len(w_sizes) < 30
+    saved = safetensors.numpy.load_file(ckpt_dir / "model.safetensors")["w"].reshape(-1)
+    np.testing.assert_array_equal(saved, flat)
+
+    dst_mem = _MutableCompute(rows * cols)
+    src_storage = _single_file_safetensors_storage(
+        ["w"], shapes, world, str(ckpt_dir), FileIO(), _CoordVote(world)
+    )
+    load_chain = gb.OneLayerCachedDTensorsRWChain(
+        src=src_storage,
+        cache=_cache_view(cache, ["w"], shapes),
+        dst=_compute_view(dst_mem, ["w"], shapes, world, [gb.Shard(1)]),
+        num_ranks_per_node=world,
+    )
+    res_load = _run_load_threads(world, cluster, load_chain)
+    assert all(type(v) is gb.Ok for v in res_load.values()), res_load
+    assert sum(cache.read_batches) == 2 * rows
+    assert max(r_sizes) < 16384 and len(r_sizes) < 30
+    np.testing.assert_array_equal(dst_mem.buf, flat)
+
+
+def _run_load_threads(world: int, cluster: Cluster, chain) -> dict[int, Any]:
+    out: dict[int, Any] = {}
+
+    def run_rank(r: int) -> None:
+        cluster.rank = r
+        out[r] = gio.chain_load(r, chain)
+
+    threads = [
+        threading.Thread(target=run_rank, args=(r,), daemon=True) for r in range(world)
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(5)
+        assert not th.is_alive()
+    return out
 
 
 def _run_threads(world: int, cluster: Cluster, chain) -> dict[int, Any]:

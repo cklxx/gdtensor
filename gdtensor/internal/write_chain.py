@@ -24,12 +24,16 @@ from .api import (
     _COORD_DIR_ENV,
     _COORD_ENV,
     _CacheRange,
+    _OwedSet,
+    _bounded_batches,
     _cleanup,
     _copy,
     _error_cleanup,
     _new_owner,
     _open_process_file,
+    _owed_actors,
     _read,
+    _rebind_owed,
     _session_view,
     _wait_seconds,
     _write,
@@ -44,6 +48,7 @@ from .chain import (
     rank_direct_write_plan,
     validate_rank,
 )
+from .dtensor import metadata_only_table
 from .plan import _check_same_tensors
 from .ranges import RangeFromComputeView
 from .result import as_error, catch, check_failed, invalid, must_ok
@@ -106,7 +111,7 @@ class _WriteNodeState:
         if seg.key in self.completed or not self.fits(seg.size):
             return False
         self.slots[seg.key] = {
-            "owed": seg.expected(),
+            "owed": _OwedSet(seg.producers),
             "ready": False,
             "flushing": False,
         }
@@ -137,6 +142,18 @@ class _WriteNodeState:
             return True
         return False
 
+    def record_stage_many(self, key, producer, items: list) -> bool:
+        slot = self.slots.get(key)
+        if slot is None:
+            raise check_failed(
+                "cache_stage", f"segment {key} missing during stage of {producer}"
+            )
+        owed = slot["owed"]
+        if isinstance(owed, _OwedSet):
+            last = owed.prepare_batch(producer, items)
+            return last is not None and self.record_stage(key, last)
+        return any(self.record_stage(key, (producer, off, size)) for off, size in items)
+
     def claim_flush(self, key) -> bool:
         slot = self.slots.get(key)
         if slot is None or not slot["ready"] or slot["flushing"]:
@@ -163,7 +180,7 @@ class _WriteNodeState:
             self.error = replace(as_error(exc))
 
     def pending_producers(self) -> list:
-        need = {p for slot in self.slots.values() for p, _o, _n in slot["owed"]}
+        need = {p for slot in self.slots.values() for p in _owed_actors(slot["owed"])}
         return sorted(need, key=str)
 
 
@@ -418,6 +435,7 @@ class _FileWriteSlotTable:
     def _refresh(self) -> None:
         state = self._read_state()
         self.nodes = state["nodes"]
+        _rebind_owed(self.nodes, self.plan.segments, "producers")
         self.version = state["version"]
         self.inflight = state["inflight"]
         self.runs = state["runs"]
@@ -503,8 +521,13 @@ if hasattr(os, "register_at_fork"):
 
 
 def _write_chain_fingerprint(chain) -> str:
-    tables = [view.d_tensor_table for view in write_cache_layers(chain)]
-    tables += [chain.src.d_tensor_table, chain.dst.d_tensor_table]
+    tables = [
+        metadata_only_table(view.d_tensor_table) for view in write_cache_layers(chain)
+    ]
+    tables += [
+        metadata_only_table(chain.src.d_tensor_table),
+        metadata_only_table(chain.dst.d_tensor_table),
+    ]
     payload = ("write", tables, chain.dst.physical_layout, chain.num_ranks_per_node)
     return _content_digest(payload)[:20]
 
@@ -620,6 +643,14 @@ class _WriteRankRun:
         identity = ("write", self.t.key, layer, gen)
         return _CacheRange(tid, off, size, node, identity, _content_digest(identity))
 
+    def _stage_groups(self) -> list:
+        grouped: dict = {}
+        for node, key, off, size in sorted(
+            self.plan.stages[self.rank], key=self._sort_stage
+        ):
+            grouped.setdefault((node, key), []).append((off, size))
+        return [(node, key, items) for (node, key), items in grouped.items()]
+
     def run(self) -> None:
         with self.t.participate(self.rank) as self.owner:
             self._run()
@@ -630,7 +661,7 @@ class _WriteRankRun:
             self.gens = {ln: self.t.node(*ln).join(self.rank) for ln in self.gens}
             _ = [self.t.mark_touched(ln) for ln in self.gens]
             self.t.bump()
-        pending = sorted(self.plan.stages[self.rank], key=self._sort_stage)
+        pending = self._stage_groups()
         try:
             self._wait_cohort()
             self._loop(pending)
@@ -745,31 +776,46 @@ class _WriteRankRun:
 
     def _flush_layer(self, layer: int) -> bool:
         items = self.flush_items[layer]
-        self._drop_completed_flushes(layer, items)
         if layer == self.last:
-            return any(self._try_flush_storage(node, key) for node, key in list(items))
-        return self._try_flush_interlayer(layer, items)
+            return self._flush_storage_layer(items)
+        return self._flush_interlayer_layer(layer, items)
 
-    def _drop_completed_flushes(self, layer: int, items: list) -> None:
-        with self.t.cond:
-            items[:] = [
-                (n, k) for n, k in items if k not in self.t.node(layer, n).completed
-            ]
-
-    def _try_flush_storage(self, node: int, key) -> bool:
-        if not self._claim_storage(node, key):
+    def _flush_storage_layer(self, items: list) -> bool:
+        claimed = self._claim_next_storage(items)
+        if claimed is None:
             return False
-        seg = self.plan.segments[self.last][node][key]
-        self._execute_storage_flush(node, seg)
+        node, key = claimed
+        self._execute_storage_flush(node, self.plan.segments[self.last][node][key])
         return True
 
-    def _claim_storage(self, node: int, key) -> bool:
+    def _flush_interlayer_layer(self, layer: int, items: list) -> bool:
+        claimed = self._claim_next_interlayer(layer, items)
+        if claimed is None:
+            return False
+        node, seg, groups = claimed
+        self._execute_interlayer_flush(layer, node, seg, groups)
+        return True
+
+    def _claim_next_storage(self, items: list):
         with self.t.cond:
-            state = self.t.node(self.last, node)
-            state.check(self.gens[(self.last, node)])
-            claimed = state.claim_flush(key)
-            (self.t.mark_touched((self.last, node)), self.t.bump()) if claimed else None
-            return claimed
+            return self._claim_next_storage_locked(items)
+
+    def _claim_next_storage_locked(self, items: list):
+        items[:] = [
+            (n, k) for n, k in items if k not in self.t.node(self.last, n).completed
+        ]
+        return next(
+            ((n, k) for n, k in items if self._try_claim_storage_locked(n, k)), None
+        )
+
+    def _try_claim_storage_locked(self, node: int, key) -> bool:
+        state = self.t.node(self.last, node)
+        state.check(self.gens[(self.last, node)])
+        if not state.claim_flush(key):
+            return False
+        self.t.mark_touched((self.last, node))
+        self.t.bump()
+        return True
 
     def _execute_storage_flush(self, node: int, seg: WriteSegment) -> None:
         try:
@@ -800,31 +846,51 @@ class _WriteRankRun:
             self.t.mark_touched((self.last, node))
             self.t.bump()
 
-    def _try_flush_interlayer(self, layer: int, items: list) -> bool:
-        ready = self._ready_interlayer(layer, items)
-        return any(
-            self._flush_interlayer_pass(layer, ready, hot_first)
-            for hot_first in (True, False)
+    def _claim_next_interlayer(self, layer: int, items: list):
+        with self.t.cond:
+            return self._claim_next_interlayer_locked(layer, items)
+
+    def _claim_next_interlayer_locked(self, layer: int, items: list):
+        items[:] = [
+            (n, k) for n, k in items if k not in self.t.node(layer, n).completed
+        ]
+        ready = [
+            (n, k)
+            for n, k in items
+            if self._is_flushable(self.t.node(layer, n), k, layer, n)
+        ]
+        return next(
+            (
+                hit
+                for hot_first in (True, False)
+                if (hit := self._pick_interlayer_locked(layer, ready, hot_first))
+                is not None
+            ),
+            None,
         )
 
-    def _ready_interlayer(self, layer: int, items: list) -> list:
-        with self.t.cond:
-            return [
-                (n, k)
-                for n, k in items
-                if self._is_flushable(self.t.node(layer, n), k, layer, n)
-            ]
+    def _pick_interlayer_locked(self, layer: int, ready: list, hot_first: bool):
+        return next(
+            (
+                hit
+                for node, key in ready
+                if (hit := self._try_pick_interlayer(layer, node, key, hot_first))
+                is not None
+            ),
+            None,
+        )
+
+    def _try_pick_interlayer(self, layer: int, node: int, key, hot_first: bool):
+        seg = self.plan.segments[layer][node][key]
+        groups = self._child_groups(layer, seg)
+        if self._claim_interlayer_locked(layer, node, seg, groups, hot_first):
+            return (node, seg, groups)
+        return None
 
     def _is_flushable(self, state, key, layer: int, node: int) -> bool:
         state.check(self.gens[(layer, node)])
         slot = state.slots.get(key)
         return bool(slot and slot["ready"] and not slot["flushing"])
-
-    def _flush_interlayer_pass(self, layer: int, ready: list, hot_first: bool) -> bool:
-        return any(
-            self._try_interlayer_item(layer, node, key, hot_first)
-            for node, key in ready
-        )
 
     def _child_groups(self, layer: int, seg: WriteSegment) -> dict:
         pairs = {(tn, tk): None for tn, tk, _o, _s in seg.children}
@@ -832,20 +898,6 @@ class _WriteRankRun:
         for tn, tk in pairs:
             groups.setdefault(tn, []).append(self.plan.segments[layer + 1][tn][tk])
         return groups
-
-    def _try_interlayer_item(self, layer: int, node: int, key, hot_first: bool) -> bool:
-        seg = self.plan.segments[layer][node][key]
-        groups = self._child_groups(layer, seg)
-        if not self._claim_interlayer(layer, node, seg, groups, hot_first):
-            return False
-        self._execute_interlayer_flush(layer, node, seg, groups)
-        return True
-
-    def _claim_interlayer(
-        self, layer: int, node: int, seg, groups: dict, hot_first: bool
-    ) -> bool:
-        with self.t.cond:
-            return self._claim_interlayer_locked(layer, node, seg, groups, hot_first)
 
     def _tstate_ready(self, tlayer: int, tnode: int, tsegs: list) -> bool:
         tstate = self.t.node(tlayer, tnode)
@@ -920,8 +972,11 @@ class _WriteRankRun:
     def _record_children_and_release(
         self, layer: int, node: int, seg: WriteSegment, groups: dict, producer
     ) -> None:
+        by_child: dict = {}
         for tnode, tk, off, size in seg.children:
-            self.t.node(layer + 1, tnode).record_stage(tk, (producer, off, size))
+            by_child.setdefault((tnode, tk), []).append((off, size))
+        for (tnode, tk), items in by_child.items():
+            self.t.node(layer + 1, tnode).record_stage_many(tk, producer, items)
         self.t.node(layer, node).complete_flush(seg.key)
         self.t.activity(self.owner, -1)
         for tnode in groups:
@@ -950,7 +1005,7 @@ class _WriteRankRun:
             )
 
     def _is_hot_piece_locked(self, piece) -> bool:
-        node, key, _off, _size = piece
+        node, key, _items = piece
         state = self.t.node(0, node)
         state.check(self.gens[(0, node)])
         return key in state.slots
@@ -970,7 +1025,7 @@ class _WriteRankRun:
         )
 
     def _try_admit_piece_locked(self, piece, hot_l1: bool) -> bool:
-        node, key, _off, _size = piece
+        node, key, _items = piece
         state = self.t.node(0, node)
         state.check(self.gens[(0, node)])
         if key in state.slots:
@@ -996,30 +1051,44 @@ class _WriteRankRun:
         return True
 
     def _run_stage(self, pending: list, piece) -> None:
-        node, key, off, size = piece
+        node, key, items = piece
         try:
             self._inflight(1)
         except BaseException as exc:
             _error_cleanup(exc, self._fail, 0, node, exc, None)
             raise
         try:
-            data = _read(
-                self.src.data_accessor, RangeFromComputeView(key[0], off, size)
-            )
-            _write(
-                self.caches[0].data_accessor,
-                self._range(0, node, key[0], off, size),
-                data,
-            )
+            self._write_stage_items(node, key[0], items)
         except BaseException as exc:
             _error_cleanup(exc, self._flush_failed, 0, node, exc)
             raise
         with self.t.cond:
-            self.t.node(0, node).record_stage(key, (("rank", self.rank), off, size))
+            self.t.node(0, node).record_stage_many(key, ("rank", self.rank), items)
             self.t.activity(self.owner, -1)
             self.t.mark_touched((0, node))
             self.t.bump()
         pending.remove(piece)
+
+    def _write_stage_items(self, node: int, tid: str, items: list) -> None:
+        dst = self.caches[0].data_accessor
+        batch_write = getattr(dst, "write_bytes_batch", None)
+        if batch_write is not None and len(items) > 1:
+            self._write_stage_batches(node, tid, items, batch_write)
+            return
+        for off, size in items:
+            data = _read(self.src.data_accessor, RangeFromComputeView(tid, off, size))
+            _write(dst, self._range(0, node, tid, off, size), data)
+
+    def _write_stage_batches(
+        self, node: int, tid: str, items: list, batch_write
+    ) -> None:
+        for batch in _bounded_batches(items, lambda item: item[1]):
+            ranges = [self._range(0, node, tid, off, size) for off, size in batch]
+            payloads = [
+                _read(self.src.data_accessor, RangeFromComputeView(tid, off, size))
+                for off, size in batch
+            ]
+            batch_write(ranges, payloads)
 
     def _block(self, version: int, deadline: float, pending: list) -> None:
         with self.t.cond:
