@@ -111,12 +111,7 @@ def test_exports_are_exactly_the_design(namespace):
 @pytest.mark.parametrize("name,fields", list(PRODUCT_FIELDS.items()))
 def test_products_mixins_and_factories(name, fields):
     design = (ROOT / "docs" / "DTensorsView-design.md").read_text()
-    if name == "TensorComponentPos":
-        match = re.search(r"^TensorComponentPos = (.*)$", design, re.MULTILINE)
-        assert match is not None
-        declaration = match.group(1)
-        declared_fields = tuple(re.findall(r"\$(\w+)", declaration))
-    elif name in ("Replicate", "Partial"):
+    if name in ("Replicate", "Partial"):
         # Field-less products: `Name = Object` on one line, no `* $field`.
         assert re.search(rf"^{name} = Object\s*$", design, re.MULTILINE)
         declared_fields = ()
@@ -205,7 +200,7 @@ def test_internal_plan_and_check_declarations_match_design_without_importing_the
     design = (ROOT / "docs" / "DTensorsView-design.md").read_text()
     section = design[design.index("#### B.1.2 Plan APIs") : design.index("#### B.1.4")]
     declarations = re.findall(
-        r"^(\w+)(?:\[[^\n]*\])? =\n    (Result\[\w+\])\n(.*?)(?=^\w|^```)",
+        r"^(\w+)(?:\[[^\n]*\])? =\n     (Result\[\w+\])\n(.*?)(?=^\w|^```)",
         section,
         re.MULTILINE | re.DOTALL,
     )

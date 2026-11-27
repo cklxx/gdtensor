@@ -79,7 +79,7 @@ mesh 相关的 Oneof 分支都是命名类型，所以不带 tag；`type()` 或 
 
 一个张量的单张量 mesh 必须等于多张量 mesh 中该张量所在的那一行：
 
-```bash
+```python
 single_tensor_mesh = multi_tensors_mesh[
   tensor_order_value_of(tensor_id) : tensor_order_value_of(tensor_id) + 1,
   :
@@ -154,11 +154,11 @@ node 和 rank 之间的换算由读链的 `num_ranks_per_node` 给出（5.8）�
 
 ## 5 执行模型
 
-### 5.1 CopyPlan 和 DTensorRange
+### 5.1 `CopyPlan` 和 `DTensorRange`
 
 `DTensorRange` 表示一次复制的一侧：
 
-```bash
+```text
 DTensorRange =
     Oneof
   | RangeFromComputeView
@@ -586,61 +586,85 @@ must_ok(io.rank_save(rank, acc_view, out_storage))
 
 ## 附录 B 类型定义
 
-本附录的类型定义用 viba DSL 写。viba（vibe adt）是给 vibe coding 用的意图描述 DSL，定义见 [lixinqi/viba](https://github.com/lixinqi/viba)。本附录是类型定义清单；设计说明见正文。这里用平铺的 viba 全名，没有 namespace；Python 侧的短名和 namespace 见 C.3。全文的 viba 代码块统一把围栏语言写成 `bash`；那只是高亮，不是 shell 命令。
+本附录的类型定义用 viba DSL 写。viba（vibe adt）是给 vibe coding 用的意图描述 DSL，定义见 [lixinqi/viba](https://github.com/lixinqi/viba)。本附录是类型定义清单；设计说明见正文。这里用平铺的 viba 全名，没有 namespace；Python 侧的短名和 namespace 见 C.3。全文的 viba 代码块统一使用 `viba` 围栏并遵循 `viba.lint` 版式与单定义规范。
 
 ### B.1 API
 
 #### B.1.1 IO APIs
 
-```bash
+##### `d_tensors_view_rank_load`
+
+```viba
 # Thin executor of d_tensors_view_rank_plan_load; range selection lives in
 # the plan API only.
 d_tensors_view_rank_load =
-    Result[void]
+     Result[void]
   <- $rank int
   <- $compute_view ComputeDTensorsView
   <- $storage_view StorageDTensorsView
+```
 
+##### `d_tensors_view_rank_save`
+
+```viba
 # Thin executor of d_tensors_view_rank_plan_save.
 d_tensors_view_rank_save =
-    Result[void]
+     Result[void]
   <- $rank int
   <- $compute_view ComputeDTensorsView
   <- $storage_view StorageDTensorsView
+```
 
+##### `d_tensors_view_rank_chain_load`
+
+```viba
 # Thin executor of a read-direction RW chain. Legs and their ranges come from
 # d_tensors_view_rank_plan_chain_load; this only executes them in order.
 d_tensors_view_rank_chain_load =
-    Result[void]
+     Result[void]
   <- $rank int
   <- $rw_chain DTensorsRWChain
+```
 
+##### `d_tensors_view_rank_chain_save`
+
+```viba
 # Thin executor of a write-direction RW chain. Legs and their ranges come from
 # d_tensors_view_rank_plan_chain_save; this only executes them in order.
 d_tensors_view_rank_chain_save =
-    Result[void]
+     Result[void]
   <- $rank int
   <- $rw_chain DTensorsRWChain
 ```
 
 #### B.1.2 Plan APIs
 
-```bash
+##### `d_tensors_view_rank_plan_load`
+
+```viba
 # Internal key function behind d_tensors_view_rank_load. Keep load a thin
 # executor of this plan; range selection must live here only.
 d_tensors_view_rank_plan_load =
-    Result[CopyPlan]
+     Result[CopyPlan]
   <- $rank int
   <- $compute_view ComputeDTensorsView
   <- $storage_view StorageDTensorsView
+```
 
+##### `d_tensors_view_rank_plan_save`
+
+```viba
 # Internal key function behind d_tensors_view_rank_save.
 d_tensors_view_rank_plan_save =
-    Result[CopyPlan]
+     Result[CopyPlan]
   <- $rank int
   <- $compute_view ComputeDTensorsView
   <- $storage_view StorageDTensorsView
+```
 
+##### `d_tensors_view_rank_plan_chain_load`
+
+```viba
 # Internal key function behind d_tensors_view_rank_chain_load. It returns one
 # CopyPlanChain, isomorphic to the read-direction RW chain: one CopyPlan per
 # leg, in data-flow order. The tensor/meta precondition is checked per leg, and
@@ -648,7 +672,7 @@ d_tensors_view_rank_plan_save =
 # row with tensor_order_value_of; tensor_id is never used as a subscript of
 # named_d_tensors (see 5.2).
 d_tensors_view_rank_plan_chain_load =
-    Result[CopyPlanChain]
+     Result[CopyPlanChain]
   <- $rank int
   <- $rw_chain DTensorsRWChain
   <- Assert[{
@@ -659,11 +683,15 @@ d_tensors_view_rank_plan_chain_load =
         global_tensor_meta_of(leg.src.d_tensor_table.named_d_tensors[tensor_order_value_of(leg.src.d_tensor_table, tensor_id)])
         == global_tensor_meta_of(leg.dst.d_tensor_table.named_d_tensors[tensor_order_value_of(leg.dst.d_tensor_table, tensor_id)])
   }]
+```
 
+##### `d_tensors_view_rank_plan_chain_save`
+
+```viba
 # Internal key function behind d_tensors_view_rank_chain_save. Returns one
 # CopyPlanChain isomorphic to the write-direction RW chain.
 d_tensors_view_rank_plan_chain_save =
-    Result[CopyPlanChain]
+     Result[CopyPlanChain]
   <- $rank int
   <- $rw_chain DTensorsRWChain
   <- Assert[{
@@ -678,113 +706,167 @@ d_tensors_view_rank_plan_chain_save =
 
 #### B.1.3 Check APIs
 
-```bash
+##### `check_compute_d_tensors_access_disjoint`
+
+```viba
 check_compute_d_tensors_access_disjoint =
-    Result[void]
+     Result[void]
   <- $d_tensor_table DTensorTable[ComputeMesh]
   <- $copy_plan CopyPlan
+```
 
+##### `check_compute_d_tensors_access_full_covering`
+
+```viba
 check_compute_d_tensors_access_full_covering =
-    Result[void]
+     Result[void]
   <- $d_tensor_table DTensorTable[ComputeMesh]
   <- $copy_plan CopyPlan
+```
 
+##### `check_cache_d_tensors_access_disjoint`
+
+```viba
 check_cache_d_tensors_access_disjoint =
-    Result[void]
+     Result[void]
   <- $d_tensor_table DTensorTable[CacheMesh]
   <- $copy_plan CopyPlan
+```
 
+##### `check_cache_d_tensors_access_full_covering`
+
+```viba
 check_cache_d_tensors_access_full_covering =
-    Result[void]
+     Result[void]
   <- $d_tensor_table DTensorTable[CacheMesh]
   <- $copy_plan CopyPlan
+```
 
+##### `check_storage_d_tensors_access_disjoint`
+
+```viba
 check_storage_d_tensors_access_disjoint =
-    Result[void]
+     Result[void]
   <- $d_tensor_table DTensorTable[SingleTensorStorageMesh]
   <- $physical_layout PhysicalLayoutTable
   <- $file_paths list[str]
   <- $copy_plan CopyPlan
+```
 
+##### `check_storage_d_tensors_access_full_covering`
+
+```viba
 check_storage_d_tensors_access_full_covering =
-    Result[void]
+     Result[void]
   <- $d_tensor_table DTensorTable[SingleTensorStorageMesh]
   <- $physical_layout PhysicalLayoutTable
   <- $file_paths list[str]
   <- $copy_plan CopyPlan
+```
 
+##### `check_storage_mesh_disjoint`
+
+```viba
 check_storage_mesh_disjoint[TensorSlotsMeshT] =
-    Result[void]
+     Result[void]
   <- $lhs StorageMesh[TensorSlotsMeshT]
   <- $rhs StorageMesh[TensorSlotsMeshT]
 ```
 
 #### B.1.4 Compute/Torch APIs
 
-```bash
+##### `compute_d_tensors_view_get_tensor_ids`
+
+```viba
 # List tensor ids in a compute view.
 compute_d_tensors_view_get_tensor_ids =
-    list[str]
+     list[str]
   <- $view ComputeDTensorsView
+```
 
+##### `compute_d_tensors_view_get_gd_tensor`
+
+```viba
 # Get a generic compute tensor by tensor id. Use tensor_order_value_of for
 # the lookup; a missing id returns Err with NotFoundError.
 compute_d_tensors_view_get_gd_tensor =
-    Result[GenericDTensor[ComputeMesh]]
+     Result[GenericDTensor[ComputeMesh]]
   <- $view ComputeDTensorsView
   <- $tensor_id str
+```
 
+##### `gd_tensor_make`
+
+```viba
 # Wrap a torch.DTensor as a generic compute tensor. The torch tensor provides
 # the data, global meta, placements and device mesh; gd_tensor_make converts
 # the device mesh to the viba ComputeMesh.
 gd_tensor_make =
-    GenericDTensor[ComputeMesh]
+     GenericDTensor[ComputeMesh]
   <- $d_tensor torch.DTensor
+```
 
+##### `gd_tensor_get_d_tensor`
+
+```viba
 # Get the underlying torch.DTensor; nil means metadata-only.
 gd_tensor_get_d_tensor =
-    (torch.DTensor | nil)
+     (torch.DTensor | nil)
   <- $gd_tensor GenericDTensor[ComputeMesh]
+```
 
+##### `gd_tensor_reset_d_tensor`
+
+```viba
 # Replace the underlying torch.DTensor.
 gd_tensor_reset_d_tensor =
-    void
+     void
   <- $gd_tensor GenericDTensor[ComputeMesh]
   <- $d_tensor torch.DTensor
 ```
 
 #### B.1.5 View constructors
 
-```bash
+##### `d_tensors_view_map`
+
+```viba
 # Convert each tensor of origin. Callbacks are optional: a nil tensor
 # callback means identity; a nil session callback means skip that session.
 # No range selection.
 d_tensors_view_map =
-       Result[DTensorsView]
+     Result[DTensorsView]
   <- $origin DTensorsView
   <- $map_core DTensorsViewMapCore
 ```
 
 #### B.1.6 Stats APIs
 
-```bash
-# Pure functions over the RW chain structure: no session is opened
-# and no payload is read. Each result has one entry per node of the chain,
-# indexed by node id, in bytes.
+各函数在读写链结构上纯静态计算，不打开 session 也不读取 payload；返回值按节点 id 索引，单位为字节。
 
+##### `get_stat_mem_overhead_of_rw_chain`
+
+```viba
 # Memory the cache occupies on each node.
 get_stat_mem_overhead_of_rw_chain =
-    list[int]
+     list[int]
   <- $rw_chain DTensorsRWChain
+```
 
+##### `get_stat_outbound_traffic_of_rw_chain`
+
+```viba
 # Bytes each node sends out.
 get_stat_outbound_traffic_of_rw_chain =
-    list[int]
+     list[int]
   <- $rw_chain DTensorsRWChain
+```
 
+##### `get_stat_inbound_traffic_of_rw_chain`
+
+```viba
 # Bytes each node takes in.
 get_stat_inbound_traffic_of_rw_chain =
-    list[int]
+     list[int]
   <- $rw_chain DTensorsRWChain
 ```
 
@@ -794,21 +876,28 @@ get_stat_inbound_traffic_of_rw_chain =
 
 #### B.2.1 Compute side
 
-##### B.2.1.1 ComputeDTensorsView
+##### B.2.1.1 `ComputeDTensorsView`
 
-```bash
+```viba
 ComputeDTensorsView =
     Object
-  * $tensor_ids list[str]
-    # Tensors described by this view; the rank is an API argument, not a field.
-  * $d_tensor_table DTensorTable[ComputeMesh]
-    # Host-side access to the local tensor ranges.
-  * $data_accessor DTensorDataAccessor[RangeFromComputeView]
+  * $tensor_ids (
+        list[str]
+      * { Tensors described by this view; the rank is an API argument, not a field. }
+    )
+  * $d_tensor_table (
+        DTensorTable[ComputeMesh]
+      * { Compute DTensor table ordered consistently with tensor_ids. }
+    )
+  * $data_accessor (
+        DTensorDataAccessor[RangeFromComputeView]
+      * { Host-side access to the local tensor ranges. }
+    )
 ```
 
-##### B.2.1.2 ComputeMesh
+##### B.2.1.2 `ComputeMesh`
 
-```bash
+```viba
 # Branches are named types; no tags, the payload type is the branch.
 ComputeMesh =
     Oneof
@@ -823,55 +912,64 @@ ComputeMesh =
 
 `slot`（槽位）是逻辑概念，不是文件或容器。把存储计划看成一个 `num_tensors × world_size` 的表：每一行是一个张量，每一列是一个全局 rank，每个格子是一个 slot；总 slot 数 = `num_tensors * world_size`。格子可以为空：该 rank 不持有这个张量、这个张量不在该 pp stage，或者它只存一份而其余列留空。同一行的非空格子按列顺序拼接，构成这个张量的存储区域。`StorageMesh` 的 `SlotOuterProductMesh` 分支里，`tensor_slots` 选择行（张量），`content_slots` 选择列（slot）；`content_slots` 是 `ContentSlotsMesh`，即 `LiteralMesh["world_size"] | ArrangedMesh["world_size"]`：`LiteralMesh` 直接给出 rank 列表，`ArrangedMesh` 的 `"world_size"` 是列数。
 
-##### B.2.2.1 StorageDTensorsView
+##### B.2.2.1 `StorageDTensorsView`
 
-```bash
+```viba
 StorageDTensorsView =
     Object
-    # Tensors this view covers; a subset of the storage DTensors.
-  * $tensor_ids list[str]
-    # Storage DTensor table; named_d_tensors order is the header order.
-  * $d_tensor_table DTensorTable[SingleTensorStorageMesh]
-    # Read/write raw storage ranges; the range carries a file path and offset.
-  * $data_accessor DTensorDataAccessor[RangeFromStorageView]
-    # Physical file table; lookup instead of computation.
-  * $physical_layout PhysicalLayoutTable
-    # Create a save session. Example (safetensors): compute relative
-    # data_offsets from tensor sizes/order, serialize and pad the header,
-    # then data_start = 8 + header_len; write the header first and return
-    # the session. Data is written later through data_accessor.
-  * $begin_save (
-        Result[StorageSaveSession]
-      <- $self StorageDTensorsView
-      <- $rank int
+  * $tensor_ids (
+        list[str]
+      * { Tensors this view covers; a subset of the storage DTensors. }
     )
-    # Create a load session. Example (safetensors): open the file and read
-    # its header before any get_file_offset call.
+  * $d_tensor_table (
+        DTensorTable[SingleTensorStorageMesh]
+      * { Storage DTensor table; named_d_tensors order is the header order. }
+    )
+  * $data_accessor (
+        DTensorDataAccessor[RangeFromStorageView]
+      * { Read/write raw storage ranges; the range carries a file path and offset. }
+    )
+  * $physical_layout (
+        PhysicalLayoutTable
+      * { Physical file table; lookup instead of computation. }
+    )
+  * $begin_save (
+        (
+             Result[StorageSaveSession]
+          <- $self StorageDTensorsView
+          <- $rank int
+        )
+      * { Create a save session; safetensors writes header first and returns session. }
+    )
   * $begin_load (
-        Result[StorageLoadSession]
-      <- $self StorageDTensorsView
-      <- $rank int
+        (
+             Result[StorageLoadSession]
+          <- $self StorageDTensorsView
+          <- $rank int
+        )
+      * { Create a load session and read the container header before get_file_offset calls. }
     )
 ```
 
-##### B.2.2.2 PhysicalLayoutTable
+##### B.2.2.2 `PhysicalLayoutTable`
 
-```bash
-ContainerFormat = "safetensors" | "distcp"
-
-TensorComponentPos = $tensor_id str * $rank int
-
+```viba
 # Pure configuration data; produced by a business layout constructor from
 # DTensorTable and the chosen topology / format.
 PhysicalLayoutTable =
     Object
-    # One format for every file in this plan.
-  * $container_format ContainerFormat
-    # TensorComponentPos -> the list that contains it; a missing key means
-    # this tensor has no physical file on this rank.
-  * $tensor_entries dict[TensorComponentPos, DisjointStorageMeshList]
-    # leader TensorComponentPos -> physical file path.
-  * $file_paths dict[TensorComponentPos, $file_path str]
+  * $container_format (
+        ContainerFormat
+      * { One format for every file in this plan. }
+    )
+  * $tensor_entries (
+        dict[TensorComponentPos, DisjointStorageMeshList]
+      * { TensorComponentPos -> the list that contains it; missing means no physical file on this rank. }
+    )
+  * $file_paths (
+        dict[TensorComponentPos, $file_path str]
+      * { Leader TensorComponentPos -> physical file path. }
+    )
   * Hint[{
     1. 系统可能会同时支持多种保存拓扑，比如每个 rank 存一个或多个文件，或者多个 rank 存一个文件，或者每个 pp stage 存一个文件，等等。
     2. 同一个 PhysicalLayoutTable 只对应一种 ContainerFormat；要混格式就拆成多份布局。
@@ -879,29 +977,59 @@ PhysicalLayoutTable =
     4. 查表方式：先在 tensor_entries 里按 TensorComponentPos 找 disjoint_storage_meshes；没有这个键表示没有物理文件；再用 leader_tensor_component_pos_of(disjoint_storage_meshes) 在 file_paths 里找路径。
     5. file_paths 的键必须是某个 DisjointStorageMeshList 的 leader TensorComponentPos；同一个 list 只对应一个路径。
   }]
+```
 
+###### `ContainerFormat`
+
+```viba
+ContainerFormat = "safetensors" | "distcp"
+```
+
+###### `TensorComponentPos`
+
+```viba
+TensorComponentPos =
+    Object
+  * $tensor_id (
+        str
+      * { Global tensor identifier. }
+    )
+  * $rank (
+        int
+      * { Global rank index covering the component slot. }
+    )
+```
+
+###### `leader_tensor_component_pos_of`
+
+```viba
 # Canonical TensorComponentPos of a DisjointStorageMeshList; used as its
 # dict key.
 leader_tensor_component_pos_of =
-    TensorComponentPos
+     TensorComponentPos
   <- $disjoint_storage_meshes DisjointStorageMeshList
+```
 
+###### `file_path_of`
+
+```viba
 # Path for a component pos: tensor_entries[pos] -> list -> leader ->
 # file_paths. A missing key at either step returns Err with NotFoundError.
 file_path_of =
-    Result[str]
+     Result[str]
   <- $layout PhysicalLayoutTable
   <- $pos TensorComponentPos
 ```
 
-##### B.2.2.3 DisjointStorageMeshList
+##### B.2.2.3 `DisjointStorageMeshList`
 
-```bash
+```viba
 DisjointStorageMeshList =
     Object
-    # One logical list per physical file. The meshes inside this list are
-    # disjoint, and meshes from different files are disjoint too.
-  * $disjoint_storage_mesh_list list[MultiTensorsStorageMesh]
+  * $disjoint_storage_mesh_list (
+        list[MultiTensorsStorageMesh]
+      * { One logical list per physical file; meshes inside and across files are disjoint. }
+    )
   * Hint[{
     不同物理文件的 mesh 也互不重叠：每个 slot 最多被一个 mesh 覆盖。
     每个空 content slot 占用 0 字节；空槽不参与 offset 累加，所以 list 里有很多空槽也不会让后续张量的 offset 错位。
@@ -914,25 +1042,50 @@ DisjointStorageMeshList =
   }]
 ```
 
-##### B.2.2.4 StorageMesh
+##### B.2.2.4 `StorageMesh`
 
-```bash
+###### `SingleTensorStorageMesh`
+
+```viba
 SingleTensorStorageMesh = StorageMesh[ArrangedMesh["constant_one"]]
-MultiTensorsStorageMesh = StorageMesh[ArrangedMesh["tensor_count"]]
+```
 
+###### `MultiTensorsStorageMesh`
+
+```viba
+MultiTensorsStorageMesh = StorageMesh[ArrangedMesh["tensor_count"]]
+```
+
+###### `StorageMesh` body
+
+```viba
 # Branches are named types; no tags.
 StorageMesh[TensorSlotsMeshT] =
     Oneof
   | SlotOuterProductMesh[TensorSlotsMeshT]
   | ReshapedMesh[StorageMesh[TensorSlotsMeshT]]
   | SlicedMesh[StorageMesh[TensorSlotsMeshT]]
+```
 
+###### `SlotOuterProductMesh`
+
+```viba
 # The two dimensions: which tensors, which content slots.
 SlotOuterProductMesh[TensorSlotsMeshT] =
     Object
-  * $tensor_slots TensorSlotsMeshT
-  * $content_slots ContentSlotsMesh
+  * $tensor_slots (
+        TensorSlotsMeshT
+      * { Selected tensor rows covered by this storage mesh. }
+    )
+  * $content_slots (
+        ContentSlotsMesh
+      * { Selected content slot columns covered by this storage mesh. }
+    )
+```
 
+###### `ContentSlotsMesh`
+
+```viba
 # Content slot selector: an explicit rank list, or an arranged world_size.
 ContentSlotsMesh =
     Oneof
@@ -940,9 +1093,9 @@ ContentSlotsMesh =
   | ArrangedMesh["world_size"]
 ```
 
-##### B.2.2.5 StorageSaveSession
+##### B.2.2.5 `StorageSaveSession`
 
-```bash
+```viba
 # Interface type; a concrete session (e.g. SafeTensorsSession or
 # DcpTensorsSession) implements get_file_offset / init_data_accessor /
 # commit / abort.
@@ -952,46 +1105,40 @@ ContentSlotsMesh =
 # through DTensorDataAccessor, not through the offset methods directly.
 StorageSaveSession =
     Object
-    # Actual file offset (header/alignment included); valid after begin_save,
-    # before commit/abort. safetensors: 8 + header_len + relative data_offset.
-    # The data_accessor uses contiguous_payload_offset, not this value.
-    # Example: data_start 208 + contiguous offset 100 = actual 308.
-    # Empty slots occupy 0 bytes; offset accumulation skips them.
   * $get_file_offset (
-        Result[int]
-      <- $self StorageSaveSession
-      <- $pos TensorComponentPos
+        (
+             Result[int]
+          <- $self StorageSaveSession
+          <- $pos TensorComponentPos
+        )
+      * { Actual file offset (header/alignment included); valid between begin_save and commit/abort. }
     )
-    # Bind buffer I/O to this session and return the accessor. The accessor
-    # maps RangeFromStorageView.contiguous_payload_offset through this
-    # session's get_file_offset; callers that only hold the session use this
-    # accessor instead of StorageDTensorsView.data_accessor.
   * $init_data_accessor (
-        Result[DTensorDataAccessor[RangeFromStorageView]]
-      <- $self StorageSaveSession
+        (
+             Result[DTensorDataAccessor[RangeFromStorageView]]
+          <- $self StorageSaveSession
+        )
+      * { Bind buffer I/O to this save session and return its data accessor. }
     )
-    # Publish the save, then close the session.
-    # Example (safetensors): fsync model.safetensors.tmp, then rename it to
-    # model.safetensors. Readers see the old file or no file before commit,
-    # and the complete new file after.
-    # Example (distcp): write .metadata.tmp, fsync, then rename it to
-    # .metadata; the presence of .metadata is the checkpoint-complete marker.
-    # If the outcome is unknown, keep payloads; do not delete them.
   * $commit (
-        Result[void]
-      <- $self StorageSaveSession
+        (
+             Result[void]
+          <- $self StorageSaveSession
+        )
+      * { Publish the save (e.g. fsync + rename), then close; keep payloads if outcome is unknown. }
     )
-    # Discard temporary files and close the session. Do not delete payloads
-    # after an uncertain commit; the final path may already exist.
   * $abort (
-        Result[void]
-      <- $self StorageSaveSession
+        (
+             Result[void]
+          <- $self StorageSaveSession
+        )
+      * { Discard temporary files and close; never delete payloads after an uncertain commit. }
     )
 ```
 
-##### B.2.2.6 StorageLoadSession
+##### B.2.2.6 `StorageLoadSession`
 
-```bash
+```viba
 # Interface type; a concrete session (e.g. SafeTensorsSession or
 # DcpTensorsSession) implements get_file_offset / init_data_accessor / finish.
 # Load session has one terminal operation: finish (close). It never
@@ -1000,68 +1147,85 @@ StorageSaveSession =
 # through DTensorDataAccessor, not through the offset methods directly.
 StorageLoadSession =
     Object
-    # Actual file offset (header/alignment included); valid after begin_load,
-    # before finish. safetensors: 8 + header_len + relative data_offset.
-    # The data_accessor uses contiguous_payload_offset, not this value.
-    # Example: data_start 208 + contiguous offset 100 = actual 308.
-    # Empty slots occupy 0 bytes; offset accumulation skips them.
   * $get_file_offset (
-        Result[int]
-      <- $self StorageLoadSession
-      <- $pos TensorComponentPos
+        (
+             Result[int]
+          <- $self StorageLoadSession
+          <- $pos TensorComponentPos
+        )
+      * { Actual file offset (header/alignment included); valid between begin_load and finish. }
     )
-    # Bind buffer I/O to this session and return the accessor. The accessor
-    # maps RangeFromStorageView.contiguous_payload_offset through this
-    # session's get_file_offset; callers that only hold the session use this
-    # accessor instead of StorageDTensorsView.data_accessor.
   * $init_data_accessor (
-        Result[DTensorDataAccessor[RangeFromStorageView]]
-      <- $self StorageLoadSession
+        (
+             Result[DTensorDataAccessor[RangeFromStorageView]]
+          <- $self StorageLoadSession
+        )
+      * { Bind buffer I/O to this load session and return its data accessor. }
     )
-    # Close the load session. Example: close file handles; the read-only
-    # side has nothing to publish, so there is no commit here.
   * $finish (
-        Result[void]
-      <- $self StorageLoadSession
+        (
+             Result[void]
+          <- $self StorageLoadSession
+        )
+      * { Close the read-only load session handles. }
     )
 ```
 
 #### B.2.3 Cache side
 
-##### B.2.3.1 CacheDTensorsView
+##### B.2.3.1 `CacheDTensorsView`
 
-```bash
+```viba
 # Node-local companion storage on the compute side. Its range type is
 # RangeFromCacheView, which is RangeFromComputeView (B.3.1), so a cache view
 # needs no session and no PhysicalLayoutTable.
 CacheDTensorsView =
     Object
-    # Tensors cached by this view.
-  * $tensor_ids list[str]
-    # Cache mesh; its participants are nodes, not ranks.
-  * $d_tensor_table DTensorTable[CacheMesh]
-    # Read/write raw cache ranges; same range type as the compute side.
-  * $data_accessor DTensorDataAccessor[RangeFromCacheView]
+  * $tensor_ids (
+        list[str]
+      * { Tensors cached by this view. }
+    )
+  * $d_tensor_table (
+        DTensorTable[CacheMesh]
+      * { Cache mesh tensor table; its participants are nodes, not ranks. }
+    )
+  * $data_accessor (
+        DTensorDataAccessor[RangeFromCacheView]
+      * { Read/write raw cache ranges; same range type as the compute side. }
+    )
 ```
 
 缓存是计算节点上的伴生存储：数据在节点本地，读写不经文件，所以这个 view 的字段和 `ComputeDTensorsView` 相同，只把 mesh 换成 `CacheMesh`。
 
-##### B.2.3.2 CacheMesh
+##### B.2.3.2 `CacheMesh`
 
-```bash
+```viba
 # Branches are named types; no tags.
 CacheMesh =
     Oneof
   | StCacheOuterProductMesh
   | PermutedMesh[CacheMesh]
+```
 
+###### `StCacheOuterProductMesh`
+
+```viba
 # St -- spatiotemporal. Three dimensions: temporal (steps), spatial (nodes)
 # and concurrency (buffer slots).
 StCacheOuterProductMesh =
     Object
-  * $temporal TemporalCacheMesh
-  * $spatial SpatioCacheMesh
-  * $concurrency ConcurrencyMesh
+  * $temporal (
+        TemporalCacheMesh
+      * { Temporal reuse dimension across num_steps steps (placement fixed to Shard). }
+    )
+  * $spatial (
+        SpatioCacheMesh
+      * { Spatial node dimension across num_nodes nodes (Replicate on read, Shard on write). }
+    )
+  * $concurrency (
+        ConcurrencyMesh
+      * { Concurrent buffer slot dimension across concurrency_width slots (placement fixed to Shard). }
+    )
   * Hint[{
     1. 放置符按维度约束：temporal / concurrency 固定为 Shard，spatial 允许 Replicate 或 Shard（读方向为 Replicate，写方向为 Shard）；mesh 做了 PermutedMesh 时 placements 按同样的顺序排。check_constraints 拒绝别的组合。
     2. spatial 维在读方向逐级 Replicate 放大副本消减读热点（一传十、十传百）；在写方向使用 Shard 让各节点持互不重叠分片并逐级合并为更大连续段。
@@ -1072,15 +1236,27 @@ StCacheOuterProductMesh =
     6. ReshapedMesh 保持元素总数不变，所以 temporal 与 spatial 之间的 reshape 只在两侧总数相等时成立；reshape 只改展开顺序，不改放置符。
     7. CacheMesh 没有 SlicedMesh 分支。
   }]
+```
 
+###### `ConcurrencyMesh`
+
+```viba
 ConcurrencyMesh = ArrangedMesh["concurrency_width"]
+```
 
+###### `TemporalCacheMesh`
+
+```viba
 # Temporal dimension; num_steps is the number of steps.
 TemporalCacheMesh =
     Oneof
   | ArrangedMesh["num_steps"]
   | ReshapedMesh[SpatioCacheMesh]
+```
 
+###### `SpatioCacheMesh`
+
+```viba
 # Spatial dimension; num_nodes is the number of nodes.
 SpatioCacheMesh =
     Oneof
@@ -1088,9 +1264,9 @@ SpatioCacheMesh =
   | ReshapedMesh[TemporalCacheMesh]
 ```
 
-##### B.2.3.3 is_cache_mesh_subset_of_mesh
+##### B.2.3.3 `is_cache_mesh_subset_of_mesh`
 
-```bash
+```viba
 # True when every rank covered by lhs is also covered by rhs. A cache mesh
 # is expanded to ranks through its spatial dimension only: node n maps to
 # [n * num_ranks_per_node, (n + 1) * num_ranks_per_node), and the temporal /
@@ -1098,7 +1274,7 @@ SpatioCacheMesh =
 # ranks. rhs is expanded the same way when it is a cache mesh, and is already
 # in ranks when it is a compute mesh. Used by the read chain Assert in B.3.2.
 is_cache_mesh_subset_of_mesh =
-    bool
+     bool
   <- $lhs CacheMesh
   <- $rhs (CacheMesh | ComputeMesh)
   <- $num_ranks_per_node int
@@ -1106,9 +1282,9 @@ is_cache_mesh_subset_of_mesh =
 
 #### B.2.4 Common
 
-##### B.2.4.1 DTensorsView
+##### B.2.4.1 `DTensorsView`
 
-```bash
+```viba
 DTensorsView =
     Oneof
   | ComputeDTensorsView
@@ -1116,176 +1292,264 @@ DTensorsView =
   | CacheDTensorsView
 ```
 
-##### B.2.4.2 DTensorDataAccessor
+##### B.2.4.2 `DTensorDataAccessor`
 
-```bash
+```viba
 DTensorDataAccessor[RangeT] =
     Object
-    # Read one range owned by this view and hand each chunk to the callback.
-    # RangeT is the compute-side or storage-side range; units are bytes.
   * $read_to_buffer (
-         Result[void]
-      <- $global_range RangeT
-      <- $read_to_buffer (Result[void] <- $buffer_ptr int <- $buffer_len int)
+        (
+             Result[void]
+          <- $global_range RangeT
+          <- $read_to_buffer (
+                  Result[void]
+               <- $buffer_ptr int
+               <- $buffer_len int
+             )
+        )
+      * { Read one range owned by this view and hand each byte chunk to the callback. }
     )
-    # Ask the callback for each chunk and write it into one range owned by
-    # this view. RangeT is the compute-side or storage-side range; units are bytes.
   * $write_from_buffer (
-         Result[void]
-      <- $global_range RangeT
-      <- $write_from_buffer (Result[void] <- $buffer_ptr int <- $buffer_len int)
+        (
+             Result[void]
+          <- $global_range RangeT
+          <- $write_from_buffer (
+                  Result[void]
+               <- $buffer_ptr int
+               <- $buffer_len int
+             )
+        )
+      * { Pull each byte chunk from the callback and write it into one range owned by this view. }
     )
 ```
 
-##### B.2.4.3 NamedDTensor
+##### B.2.4.3 `NamedDTensor`
 
-```bash
+```viba
 NamedDTensor[MeshT] =
     Object
-    # Stable tensor name inside its weight namespace.
-  * $global_tensor_id str
-    # Logical tensor view; its metadata is the global tensor metadata.
-  * $d_tensor GenericDTensor[MeshT]
-    # Other module paths that name the same payload.
-  * $alias list[str]
+  * $global_tensor_id (
+        str
+      * { Stable tensor name inside its weight namespace. }
+    )
+  * $d_tensor (
+        GenericDTensor[MeshT]
+      * { Logical tensor view; its metadata is the global tensor metadata. }
+    )
+  * $alias (
+        list[str]
+      * { Other module paths that name the same payload. }
+    )
 ```
 
-##### B.2.4.4 GenericDTensor
+##### B.2.4.4 `GenericDTensor`
 
-```bash
+```viba
 GenericDTensor[MeshT] =
     Oneof
   | NaiveDTensor[MeshT]
   | ReshapedDTensor[MeshT]
+```
 
+###### `ReshapedDTensor`
+
+```viba
 # Element-order-preserving logical reshape; shape must keep the local
 # ownership interval unchanged, otherwise redistribute first.
 ReshapedDTensor[MeshT] =
     Object
-    # Tensor being reshaped.
-  * $underlying_d_tensor NaiveDTensor[MeshT]
-    # Shape of the logical reshape; one entry per tensor dimension.
-  * $shape list[int]
+  * $underlying_d_tensor (
+        NaiveDTensor[MeshT]
+      * { Underlying unreshaped tensor being logically reshaped. }
+    )
+  * $shape (
+        list[int]
+      * { Shape of the logical reshape; one entry per tensor dimension. }
+    )
 ```
 
-##### B.2.4.5 NaiveDTensor
+##### B.2.4.5 `NaiveDTensor`
 
-```bash
+```viba
 NaiveDTensor[MeshT] =
     Object
-    # Full logical tensor metadata.
-  * $global_tensor_meta GlobalTensorMeta
-    # One placement per mesh dimension, in mesh order.
-  * $placements list[Placement]
-    # Mesh this tensor is placed on.
-  * $mesh MeshT
-    # Underlying torch tensor for compute-side processing; nil means
-    # metadata-only. Only compute-side tensors set this; storage-side tensors
-    # keep it nil. Use gd_tensor_get_d_tensor / gd_tensor_reset_d_tensor.
-  * $torch_d_tensor (torch.DTensor | nil)
+  * $global_tensor_meta (
+        GlobalTensorMeta
+      * { Full logical tensor metadata. }
+    )
+  * $placements (
+        list[Placement]
+      * { One placement per mesh dimension, in mesh order. }
+    )
+  * $mesh (
+        MeshT
+      * { Mesh this tensor is placed on. }
+    )
+  * $torch_d_tensor (
+        (torch.DTensor | nil)
+      * { Underlying compute-side torch tensor; nil means metadata-only. }
+    )
 ```
 
-##### B.2.4.6 GlobalTensorMeta
+##### B.2.4.6 `GlobalTensorMeta`
 
-```bash
+```viba
 GlobalTensorMeta =
     Object
-    # Shape of the full logical tensor; one entry per dimension.
-  * $global_shape list[int]
-    # Framework dtype name.
-  * $dtype str
-    # Bytes per element.
-  * $itemsize int
+  * $global_shape (
+        list[int]
+      * { Shape of the full logical tensor; one entry per dimension. }
+    )
+  * $dtype (
+        str
+      * { Framework dtype name. }
+    )
+  * $itemsize (
+        int
+      * { Bytes per element. }
+    )
 ```
 
-##### B.2.4.7 Placement
+##### B.2.4.7 `Placement`
 
-```bash
+```viba
 # Branches are named types; no tags.
 Placement =
     Oneof
   | Shard
   | Replicate
   | Partial
+```
 
+###### `Shard`
+
+```viba
 # One contiguous logical slice along this tensor dimension.
 Shard =
     Object
-  * $axis int
+  * $axis (
+        int
+      * { Non-negative tensor axis index along which the tensor is sharded. }
+    )
+```
 
+###### `Replicate`
+
+```viba
 # Every participant holds the full tensor. Must be a field-less type: the
 # type itself carries the meaning.
 Replicate = Object
+```
 
+###### `Partial`
+
+```viba
 # Every participant holds a reduction contribution; not persistable yet.
 # Must be a field-less type, same as Replicate.
 Partial = Object
 ```
 
-##### B.2.4.8 DTensorTable
+##### B.2.4.8 `DTensorTable`
 
-```bash
+```viba
 DTensorTable[MeshT] =
     Object
-    # Ordered DTensors; list order is the header order.
-  * $named_d_tensors list[NamedDTensor[MeshT]]
+  * $named_d_tensors (
+        list[NamedDTensor[MeshT]]
+      * { Ordered DTensors; list order is the header order. }
+    )
 ```
 
-##### B.2.4.9 GlobalTensorMetaOf
+##### B.2.4.9 `global_tensor_meta_of`
 
-```bash
+```viba
 global_tensor_meta_of[MeshT] =
-    GlobalTensorMeta
+     GlobalTensorMeta
   <- $named_d_tensor NamedDTensor[MeshT]
 ```
 
-##### B.2.4.10 TensorOrderValueOf
+##### B.2.4.10 `tensor_order_value_of`
 
-```bash
+```viba
 # List index of tensor_id in named_d_tensors; a missing id returns Err
 # with NotFoundError.
 tensor_order_value_of[MeshT] =
-    Result[int]
+     Result[int]
   <- $d_tensor_table DTensorTable[MeshT]
   <- $tensor_id str
 ```
 
-##### B.2.4.11 DTensorsViewMapCore
+##### B.2.4.11 `DTensorsViewMapCore`
 
-```bash
+```viba
 # Five optional callbacks for d_tensors_view_map. Compute, storage and cache
 # tensor callbacks are separate because their tensor types differ; storage
 # also converts sessions. A nil tensor callback means identity; a nil session
 # callback means skip that session.
 DTensorsViewMapCore =
     Object
-  * $convert_each_compute_view ((
-          Result[GenericDTensor[ComputeMesh]]
-        <- $tensor GenericDTensor[ComputeMesh]
-      ) | nil)
-  * $convert_each_storage_view ((
-          Result[GenericDTensor[StorageMesh]]
-        <- $tensor GenericDTensor[StorageMesh]
-      ) | nil)
-  * $convert_each_cache_view ((
-          Result[GenericDTensor[CacheMesh]]
-        <- $tensor GenericDTensor[CacheMesh]
-      ) | nil)
-  * $convert_each_storage_load_session ((
-          Result[StorageLoadSession]
-        <- $session StorageLoadSession
-      ) | nil)
-  * $convert_each_storage_save_session ((
-          Result[StorageSaveSession]
-        <- $session StorageSaveSession
-      ) | nil)
+  * $convert_each_compute_view (
+        (
+            Oneof
+          | (
+                 Result[GenericDTensor[ComputeMesh]]
+              <- $tensor GenericDTensor[ComputeMesh]
+            )
+          | nil
+        )
+      * { Optional transform for each compute GenericDTensor; nil keeps identity. }
+    )
+  * $convert_each_storage_view (
+        (
+            Oneof
+          | (
+                 Result[GenericDTensor[StorageMesh]]
+              <- $tensor GenericDTensor[StorageMesh]
+            )
+          | nil
+        )
+      * { Optional transform for each storage GenericDTensor; nil keeps identity. }
+    )
+  * $convert_each_cache_view (
+        (
+            Oneof
+          | (
+                 Result[GenericDTensor[CacheMesh]]
+              <- $tensor GenericDTensor[CacheMesh]
+            )
+          | nil
+        )
+      * { Optional transform for each cache GenericDTensor; nil keeps identity. }
+    )
+  * $convert_each_storage_load_session (
+        (
+            Oneof
+          | (
+                 Result[StorageLoadSession]
+              <- $session StorageLoadSession
+            )
+          | nil
+        )
+      * { Optional transform for each StorageLoadSession; nil skips session conversion. }
+    )
+  * $convert_each_storage_save_session (
+        (
+            Oneof
+          | (
+                 Result[StorageSaveSession]
+              <- $session StorageSaveSession
+            )
+          | nil
+        )
+      * { Optional transform for each StorageSaveSession; nil skips session conversion. }
+    )
 ```
 
-### B.2.5 check_constraints
+### B.2.5 `check_constraints`
 
 每个数据 `Object` / `Oneof`（session / access 接口除外）都有：
 
-```bash
+```viba
 check_constraints = Result[void] <- $self T
 ```
 
@@ -1328,78 +1592,114 @@ Python 实现里，`check_constraints` 在数据类 `Foo` 上；build 接口在 
 
 #### B.3.1 Ranges
 
-```bash
+##### `CopyPlan`
+
+```viba
+# One source-to-destination copy; each side is a DTensorRange.
+CopyPlan = list[($src DTensorRange, $dst DTensorRange)]
+```
+
+##### `DTensorRange`
+
+```viba
 # A range on either side of a copy: a compute, storage, or cache view. A
 # cache view uses RangeFromComputeView, so there are only two branches.
 DTensorRange =
     Oneof
   | RangeFromComputeView
   | RangeFromStorageView
+```
 
-# One source-to-destination copy; each side is a DTensorRange.
-CopyPlan = list[(
-  $src DTensorRange,
-  $dst DTensorRange
-)]
+##### `RangeFromCacheView`
 
-RangeFromComputeView =
-    Object
-  * $global_tensor_id str
-  * $global_tensor_offset int
-  * $size int
-
+```viba
 # A cache range is a compute range: the cache lives on the compute side and
 # its accessor takes the same range type, so DTensorRange has no cache
 # branch.
 RangeFromCacheView = RangeFromComputeView
+```
 
+##### `RangeFromComputeView`
+
+```viba
+RangeFromComputeView =
+    Object
+  * $global_tensor_id (
+        str
+      * { Global tensor identifier on the compute or cache side. }
+    )
+  * $global_tensor_offset (
+        int
+      * { Byte offset inside the global logical tensor. }
+    )
+  * $size (
+        int
+      * { Byte length of this slice. }
+    )
+```
+
+##### `RangeFromStorageView`
+
+```viba
 RangeFromStorageView =
     Object
-  * $file_path str
-    # Offset in the contiguous payload region of this file: all payloads
-    # are assumed contiguous, and empty slots occupy 0 bytes. It is derived
-    # from slots, global meta and rank; it is not the file offset (header
-    # and alignment are not included).
-    # Example: A0=100, A1=empty, A2=100, B0=200 in one file gives
-    #   contiguous offsets A0=0, A2=100, B0=200; A1 has no range.
-    #   With data_start=208, actual file offsets are 208, 308, 408.
-  * $contiguous_payload_offset int
-  * $size int
+  * $file_path (
+        str
+      * { Path of the backing container file. }
+    )
+  * $contiguous_payload_offset (
+        int
+      * { Byte offset in the contiguous payload region (empty slots are 0 bytes; excludes header/alignment). }
+    )
+  * $size (
+        int
+      * { Byte length of this storage slice. }
+    )
 ```
 
 #### B.3.2 读写链
 
-```bash
+##### `DTensorsRWChain`
+
+```viba
 DTensorsRWChain =
     Oneof
   | DirectDTensorsRWChain
   | OneLayerCachedDTensorsRWChain
   | TwoLayerCachedDTensorsRWChain
   | MixedDTensorsRWChain
+```
 
+##### `get_tensor_ids_of_rw_chain`
+
+```viba
 # Tensor ids covered by the chain: compute endpoint's tensor_ids for the
 # concrete branches; the concatenation of the segments in list order for Mixed.
 get_tensor_ids_of_rw_chain =
-    list[str]
+     list[str]
   <- $rw_chain DTensorsRWChain
+```
 
+##### `legs_of`
+
+```viba
 # Views at the two ends of each leg, in data-flow order: Direct gives one
 # pair (src, dst); OneLayerCached gives (src, cache) and (cache, dst);
 # TwoLayerCached gives three pairs; Mixed concatenates its segments' pairs.
 legs_of =
-    list[($src DTensorsView, $dst DTensorsView)]
+     list[($src DTensorsView, $dst DTensorsView)]
   <- $rw_chain DTensorsRWChain
+```
 
-# A concrete chain has no Mixed branch, so a Mixed chain does not nest.
-ConcreteDTensorsRWChain =
-    Oneof
-  | DirectDTensorsRWChain
-  | OneLayerCachedDTensorsRWChain
-  | TwoLayerCachedDTensorsRWChain
+##### `MixedDTensorsRWChain`
 
+```viba
 MixedDTensorsRWChain =
     Object
-  * $disjoint_tensor_ids_and_rw_chain_list list[DisjointTensorIdsAndRWChain]
+  * $disjoint_tensor_ids_and_rw_chain_list (
+        list[DisjointTensorIdsAndRWChain]
+      * { Disjoint tensor-id segments paired with their concrete RW chains. }
+    )
   * Assert[{
       let tensor_ids = [
         x
@@ -1409,31 +1709,94 @@ MixedDTensorsRWChain =
       check len(tensor_ids) == len(set(tensor_ids))
       and all segment directions match (all read or all write)
     }]
+```
 
+##### `DisjointTensorIdsAndRWChain`
+
+```viba
 DisjointTensorIdsAndRWChain =
     Object
-  * $tensor_ids list[str]
-  * $rw_chain ConcreteDTensorsRWChain
+  * $tensor_ids (
+        list[str]
+      * { Disjoint subset of tensor ids covered by rw_chain. }
+    )
+  * $rw_chain (
+        ConcreteDTensorsRWChain
+      * { Concrete RW chain handling this tensor subset. }
+    )
   * Assert[{
       tensor_ids == get_tensor_ids_of_rw_chain(rw_chain)
     }]
+```
 
+##### `ConcreteDTensorsRWChain`
+
+```viba
+# A concrete chain has no Mixed branch, so a Mixed chain does not nest.
+ConcreteDTensorsRWChain =
+    Oneof
+  | DirectDTensorsRWChain
+  | OneLayerCachedDTensorsRWChain
+  | TwoLayerCachedDTensorsRWChain
+```
+
+##### `DirectDTensorsRWChain`
+
+```viba
 DirectDTensorsRWChain =
     Object
-  * $src (StorageDTensorsView | ComputeDTensorsView)
-  * $dst (StorageDTensorsView | ComputeDTensorsView)
+  * $src (
+        (
+            Oneof
+          | StorageDTensorsView
+          | ComputeDTensorsView
+        )
+      * { Source endpoint view (Storage on read, Compute on write). }
+    )
+  * $dst (
+        (
+            Oneof
+          | StorageDTensorsView
+          | ComputeDTensorsView
+        )
+      * { Destination endpoint view (Compute on read, Storage on write). }
+    )
   * Assert[{
       src and dst pair StorageDTensorsView and ComputeDTensorsView
       and src.tensor_ids == dst.tensor_ids
     }]
+```
 
+##### `OneLayerCachedDTensorsRWChain`
+
+```viba
 # data-flow: src -> cache -> dst
 OneLayerCachedDTensorsRWChain =
     Object
-  * $src (StorageDTensorsView | ComputeDTensorsView)
-  * $cache CacheDTensorsView
-  * $dst (StorageDTensorsView | ComputeDTensorsView)
-  * $num_ranks_per_node int
+  * $src (
+        (
+            Oneof
+          | StorageDTensorsView
+          | ComputeDTensorsView
+        )
+      * { Source endpoint view (Storage on read, Compute on write). }
+    )
+  * $cache (
+        CacheDTensorsView
+      * { Single-layer cache view on compute nodes (spatial Replicate on read, Shard on write). }
+    )
+  * $dst (
+        (
+            Oneof
+          | StorageDTensorsView
+          | ComputeDTensorsView
+        )
+      * { Destination endpoint view (Compute on read, Storage on write). }
+    )
+  * $num_ranks_per_node (
+        int
+      * { Number of compute ranks per physical node. }
+    )
   * Hint[{
       cache 落在计算侧的节点上：
       ComputeDTensorsView 的视角是 rank / world_size；
@@ -1448,15 +1811,42 @@ OneLayerCachedDTensorsRWChain =
         cache.mesh, (dst if read else src).mesh, num_ranks_per_node
       )
     }]
+```
 
+##### `TwoLayerCachedDTensorsRWChain`
+
+```viba
 # data-flow: src -> first_cache -> second_cache -> dst
 TwoLayerCachedDTensorsRWChain =
     Object
-  * $src (StorageDTensorsView | ComputeDTensorsView)
-  * $first_cache CacheDTensorsView
-  * $second_cache CacheDTensorsView
-  * $dst (StorageDTensorsView | ComputeDTensorsView)
-  * $num_ranks_per_node int
+  * $src (
+        (
+            Oneof
+          | StorageDTensorsView
+          | ComputeDTensorsView
+        )
+      * { Source endpoint view (Storage on read, Compute on write). }
+    )
+  * $first_cache (
+        CacheDTensorsView
+      * { First cache layer along data flow (small on read, big on write). }
+    )
+  * $second_cache (
+        CacheDTensorsView
+      * { Second cache layer along data flow (big on read, small on write). }
+    )
+  * $dst (
+        (
+            Oneof
+          | StorageDTensorsView
+          | ComputeDTensorsView
+        )
+      * { Destination endpoint view (Compute on read, Storage on write). }
+    )
+  * $num_ranks_per_node (
+        int
+      * { Number of compute ranks per physical node. }
+    )
   * Hint[{
       两层 cache 均落在计算侧节点上，按数据流顺序排列：
       读方向 src(Storage) -> first_cache(small) -> second_cache(big) -> dst(Compute)；
@@ -1470,7 +1860,11 @@ TwoLayerCachedDTensorsRWChain =
       and (read:  first_cache ⊆ second_cache ⊆ dst;
            write: second_cache ⊆ first_cache ⊆ src)
     }]
+```
 
+##### `CopyPlanChain`
+
+```viba
 # Plan of an RW chain. Isomorphic to DTensorsRWChain: the branches match
 # one to one, and each branch holds one CopyPlan per leg, in data-flow order.
 # Direct has one leg, OneLayerCached two, TwoLayerCached three.
@@ -1480,101 +1874,200 @@ CopyPlanChain =
   | OneLayerCachedCopyPlanChain
   | TwoLayerCachedCopyPlanChain
   | MixedCopyPlanChain
+```
 
-DirectCopyPlanChain =
+##### `MixedCopyPlanChain`
+
+```viba
+MixedCopyPlanChain =
     Object
-  * $src_to_dst CopyPlan
+  * $disjoint_tensor_ids_and_copy_plan_chain_list (
+        list[DisjointTensorIdsAndCopyPlanChain]
+      * { Disjoint tensor-id segments paired with their concrete CopyPlan chains. }
+    )
+```
 
-# data-flow: src -> cache -> dst
-OneLayerCachedCopyPlanChain =
+##### `DisjointTensorIdsAndCopyPlanChain`
+
+```viba
+DisjointTensorIdsAndCopyPlanChain =
     Object
-  * $src_to_cache CopyPlan
-  * $cache_to_dst CopyPlan
+  * $tensor_ids (
+        list[str]
+      * { Disjoint subset of tensor ids covered by copy_plan_chain. }
+    )
+  * $copy_plan_chain (
+        ConcreteCopyPlanChain
+      * { Concrete CopyPlan chain handling this tensor subset. }
+    )
+```
 
-# data-flow: src -> first_cache -> second_cache -> dst
-TwoLayerCachedCopyPlanChain =
-    Object
-  * $src_to_first_cache CopyPlan
-  * $first_cache_to_second_cache CopyPlan
-  * $second_cache_to_dst CopyPlan
+##### `ConcreteCopyPlanChain`
 
+```viba
 # Same nesting rule as the RW chain: a Mixed plan chain holds concrete ones.
 ConcreteCopyPlanChain =
     Oneof
   | DirectCopyPlanChain
   | OneLayerCachedCopyPlanChain
   | TwoLayerCachedCopyPlanChain
+```
 
-MixedCopyPlanChain =
-    Object
-  * $disjoint_tensor_ids_and_copy_plan_chain_list list[DisjointTensorIdsAndCopyPlanChain]
+##### `DirectCopyPlanChain`
 
-DisjointTensorIdsAndCopyPlanChain =
+```viba
+DirectCopyPlanChain =
     Object
-  * $tensor_ids list[str]
-  * $copy_plan_chain ConcreteCopyPlanChain
+  * $src_to_dst (
+        CopyPlan
+      * { Copy plan from src directly to dst. }
+    )
+```
+
+##### `OneLayerCachedCopyPlanChain`
+
+```viba
+# data-flow: src -> cache -> dst
+OneLayerCachedCopyPlanChain =
+    Object
+  * $src_to_cache (
+        CopyPlan
+      * { Copy plan from src into cache. }
+    )
+  * $cache_to_dst (
+        CopyPlan
+      * { Copy plan from cache to dst. }
+    )
+```
+
+##### `TwoLayerCachedCopyPlanChain`
+
+```viba
+# data-flow: src -> first_cache -> second_cache -> dst
+TwoLayerCachedCopyPlanChain =
+    Object
+  * $src_to_first_cache (
+        CopyPlan
+      * { Copy plan from src into first_cache. }
+    )
+  * $first_cache_to_second_cache (
+        CopyPlan
+      * { Copy plan from first_cache into second_cache. }
+    )
+  * $second_cache_to_dst (
+        CopyPlan
+      * { Copy plan from second_cache to dst. }
+    )
 ```
 
 `num_nodes` 是 cache mesh 的 `spatial` 维（节点数），`world_size` 是计算侧（读方向 `dst` / 写方向 `src`）mesh 的参与者总数；`temporal` / `concurrency` 不加 rank，它们只是同一批 node 上的缓冲槽；`is_cache_mesh_subset_of_mesh` 见 B.2.3.3。
 
 #### B.3.3 Meshes
 
-```bash
+##### `ArrangedMesh`
+
+```viba
 ArrangedMesh[tag_name] =
     Object
-    # Number of participants on this mesh.
-  * $size tagged[tag_name, int]
+  * $size (
+        tagged[tag_name, int]
+      * { Number of participants on this mesh. }
+    )
+```
 
+##### `LiteralMesh`
+
+```viba
 # Explicit rank list; used when a device mesh has no regular arranged form.
 # max is tagged by the dimension it bounds: world_size, tensor_count, ...
 LiteralMesh[tag_name] =
     Object
-    # Ranks covered by this mesh, in order.
-  * $ranks list[int]
-    # Exclusive upper bound for every rank in ranks.
-  * $max tagged[tag_name, int]
+  * $ranks (
+        list[int]
+      * { Ranks covered by this mesh, in order. }
+    )
+  * $max (
+        tagged[tag_name, int]
+      * { Exclusive upper bound for every rank in ranks. }
+    )
   * Assert[{
       forall x in ranks:
         check x >= 0 and x < self.max
       check len(ranks) == len(set(ranks))
   }]
-
-ReshapedMesh[T] =
-    Object
-    # Mesh before reshaping.
-  * $underlying_mesh T
-    # Shape of the mesh after reshaping; one entry per dimension.
-  * $shape list[int]
-
-PermutedMesh[T] =
-    Object
-    # Mesh before permuting dimensions.
-  * $underlying_mesh T
-    # New order of mesh dimensions.
-  * $permutation list[int]
-
-SlicedMesh[T] =
-    Object
-    # Mesh before fixing dimensions.
-  * $underlying_mesh T
-    # One entry per underlying mesh dimension; nil keeps that dimension.
-  * $slices list[(Slice | nil)]
-
-Slice =
-    Object
-    # First index selected on this mesh dimension; nil starts at zero.
-  * $start (int | nil)
-    # Index after the last selected one; nil runs to the end.
-  * $stop (int | nil)
-    # Step between selected indices; nil means one.
-  * $step (int | nil)
 ```
 
-#### B.3.4 Error 与 Result
+##### `ReshapedMesh`
+
+```viba
+ReshapedMesh[T] =
+    Object
+  * $underlying_mesh (
+        T
+      * { Mesh before reshaping. }
+    )
+  * $shape (
+        list[int]
+      * { Shape of the mesh after reshaping; one entry per dimension. }
+    )
+```
+
+##### `PermutedMesh`
+
+```viba
+PermutedMesh[T] =
+    Object
+  * $underlying_mesh (
+        T
+      * { Mesh before permuting dimensions. }
+    )
+  * $permutation (
+        list[int]
+      * { New order of mesh dimensions. }
+    )
+```
+
+##### `SlicedMesh`
+
+```viba
+SlicedMesh[T] =
+    Object
+  * $underlying_mesh (
+        T
+      * { Mesh before fixing dimensions. }
+    )
+  * $slices (
+        list[(Slice | nil)]
+      * { One entry per underlying mesh dimension; nil keeps that dimension. }
+    )
+```
+
+##### `Slice`
+
+```viba
+Slice =
+    Object
+  * $start (
+        (int | nil)
+      * { First index selected on this mesh dimension; nil starts at zero. }
+    )
+  * $stop (
+        (int | nil)
+      * { Index after the last selected one; nil runs to the end. }
+    )
+  * $step (
+        (int | nil)
+      * { Step between selected indices; nil means one. }
+    )
+```
+
+#### B.3.4 `Error` 与 `Result`
 
 `Error` 是顶层类型，`Result` 的 `Err` 分支用它，不用裸 `str`。每个分支都是一个 Object，至少带 `msg`；调用方按分支类型处理，不解析 `msg`。
 
-```bash
+##### `Error`
+
+```viba
 # Failure reported by any Result-returning API. Every branch is a named
 # Object, so the branch type is the tag; callers switch on the value type.
 Error =
@@ -1584,55 +2077,99 @@ Error =
   | NotFoundError
   | InvalidArgumentError
   | GDTensorIOError
+```
 
+##### `ConstraintViolationError`
+
+```viba
 # check_constraints rejected the data.
 ConstraintViolationError =
     Object
-    # Type name of the object whose check_constraints failed, e.g.
-    # "PhysicalLayoutTable".
-  * $type_name str
-    # Name of the constraint that failed on that object.
-  * $constraint_name str
-    # Human-readable reason.
-  * $msg str
+  * $type_name (
+        str
+      * { Type name of the object whose check_constraints failed, e.g. "PhysicalLayoutTable". }
+    )
+  * $constraint_name (
+        str
+      * { Name of the constraint that failed on that object. }
+    )
+  * $msg (
+        str
+      * { Human-readable reason. }
+    )
+```
 
+##### `CheckFailedError`
+
+```viba
 # A check_* validation failed: not disjoint, not covering, or overlapping
 # storage meshes.
 CheckFailedError =
     Object
-    # Name of the check that failed.
-  * $check_name str
-    # Human-readable reason.
-  * $msg str
+  * $check_name (
+        str
+      * { Name of the check that failed. }
+    )
+  * $msg (
+        str
+      * { Human-readable reason. }
+    )
+```
 
+##### `NotFoundError`
+
+```viba
 # A lookup by tensor id, dict key, or file path found nothing.
 NotFoundError =
     Object
-    # Field or table being looked up, e.g. "tensor_id", "tensor_entries",
-    # "file_paths".
-  * $key_name str
-    # The missing value, in its canonical form.
-  * $key str
-    # Human-readable reason.
-  * $msg str
+  * $key_name (
+        str
+      * { Field or table being looked up, e.g. "tensor_id", "tensor_entries", "file_paths". }
+    )
+  * $key (
+        str
+      * { The missing value, in its canonical form. }
+    )
+  * $msg (
+        str
+      * { Human-readable reason. }
+    )
+```
 
+##### `InvalidArgumentError`
+
+```viba
 # A caller-supplied argument does not satisfy the documented contract.
 InvalidArgumentError =
     Object
-    # Argument or precondition that failed, e.g. "tensor_ids".
-  * $argument_name str
-    # Human-readable reason.
-  * $msg str
+  * $argument_name (
+        str
+      * { Argument or precondition that failed, e.g. "tensor_ids". }
+    )
+  * $msg (
+        str
+      * { Human-readable reason. }
+    )
+```
 
+##### `GDTensorIOError`
+
+```viba
 # File or buffer I/O failed.
 GDTensorIOError =
     Object
-    # File path for file I/O; nil for in-memory buffer I/O.
-  * $file_path (str | nil)
-    # Operation that failed, e.g. "open", "read", "write", "fsync", "rename".
-  * $operation str
-    # Human-readable reason.
-  * $msg str
+  * $file_path (
+        (str | nil)
+      * { File path for file I/O; nil for in-memory buffer I/O. }
+    )
+  * $operation (
+        str
+      * { Operation that failed, e.g. "open", "read", "write", "fsync", "rename". }
+    )
+  * $msg (
+        str
+      * { Human-readable reason. }
+    )
 ```
 
 各分支的产生方：
@@ -1645,22 +2182,38 @@ GDTensorIOError =
 | `InvalidArgumentError` | `d_tensors_view_rank_plan_chain_load` 的 `Assert` 失败；session 在生命周期之外被调用（`begin_*` 之前，或 `commit` / `abort` / `finish` 之后） |
 | `GDTensorIOError` | `begin_save` / `begin_load` / `commit` / `abort` / `finish` / `init_data_accessor` 的文件操作，以及 accessor 的 buffer 读写 |
 
-```bash
+##### `Result`
+
+```viba
 # Success or failure. Branches are named types; no tags.
 Result[T] =
     Oneof
   | Ok[T]
   | Err
+```
 
+##### `Ok`
+
+```viba
 # Success; value is the payload, nil for void.
 Ok[T] =
     Object
-  * $value T
+  * $value (
+        T
+      * { Payload value, or nil for Result[void]. }
+    )
+```
 
+##### `Err`
+
+```viba
 # Failure; value is one of the Error branches.
 Err =
     Object
-  * $value Error
+  * $value (
+        Error
+      * { Concrete Error branch describing the failure. }
+    )
 ```
 
 ## 附录 C Python 实现与代码生成指南
