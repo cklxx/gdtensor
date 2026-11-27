@@ -53,7 +53,8 @@ tlc() {
   rm -f "$HERE"/SlotLifecycle_TTrace_*.bin "$HERE"/SlotLifecycle_TTrace_*.tla \
         "$HERE"/CopyPlan_TTrace_*.bin    "$HERE"/CopyPlan_TTrace_*.tla \
         "$HERE"/AtomicPublish_TTrace_*.bin "$HERE"/AtomicPublish_TTrace_*.tla \
-        "$HERE"/CachePropagation_TTrace_*.bin "$HERE"/CachePropagation_TTrace_*.tla || true
+        "$HERE"/CachePropagation_TTrace_*.bin "$HERE"/CachePropagation_TTrace_*.tla \
+        "$HERE"/WriteChainPropagation_TTrace_*.bin "$HERE"/WriteChainPropagation_TTrace_*.tla || true
   return $rc
 }
 
@@ -317,6 +318,75 @@ if [ "$rc" -ne 0 ] && grep -qE "LiveGoal (is|was) violated" "$CP_LOG.run"; then
   PASS=$((PASS+1))
 else
   echo "  BAD cp_peer_down : expected a LiveGoal counterexample (exit $rc)" | tee -a "$CP_LOG"
+  FAIL=$((FAIL+1))
+fi
+
+# ============================================================================
+# 5. WriteChainPropagation: node-level write propagation executor
+#    (internal/write_propagation.py + internal/write_chain.py).
+# ============================================================================
+echo "########## WriteChainPropagation ##########" | tee -a "$POS_LOG"
+WC_LOG="$OUT/write_chain_propagation.log"; : > "$WC_LOG"
+
+wc_cfg() { # $1=cfg name, $2=mutant, $3=allow_fail, $4=spec/inv/prop tail
+  cat > "$OUT/cfgs/$1.cfg" <<CFG
+CONSTANTS
+MUTANT = "$2"
+ALLOW_FAIL = $3
+$4
+CFG
+}
+
+wc_cfg wc_pos none TRUE "SPECIFICATION Spec
+INVARIANTS
+WRITE_CACHE_INV"
+if tlc WriteChainPropagation.tla "$OUT/cfgs/wc_pos.cfg" "$WC_LOG"; then
+  echo "  ok wc_pos (all write plan invariants hold)" | tee -a "$WC_LOG"; PASS=$((PASS+1))
+else
+  echo "  FAIL wc_pos" | tee -a "$WC_LOG"; FAIL=$((FAIL+1))
+fi
+
+wc_cfg wc_live_ok none FALSE "SPECIFICATION FairSpec
+PROPERTIES
+LiveGoal"
+rc=0; tlc WriteChainPropagation.tla "$OUT/cfgs/wc_live_ok.cfg" "$WC_LOG" || rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "  ok wc_live_ok (write segments flush under complete-cohort fairness)" | tee -a "$WC_LOG"
+  PASS=$((PASS+1))
+else
+  echo "  BAD wc_live_ok (exit $rc)" | tee -a "$WC_LOG"; FAIL=$((FAIL+1))
+fi
+
+wc_neg() { # $1=cfg name, $2=mutant, $3=target invariant
+  wc_cfg "$1" "$2" TRUE "SPECIFICATION Spec
+INVARIANTS
+$3"
+  local rc=0
+  tlc WriteChainPropagation.tla "$OUT/cfgs/$1.cfg" "$WC_LOG" || rc=$?
+  if [ "$rc" -ne 0 ] && grep -qE "Invariant $3 is violated" "$WC_LOG.run"; then
+    echo "  ok   $1 : caught by $3 (exit $rc)" | tee -a "$WC_LOG"; PASS=$((PASS+1))
+  else
+    echo "  BAD  $1 : $3 did not name the violation (exit $rc)" | tee -a "$WC_LOG"
+    FAIL=$((FAIL+1))
+  fi
+}
+
+wc_neg wc_no_budget no_budget ByteBudget
+wc_neg wc_early_stage early_stage_flush NoEarlyStageFlush
+wc_neg wc_early_parent early_parent_flush NoEarlyParentFlush
+wc_neg wc_no_order no_upstream_order UpstreamReadyBeforeFlush
+wc_neg wc_silent_error silent_error ErrorPropagated
+wc_neg wc_remote_flush remote_flush FlushOnDN
+
+wc_cfg wc_peer_down peer_down FALSE "SPECIFICATION FairSpec
+PROPERTIES
+LiveGoal"
+rc=0; tlc WriteChainPropagation.tla "$OUT/cfgs/wc_peer_down.cfg" "$WC_LOG" || rc=$?
+if [ "$rc" -ne 0 ] && grep -qE "LiveGoal (is|was) violated" "$WC_LOG.run"; then
+  echo "  ok wc_peer_down : missing-producer boundary reproduces (exit $rc)" | tee -a "$WC_LOG"
+  PASS=$((PASS+1))
+else
+  echo "  BAD wc_peer_down : expected a LiveGoal counterexample (exit $rc)" | tee -a "$WC_LOG"
   FAIL=$((FAIL+1))
 fi
 

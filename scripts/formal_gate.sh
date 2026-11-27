@@ -58,6 +58,8 @@ check_runtime_pin() {
 }
 check_runtime_pin gdtensor/internal/api.py
 check_runtime_pin gdtensor/internal/propagation.py
+check_runtime_pin gdtensor/internal/write_chain.py
+check_runtime_pin gdtensor/internal/write_propagation.py
 # Live provenance manifest: committed HEAD + its tree vs staged model tree.
 mkdir -p log/fix-df1/formal
 {
@@ -65,7 +67,7 @@ mkdir -p log/fix-df1/formal
   echo "HEAD_TREE: $HEAD_TREE"
   echo "index-tree: $(git write-tree)"
   echo "worktree: $(git rev-parse --show-toplevel)"
-  shasum -a 256 gdtensor/internal/api.py gdtensor/internal/propagation.py
+  shasum -a 256 gdtensor/internal/api.py gdtensor/internal/propagation.py gdtensor/internal/write_chain.py gdtensor/internal/write_propagation.py
   find formal scripts -name '*.sh' -o -name '*.lean' -o -name '*.tla' -o -name '*.cfg' \
     | sort | xargs shasum -a 256
 } > log/fix-df1/formal/manifest.txt

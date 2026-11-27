@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # NOTE: this is a deliberate freeze guard for the current review, not a source
 # contract. Any intentional future edit to gdtensor/internal/api.py must bump this
 # constant in lockstep (two-place maintenance) -- otherwise the harness fails.
-FROZEN_API_SHA256 = "8bfd297961f68a6728ab097cea605d39294d2dad611db750c4f1d36d6b6282ce"
+FROZEN_API_SHA256 = "8073f8c01a638a8304202203cca8a6a6076124dfe48999c76457c017f04dae35"
 
 
 def _production_manifest(root=ROOT):
@@ -419,8 +419,9 @@ MUTATIONS = [
     (
         "gdtensor/internal/api.py",
         "        self._drain_hot(done)\n"
-        "        for piece in done:\n"
-        "            pending.remove(piece)",
+        "        if done:\n"
+        "            done_set = set(done)\n"
+        "            pending[:] = [piece for piece in pending if piece not in done_set]",
         "        for piece in done:\n"
         "            self._drain(piece)\n"
         "            pending.remove(piece)",
@@ -633,6 +634,102 @@ MUTATIONS = [
         "            raise",
         "        except BaseException as exc:\n            raise",
         "tests/io/test_cache_owner_lifecycle.py::test_drain_entry_commit_failure_publishes_error",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "        return self.resident + size <= self.budget",
+        "        return False",
+        "tests/io/test_write_chain.py::test_bounded_budget_resident_never_exceeds_stat",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        '        if not slot["owed"]:\n            slot["ready"] = True\n            return True',
+        '        if True:\n            slot["ready"] = True\n            return True',
+        "tests/io/test_write_chain.py::test_slot_flushes_only_after_all_producers_stage",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_propagation.py",
+        "        if not is_designated_writer(nd, rank, order_of(table, tid)):\n            continue",
+        "        if False:\n            continue",
+        "tests/io/test_write_chain.py::test_replicate_write_chain_deduplicates_storage_writes",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        '    except BaseException:\n        _cleanup(session, "abort")\n        raise',
+        "    except BaseException:\n        raise",
+        "tests/io/test_write_chain.py::test_cached_write_failure_aborts_session",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "    def _step(self, predicate, deadline):\n        self.t.check_alive()",
+        "    def _step(self, predicate, deadline):\n        if False:\n            self.t.check_alive()",
+        "tests/io/test_write_chain_lifecycle.py::test_peer_crash_during_stage_raises_cache_peer_down",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "    _WRITE_FINGERPRINTS.clear()",
+        "    _WRITE_FINGERPRINTS.copy()",
+        "tests/io/test_write_chain_lifecycle.py::test_fork_safety_with_held_locks_and_pending_fingerprint",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        '("object", os.getpid(), id(acc))',
+        '("object", id(acc))',
+        "tests/io/test_write_chain_lifecycle.py::test_implicit_vs_explicit_namespace_across_fork[implicit]",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "        except BaseException as exc:\n"
+        "            _error_cleanup(exc, self._flush_failed, 0, node, exc)\n"
+        "            raise",
+        "        except BaseException as exc:\n"
+        "            self._inflight(-1)\n"
+        "            self._fail(0, node, exc, None)\n"
+        "            raise",
+        "tests/io/test_write_chain_lifecycle.py::test_interrupted_error_commit_keeps_owner_and_peer_gets_peer_down",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "            _ = [self._fail_node(lay, n, exc, None) for lay, n in downstream]",
+        "            _ = []",
+        "tests/io/test_write_chain_lifecycle.py::test_two_layer_upstream_failure_propagates_to_downstream_waiter",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_propagation.py",
+        "        cells[key] = cells.get(key, 0) + seg.size",
+        "        cells[key] = max(cells.get(key, 0), seg.size)",
+        "tests/io/test_write_chain_lifecycle.py::test_multi_tensor_cell_budget_aggregation_and_weakref_cleanup",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_propagation.py",
+        "            outbound[actor] += seg.size",
+        "            outbound[actor] += 0",
+        "tests/io/test_random_write_chain_stress.py::test_random_write_chain_strategy_is_correct[0]",
+        "notorch",
+    ),
+    (
+        "gdtensor_conn/access.py",
+        "        if ensure is not None:\n            ensure(global_range.file_path)",
+        "        if False and ensure is not None:\n            ensure(global_range.file_path)",
+        "tests/io/test_write_chain_lifecycle.py::test_sdk_delayed_leader_cross_rank_staging_notorch",
+        "notorch",
+    ),
+    (
+        "gdtensor/internal/write_chain.py",
+        "        if self.last > 0 and not self._reserve_l1_for_stage(node, seg, hot_l1):",
+        "        if False and not self._reserve_l1_for_stage(node, seg, hot_l1):",
+        "tests/io/test_write_chain_lifecycle.py::test_two_layer_tight_budget_no_circular_deadlock",
         "notorch",
     ),
 ]

@@ -144,7 +144,7 @@ def test_direct_chain_delivers_every_rank_shard_bytes():
     dst = TraceMemory(np.zeros(8, dtype=np.uint8))
     sv = _storage_view(src, "w", [8], world)
     cv = _compute_view(dst, "w", [8], world)
-    chain = gb.DirectDTensorsReadChain(src=sv, dst=cv)
+    chain = gb.DirectDTensorsRWChain(src=sv, dst=cv)
     assert type(chain.check_constraints()) is gb.Ok
     for rank in range(world):
         dst.events.clear()
@@ -164,7 +164,7 @@ def test_one_layer_cache_per_node_ranks_and_observed_bytes():
     sv = _storage_view(src, "w", [8], world)
     cv = _compute_view(dst, "w", [8], world)
     cvt = _cache_view(cache, "w", [8], steps=2, nodes=nodes, width=1)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     assert type(chain.check_constraints()) is gb.Ok
@@ -190,7 +190,7 @@ def test_fault_injection_accessor_error_returns_err():
     dst = TraceMemory(np.zeros(8, dtype=np.uint8))
     sv = _storage_view(bad, "w", [8], world)
     cv = _compute_view(dst, "w", [8], world)
-    chain = gb.DirectDTensorsReadChain(src=sv, dst=cv)
+    chain = gb.DirectDTensorsRWChain(src=sv, dst=cv)
     result = gio.chain_load(0, chain)
     assert type(result) is gb.Err
     assert "boom" in result.value.msg
@@ -206,8 +206,8 @@ def test_two_layer_chain_delivers_all_ranks():
     cv = _compute_view(dst, "w", [8], world)
     smallv = _cache_view(small, "w", [8], steps=2, nodes=[0, 1], width=1)
     bigv = _cache_view(big, "w", [8], steps=2, nodes=[0, 1], width=1)
-    chain = gb.TwoLayerCachedDTensorsReadChain(
-        src=sv, small_cache=smallv, big_cache=bigv, dst=cv, num_ranks_per_node=k
+    chain = gb.TwoLayerCachedDTensorsRWChain(
+        src=sv, first_cache=smallv, second_cache=bigv, dst=cv, num_ranks_per_node=k
     )
     assert type(chain.check_constraints()) is gb.Ok
     for rank in range(world):
@@ -222,7 +222,7 @@ def test_mixed_chain_runs_segments_and_reports_error_object():
     dst_a = TraceMemory(np.zeros(4, dtype=np.uint8))
     sv_a = _storage_view(src_a, "a", [4], world)
     cv_a = _compute_view(dst_a, "a", [4], world)
-    direct = gb.DirectDTensorsReadChain(src=sv_a, dst=cv_a)
+    direct = gb.DirectDTensorsRWChain(src=sv_a, dst=cv_a)
 
     src_b = TraceMemory(np.arange(4, dtype=np.uint8))
     cache_b = TraceMemory(np.zeros(4, dtype=np.uint8))
@@ -230,14 +230,14 @@ def test_mixed_chain_runs_segments_and_reports_error_object():
     sv_b = _storage_view(src_b, "b", [4], world)
     cv_b = _compute_view(dst_b, "b", [4], world)
     cachev_b = _cache_view(cache_b, "b", [4], steps=2, nodes=[0, 1], width=1)
-    one = gb.OneLayerCachedDTensorsReadChain(
+    one = gb.OneLayerCachedDTensorsRWChain(
         src=sv_b, cache=cachev_b, dst=cv_b, num_ranks_per_node=1
     )
 
-    mixed = gb.MixedDTensorsReadChain(
+    mixed = gb.MixedDTensorsRWChain(
         [
-            gb.DisjointTensorIdsAndReadChain(["a"], direct),
-            gb.DisjointTensorIdsAndReadChain(["b"], one),
+            gb.DisjointTensorIdsAndRWChain(["a"], direct),
+            gb.DisjointTensorIdsAndRWChain(["b"], one),
         ]
     )
     assert type(mixed.check_constraints()) is gb.Ok
@@ -255,7 +255,7 @@ def test_stats_return_list_of_int_per_node():
     sv = _storage_view(src, "w", [8], world)
     cv = _compute_view(dst, "w", [8], world)
     cvt = _cache_view(cache, "w", [8], steps=2, nodes=[0, 1], width=1)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     mem = gio.chain_stat_mem_overhead(chain)
@@ -290,7 +290,7 @@ def test_mem_overhead_shrinks_with_steps_independent_of_width(steps, width, expe
         nodes=[0, 1],
         width=width,
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     mem = gio.chain_stat_mem_overhead(chain)
@@ -308,7 +308,7 @@ def test_cache_writes_cover_every_rank_read():
     sv = _storage_view(src, "w", [8], world)
     cv = _compute_view(dst, "w", [8], world)
     cvt = _cache_view(cache, "w", [8], steps=2, nodes=[0, 1], width=1)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     for rank in range(world):
@@ -328,7 +328,7 @@ def test_two_rank_node_fill_once_and_each_consumer_reads_share():
     sv = _storage_view(src, "w", [8], world)
     cv = _compute_view(dst, "w", [8], world)
     cvt = _cache_view(cache, "w", [8], steps=2, nodes=[0, 1], width=1)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     for rank in range(world):
@@ -352,7 +352,7 @@ def test_slot_released_only_after_all_consumers_drain():
     sv = _storage_view(src, "w", [8], world)
     cv = _compute_view(dst, "w", [8], world)
     cvt = _cache_view(cache, "w", [8], steps=2, nodes=[0, 1], width=1)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     for rank in range(world):
@@ -374,7 +374,7 @@ def test_fill_failure_retries_cleanly_on_next_call():
     sv = _storage_view(bad, "w", [8], world)
     cv = _compute_view(dst, "w", [8], world)
     cvt = _cache_view(cache, "w", [8], steps=2, nodes=[0, 1], width=1)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     r0 = gio.chain_load(0, chain)
@@ -383,7 +383,7 @@ def test_fill_failure_retries_cleanly_on_next_call():
     setattr(bad, "error_on_call", None)
     good = TraceMemory(np.arange(8, dtype=np.uint8))
     good_view = _storage_view(good, "w", [8], world)
-    good_chain = gb.OneLayerCachedDTensorsReadChain(
+    good_chain = gb.OneLayerCachedDTensorsRWChain(
         src=good_view, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     for rank in range(world):
@@ -475,7 +475,7 @@ def test_multi_tensor_a6_b2_c1_peak_resident():
     cvt = _multi_cache(
         TraceMemory(np.zeros(9, np.uint8)), specs, steps=2, nodes=[0, 1], width=1
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     assert type(chain.check_constraints()) is gb.Ok, chain.check_constraints()
@@ -490,7 +490,7 @@ def test_mixed_b_segment_fails_a_still_loads_same_error():
     # A: direct, healthy. B: one-layer whose source accessor faults.
     src_a = TraceMemory(np.arange(4, dtype=np.uint8))
     dst_a = TraceMemory(np.zeros(4, dtype=np.uint8))
-    direct = gb.DirectDTensorsReadChain(
+    direct = gb.DirectDTensorsRWChain(
         src=_storage_view(src_a, "a", [4], world),
         dst=_compute_view(dst_a, "a", [4], world),
     )
@@ -498,16 +498,16 @@ def test_mixed_b_segment_fails_a_still_loads_same_error():
     bad_src = TraceMemory(np.arange(4, dtype=np.uint8), error=boom)
     dst_b = TraceMemory(np.zeros(4, dtype=np.uint8))
     cache_b = TraceMemory(np.zeros(4, dtype=np.uint8))
-    one = gb.OneLayerCachedDTensorsReadChain(
+    one = gb.OneLayerCachedDTensorsRWChain(
         src=_storage_view(bad_src, "b", [4], world),
         cache=_cache_view(cache_b, "b", [4], steps=2, nodes=[0, 1], width=1),
         dst=_compute_view(dst_b, "b", [4], world),
         num_ranks_per_node=1,
     )
-    mixed = gb.MixedDTensorsReadChain(
+    mixed = gb.MixedDTensorsRWChain(
         [
-            gb.DisjointTensorIdsAndReadChain(["a"], direct),
-            gb.DisjointTensorIdsAndReadChain(["b"], one),
+            gb.DisjointTensorIdsAndRWChain(["a"], direct),
+            gb.DisjointTensorIdsAndRWChain(["b"], one),
         ]
     )
     result = gio.chain_load(0, mixed)
@@ -549,7 +549,7 @@ def test_shared_source_session_opened_once_per_chain_load():
     cvt = _cache_view(
         TraceMemory(np.zeros(8, np.uint8)), "w", [8], steps=2, nodes=[0, 1], width=1
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     for rank in range(world):
@@ -575,7 +575,7 @@ def test_finish_failure_propagates_and_session_released():
     sv = _storage_view(TraceMemory(np.arange(4, dtype=np.uint8)), "w", [4], world)
     sv.begin_load = begin
     cv = _compute_view(TraceMemory(np.zeros(4, np.uint8)), "w", [4], world)
-    chain = gb.DirectDTensorsReadChain(src=sv, dst=cv)
+    chain = gb.DirectDTensorsRWChain(src=sv, dst=cv)
     result = gio.chain_load(0, chain)
     assert type(result) is gb.Err
     assert result.value.msg == "disk-full"
@@ -605,7 +605,7 @@ def test_permuted_reshape_spatio_delivers_every_rank():
     cvt = gb.CacheDTensorsView(
         ["w"], gb.DTensorTable([gb.NamedDTensor("w", dt)]), cache
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     for rank in range(world):
@@ -621,7 +621,7 @@ def test_cross_node_observed_bytes_match_per_node_stats():
     sv = _storage_view(src, "w", [8], world)
     cv = _compute_view(dst, "w", [8], world)
     cvt = _cache_view(cache, "w", [8], steps=2, nodes=[0, 1], width=1)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=sv, cache=cvt, dst=cv, num_ranks_per_node=k
     )
     per_node_read = {0: 0, 1: 0}

@@ -12,7 +12,7 @@ from tests.support.memory import Memory, compute_view, storage_view
 def _direct_load(rank, storage_src, compute_dst):
     """storage -> compute via the public Direct read chain (one leg)."""
     return gio.chain_load(
-        rank, gb.DirectDTensorsReadChain(src=storage_src, dst=compute_dst)
+        rank, gb.DirectDTensorsRWChain(src=storage_src, dst=compute_dst)
     )
 
 

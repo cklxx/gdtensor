@@ -87,10 +87,10 @@ def build_chain(entries, checkpoint, cache_root, ranks):
         view = shapes._cache_view(cache, tids, sizes, 1, nodes, 1)
         retag(view.d_tensor_table, entries)
         views.append(view)
-    return gb.TwoLayerCachedDTensorsReadChain(
+    return gb.TwoLayerCachedDTensorsRWChain(
         src=src,
-        small_cache=views[0],
-        big_cache=views[1],
+        first_cache=views[0],
+        second_cache=views[1],
         dst=compute,
         num_ranks_per_node=1,
     )

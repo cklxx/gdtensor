@@ -176,7 +176,7 @@ def test_sdk_rank_save_load_and_direct_chain_load() -> None:
         loaded = ArrayFabric(ct, points)
         reader = make_storage_view(["w"], st, layout, root, SdkFileIO(client))
         if use_chain:
-            chain = gb.DirectDTensorsReadChain(src=reader, dst=loaded.view(0))
+            chain = gb.DirectDTensorsRWChain(src=reader, dst=loaded.view(0))
             _ok(gio.chain_load(0, chain))
         else:
             _ok(gio.rank_load(0, loaded.view(0), reader))

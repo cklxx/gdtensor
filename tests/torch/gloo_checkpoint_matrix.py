@@ -225,18 +225,18 @@ def _cache_view(table, root, namespace, nodes):
 
 def _chain(mode, source, destination, table, root, case, world):
     if mode == "direct":
-        return gb.DirectDTensorsReadChain(src=source, dst=destination), []
+        return gb.DirectDTensorsRWChain(src=source, dst=destination), []
     one, one_acc = _cache_view(table, root / "one", f"{case}-one", (0,))
     if mode == "one":
-        chain = gb.OneLayerCachedDTensorsReadChain(
+        chain = gb.OneLayerCachedDTensorsRWChain(
             src=source, cache=one, dst=destination, num_ranks_per_node=world
         )
         return chain, [one_acc]
     two, two_acc = _cache_view(table, root / "two", f"{case}-two", (0,))
-    chain = gb.TwoLayerCachedDTensorsReadChain(
+    chain = gb.TwoLayerCachedDTensorsRWChain(
         src=source,
-        small_cache=one,
-        big_cache=two,
+        first_cache=one,
+        second_cache=two,
         dst=destination,
         num_ranks_per_node=world,
     )

@@ -162,10 +162,10 @@ def _fanout(size=8, world=4, k=2, small=(0,), big=(0, 1), steps=1, width=1):
     small_mem = Probe(np.zeros(size, np.uint8))
     big_mem = Probe(np.zeros(size, np.uint8))
     dst = Probe(np.zeros(size, np.uint8))
-    chain = gb.TwoLayerCachedDTensorsReadChain(
+    chain = gb.TwoLayerCachedDTensorsRWChain(
         src=_storage(src, size, world),
-        small_cache=_cache(small_mem, size, steps, small, width),
-        big_cache=_cache(big_mem, size, steps, big, width),
+        first_cache=_cache(small_mem, size, steps, small, width),
+        second_cache=_cache(big_mem, size, steps, big, width),
         dst=_compute(dst, size, world),
         num_ranks_per_node=k,
     )
@@ -214,7 +214,7 @@ def _one_layer(size=8, world=4, k=2, nodes=(0, 1), steps=2, width=1, placement=N
     src = Probe(np.arange(size, dtype=np.uint8))
     cache = Probe(np.zeros(size, np.uint8))
     dst = Probe(np.zeros(size, np.uint8))
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_storage(src, size, world),
         cache=_cache(cache, size, steps, nodes, width),
         dst=_compute(dst, size, world, placement),
@@ -443,7 +443,7 @@ def _one_layer_mt(
     src = Probe(np.tile(np.arange(size, dtype=np.uint8), n), src_delay)
     cache_mem = Probe(np.zeros(size, np.uint8))
     dst = Probe(np.zeros(size, np.uint8))
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_storage_mt(src, tids, size, world),
         cache=_cache_mt(cache_mem, tids, size, steps, nodes, width, per_tid_nodes),
         dst=_compute_mt(dst, tids, size, world, placement),
@@ -546,7 +546,7 @@ def test_mixed_node_sets_rejected_up_front(tmp_path, monkeypatch):
         1,
         per_tid_nodes={"a": (0, 1), "b": (0,)},
     )
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=_storage_mt(src, ["a", "b"], size, world),
         cache=cv,
         dst=_compute_mt(Probe(np.zeros(size, np.uint8)), ["a", "b"], size, world),

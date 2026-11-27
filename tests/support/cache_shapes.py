@@ -199,10 +199,10 @@ def _build(case) -> dict[str, Any]:
         num_ranks_per_node=case["k"],
     )
     if len(views) == 1:
-        chain = gb.OneLayerCachedDTensorsReadChain(cache=views[0], **common)
+        chain = gb.OneLayerCachedDTensorsRWChain(cache=views[0], **common)
     else:
-        chain = gb.TwoLayerCachedDTensorsReadChain(
-            small_cache=views[0], big_cache=views[1], **common
+        chain = gb.TwoLayerCachedDTensorsRWChain(
+            first_cache=views[0], second_cache=views[1], **common
         )
     return dict(
         chain=chain,

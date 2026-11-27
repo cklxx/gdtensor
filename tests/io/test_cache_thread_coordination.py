@@ -1116,13 +1116,13 @@ def test_all_fit_probe_stays_inflight_until_completion_is_published(
 
     probe = object.__new__(api._RankRun)
     probe.t, probe.plan, probe.rank = table, table.plan, 0
-    probe.caches, probe.storage = [chain.small_cache], chain.src
+    probe.caches, probe.storage = [chain.first_cache], chain.src
     probe.source_identity = chain.src.data_accessor.cache_identity()
     probe.source_digest = api._content_digest(probe.source_identity)
     probe._absent, probe.owner = set(), None
     assert probe.source_identity is not None
     built["cluster"].rank = 0
-    assert chain.small_cache.data_accessor.has_bytes(probe._range(key, 0)), (
+    assert chain.first_cache.data_accessor.has_bytes(probe._range(key, 0)), (
         key,
         probe.source_identity,
         built["caches"][0].identities,

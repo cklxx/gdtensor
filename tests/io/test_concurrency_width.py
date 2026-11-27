@@ -90,7 +90,7 @@ def _cache_view(accessor, size, steps, width):
 
 
 def _one_layer_chain(size, steps, width, cache_mem):
-    return gb.OneLayerCachedDTensorsReadChain(
+    return gb.OneLayerCachedDTensorsRWChain(
         src=_storage_view(Memory(np.arange(size, dtype=np.uint8)), size, 2),
         cache=_cache_view(cache_mem, size, steps, width),
         dst=_compute_view(Memory(np.zeros(size, dtype=np.uint8)), size, 2),
@@ -170,10 +170,10 @@ def test_two_layer_mem_stat_sums_independent_layers():
             ["w"], gb.DTensorTable([nd]), Memory(np.zeros(size, np.uint8))
         )
 
-    chain = gb.TwoLayerCachedDTensorsReadChain(
+    chain = gb.TwoLayerCachedDTensorsRWChain(
         src=_storage_view(Memory(np.arange(size, dtype=np.uint8)), size, world),
-        small_cache=cache2(),
-        big_cache=cache2(),
+        first_cache=cache2(),
+        second_cache=cache2(),
         dst=_compute_view(Memory(np.zeros(size, np.uint8)), size, world),
         num_ranks_per_node=k,
     )

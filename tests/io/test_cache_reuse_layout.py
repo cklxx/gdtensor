@@ -299,10 +299,10 @@ def _build(root, values, points, placement, steps, width=1):
         for c, nodes in zip(caches, ([0], [0, 1]))
     ]
     chains = [
-        gb.TwoLayerCachedDTensorsReadChain(
+        gb.TwoLayerCachedDTensorsRWChain(
             src=src,
-            small_cache=views[0],
-            big_cache=views[1],
+            first_cache=views[0],
+            second_cache=views[1],
             dst=dst.view(r),
             num_ranks_per_node=2,
         )

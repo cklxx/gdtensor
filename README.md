@@ -5,7 +5,7 @@
 | namespace | 导出范围 |
 |---|---|
 | `gdtensor` | `get_tensor_ids`、`get_gd_tensor`、`make_gd_tensor`、`get_d_tensor`、`reset_d_tensor`、`Result`、`Error` |
-| `gdtensor.io` | `rank_load`、`rank_save`、`chain_load`、`chain_stat_mem_overhead`、`chain_stat_outbound_traffic`、`chain_stat_inbound_traffic` |
+| `gdtensor.io` | `rank_load`、`rank_save`、`chain_load`、`chain_save`、`chain_stat_mem_overhead`、`chain_stat_outbound_traffic`、`chain_stat_inbound_traffic` |
 | `gdtensor.builder` | C.3 产品类型、BuilderMixin、`new_*`、view map，以及 C.4 的四个 helper |
 | `gdtensor.session` | `StorageSaveSession`、`StorageLoadSession` |
 | `gdtensor.access` | `DTensorDataAccessor` |
@@ -44,7 +44,7 @@ storage_view = make_storage_view(
 
 rank_load(rank, compute_view, storage_view)
 rank_save(rank, compute_view, storage_view)
-chain_load(rank, read_chain)  # read_chain 的 source 使用上述 storage_view
+chain_load(rank, rw_chain)  # rw_chain 的 source 使用上述 storage_view
 ```
 
 client 采用 `gdtensor_conn.iobackend.FileSystemClient` 的结构化协议，不需要继承基类：

@@ -38,7 +38,7 @@ def build(tmp_path, monkeypatch):
         cluster, {"w": 4}, lambda _r: 0, str(tmp_path / "cache"), device
     )
     dst = SparseRankBuffers(cluster)
-    chain = gb.OneLayerCachedDTensorsReadChain(
+    chain = gb.OneLayerCachedDTensorsRWChain(
         src=shapes._storage_view(src, ["w"], {"w": 4}, 1),
         cache=shapes._cache_view(cache, ["w"], {"w": 4}, 1, [0], 1),
         dst=shapes._compute_view(dst, ["w"], {"w": 4}, 1, {"w": False}),
@@ -148,13 +148,13 @@ def test_partial_write_is_completed(tmp_path, monkeypatch):
 def test_source_change_during_load_returns_error(tmp_path, monkeypatch, depth):
     chain, src, cache, dst, _values = build(tmp_path, monkeypatch)
     if depth == 0:
-        chain = gb.DirectDTensorsReadChain(src=chain.src, dst=chain.dst)
+        chain = gb.DirectDTensorsRWChain(src=chain.src, dst=chain.dst)
     if depth == 2:
-        chain = gb.TwoLayerCachedDTensorsReadChain(
+        chain = gb.TwoLayerCachedDTensorsRWChain(
             src=chain.src,
             dst=chain.dst,
-            small_cache=chain.cache,
-            big_cache=chain.cache,
+            first_cache=chain.cache,
+            second_cache=chain.cache,
             num_ranks_per_node=1,
         )
     original = src.read_to_buffer
@@ -285,10 +285,10 @@ def _cold_parent_case(tmp_path, monkeypatch):
         shapes._cache_view(caches[0], list(sizes), sizes, 1, [0, 1], 1),
         shapes._cache_view(caches[1], list(sizes), sizes, 1, list(range(world)), 1),
     ]
-    chain = gb.TwoLayerCachedDTensorsReadChain(
+    chain = gb.TwoLayerCachedDTensorsRWChain(
         src=shapes._storage_view(src, list(sizes), sizes, world),
-        small_cache=views[0],
-        big_cache=views[1],
+        first_cache=views[0],
+        second_cache=views[1],
         dst=shapes._compute_view(
             dst, list(sizes), sizes, world, dict.fromkeys(sizes, False)
         ),
@@ -1020,14 +1020,14 @@ def test_hundred_node_file_coordinator_chain(tmp_path, monkeypatch, depth):
         shapes._cache_view(c, ["w"], {"w": 16002}, 2, list(range(100)), 2)
         for c in caches
     ]
-    chain = gb.DirectDTensorsReadChain(src=source, dst=compute)
+    chain = gb.DirectDTensorsRWChain(src=source, dst=compute)
     if depth == 1:
-        chain = gb.OneLayerCachedDTensorsReadChain(
+        chain = gb.OneLayerCachedDTensorsRWChain(
             src=source, dst=compute, cache=views[0]
         )
     if depth == 2:
-        chain = gb.TwoLayerCachedDTensorsReadChain(
-            src=source, dst=compute, small_cache=views[0], big_cache=views[1]
+        chain = gb.TwoLayerCachedDTensorsRWChain(
+            src=source, dst=compute, first_cache=views[0], second_cache=views[1]
         )
     errors = []
 

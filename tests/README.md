@@ -78,6 +78,13 @@ CRC 是测试断言，不改变公开 IO 接口。arange 及其确定性切片�
 - `torch/test_lawa_dtype.py` 在累加前记录噪声输入 CRC，累加后检查输入未变；BF16 输出与独立量化均值做 CRC 和精确对拍。允许误差的 F32 累加保留容差断言，不强制 CRC 相等。
 - `torch/test_lawa.py` 的非 arange bias 在加载后、累加前与独立输入做 CRC 对拍。
 
+## 缓存写链路验收（`gio.chain_save`）
+
+- `sim/test_write_chain_backends.py`：真文件 `FileIO` 与 `SdkFileIO`（`MemorySdkClient`）上的多文件 safetensors（`single` / `per_rank` / `per_stage` / `rank_multi`）、真实 PyTorch DCP `thread`/`process` 暂存及 `chain_save -> chain_load` CRC 往返、延迟 leader 跨 rank 暂存（`SaveSessionBase.ensure_staging`），以及二维列分片 2 层写入对 `pwrite` 系统调用合并计数（17 次 1024B/header 写入对比直写 257 次 64B）。
+- `io/test_random_write_chain_stress.py`：无 torch 随机写压测。随机覆盖 1–4 节点、1–3 rank/节点、1 或 2 缓存层（`first_cache` / `second_cache`）、steps、并发宽度、混合 `U8`/`I32`、1D/2D 分片与去重、file/thread 协调器、NIC 带宽和重复多代；独立 oracle 核对存储精确字节与 CRC、保护字节、层内供给覆盖、单段驻留与 `chain_stat_mem_overhead` 峰值、零残留回收以及 `chain_stat_inbound_traffic`/`chain_stat_outbound_traffic`。
+- `io/test_write_chain_lifecycle.py`：无 torch 多进程（`fork`/`spawn`）safetensors `chain_save`、fork 下隐式与显式 `cache_namespace` 隔离、stage 与 cohort 等待期间进程崩溃触发 `cache_peer_down`、持锁/待决指纹时 fork 安全、`.state` 损坏拒绝（`cache_state`）、异常提交中断保留活跃 owner、`DiskNodeCache` 篡改中止保存与发布、两层上游故障向远端等待 rank 传播、多张量单元格预算聚合与弱引用回收，以及无 torch `SdkFileIO` 延迟 leader 测试。
+- `tests/mutation_check.py` 与 `formal/tla/WriteChainPropagation.tla`：8 项无 torch 写链路变异与 TLA+ 双层写汇聚模型（9 项 TLC 检查）。
+
 `io/test_colocated_cluster_sim.py` 使用每节点独立缓存内存、有效位和 NIC，以及每 rank 独立计算内存。它检查每 rank 的 arange 分片与未写入保护字节。NIC 计数只记录跨节点传输，全覆盖场景要求网络为零。
 
 部分覆盖、单 DN 和两层场景的四项流量 xfail 已移除。段填充只由本节点的消费 rank 执行；没有本地消费者时指派本节点 rank 服务未消费段。内部缓存 range 携带 `cache_node`，让 accessor 定位节点，公开 range 字段不变。缓存节点不属于 rank 节点集合时，保留原 `cache_subset` 拒绝条件，不扩展公开部署范围。
